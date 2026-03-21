@@ -30,10 +30,10 @@ All three features work independently. Use any combination, or just the caching.
 ## Quick start
 
 ```bash
-pip install cloudposterior
+uv add cloudposterior
 
 # For cloud execution (optional):
-pip install modal && modal setup
+uv add modal && uv run modal setup
 ```
 
 ```python
@@ -213,7 +213,7 @@ with cp.wrap(model, remote=True, cache="disk", notify=True):  # everything
 Cloud execution currently uses [Modal](https://modal.com). Modal provides fast container spin-up, automatic dependency packaging, and a generous free tier.
 
 ```bash
-pip install modal
+uv add modal
 modal setup  # one-time browser auth
 ```
 
