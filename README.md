@@ -158,12 +158,16 @@ with cp.wrap(model, cache="disk", notify=True):
 pip install cloudposterior
 ```
 
-For cloud execution, you'll also need a [Modal](https://modal.com) account:
+### Cloud backend: Modal
+
+Cloud execution currently uses [Modal](https://modal.com) as the compute backend. Modal provides fast container spin-up, automatic dependency packaging, and generous free tier. To set it up:
 
 ```bash
 pip install modal
 modal setup  # one-time browser auth
 ```
+
+Support for additional compute backends (AWS, GCP, self-hosted SSH) is planned for the future. The backend is abstracted behind a `ComputeBackend` interface, so adding new providers won't require changes to your code.
 
 ## Configuration
 
