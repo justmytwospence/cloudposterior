@@ -15,9 +15,14 @@ Your `pm.sample()` call stays exactly the same. `cloudposterior` intercepts it, 
 
 ### Cloud execution
 
-Offload MCMC sampling to cloud VMs with 32 cores and 64GB RAM. No infrastructure to manage -- [Modal](https://modal.com) handles containers, scaling, and cleanup.
+Offload MCMC sampling to cloud VMs. No infrastructure to manage -- [Modal](https://modal.com) handles containers, scaling, and cleanup. Resources are auto-sized based on your model and sampling config (number of chains, data size, parameter count), or you can pick a preset.
 
 ```python
+# Auto-sized (default) -- picks CPU and memory based on chains + data size
+with cp.wrap(model, remote=True):
+    idata = pm.sample(draws=5000, chains=8)
+
+# Manual preset
 with cp.wrap(model, remote=True, instance="xlarge"):
     idata = pm.sample(draws=5000, chains=8)
 ```
@@ -26,7 +31,7 @@ The model is serialized with cloudpickle, shipped to a container with version-ma
 
 ### Automatic caching
 
-Re-running a notebook cell? If the model, data, and sampling config haven't changed, cloudposterior returns the cached result instantly. No wasted compute, no waiting.
+Re-running a notebook cell? If the model, data, and sampling config haven't changed, cloudposterior returns the cached result instantly. No wasted compute, no waiting. Caching is on by default.
 
 ```python
 # In-memory cache (default) -- fast, session-scoped
@@ -45,29 +50,37 @@ with cp.wrap(model, cache="/data/mcmc-cache"):
     idata = pm.sample(draws=2000)
 ```
 
-Cache keys are SHA-256 hashes of the serialized model + observed data + sampling kwargs. Disk cache organizes results by model name:
+Disk cache organizes results in a human-readable hierarchy using model names and word-based slugs:
 
 ```
-~/.cache/cloudposterior/
+.cloudposterior/
     eight_schools/
-        a1b2c3d4e5f6.nc
-    hierarchical_regression/
-        f6e5d4c3b2a1.nc
+        data-gentle-fox/
+            draws2000_tune1000_chains4.nc
+            draws1000_tune500_chains2.nc
+    my_regression/
+        data-watchful-panda/
+            draws5000_tune2000_chains8.nc
 ```
+
+The model directory name comes from (in priority order):
+1. `pm.Model(name="eight_schools")` -- explicit model name
+2. The variable name you used: `with pm.Model() as my_regression:` (introspected from the call stack)
+3. Free RV names: `mu_tau_theta`
 
 ### Phone notifications
 
-Monitor long-running sampling from your phone (or anywhere) via [ntfy.sh](https://ntfy.sh) push notifications. Progress updates live with per-chain stats, divergence counts, and speed.
+Monitor long-running sampling from your phone (or anywhere) via [ntfy](https://ntfy.sh) push notifications. Progress updates live with per-chain stats, divergence counts, and speed.
 
 ```python
 with cp.wrap(model, remote=True, notify=True):
     idata = pm.sample(draws=10000, chains=8)
 ```
 
-When the topic is auto-generated, cloudposterior prints a QR code you can scan to subscribe:
+When the topic is auto-generated, cloudposterior prints a link and QR code you can scan to subscribe:
 
 ```
-Notifications: https://ntfy.sh/pd-eight-schools-a1b2c3
+Notifications: https://ntfy.sh/eight-schools-subtle-pug
 [QR CODE]
 ```
 
@@ -83,14 +96,20 @@ Sampling -- 4 chains, 1000 tune + 2000 draws
 | 1     | =======>... | 1180/2000 | 2   | 0.741 | 398/s  |
 ```
 
-You can specify a custom topic or point to your own ntfy server:
+You can specify a custom topic, or point to your own ntfy server:
 
 ```python
-# Custom topic name (no QR code shown -- you already know it)
+# Custom topic (no QR code -- you already know it)
 with cp.wrap(model, notify="my-sampling-channel"):
+    ...
 
 # Self-hosted ntfy
+with cp.wrap(model, notify={"server": "https://ntfy.example.com"}):
+    ...
+
+# Both
 with cp.wrap(model, notify={"server": "https://ntfy.example.com", "topic": "mcmc"}):
+    ...
 ```
 
 ### Live progress display
@@ -99,27 +118,33 @@ Both Jupyter notebooks and terminals get proper in-place progress displays showi
 
 - Serialization (model + data packaging)
 - Upload to cloud
-- Container provisioning (with build logs)
+- Container provisioning
 - MCMC sampling with per-chain progress bars, divergences, step size, grad evals, speed, elapsed time, and ETA
 - Result download
 
-The sampling display matches PyMC's native progress -- per-chain bars that turn red on divergences, with all the stats you expect.
+Notebooks use ipywidgets for a native GUI experience. Terminals use Rich for a TUI. The sampling display matches PyMC's native progress -- per-chain bars that turn red on divergences, with all the stats you expect.
 
 ## Composable features
 
-All three features (remote, cache, notify) are independent. Use any combination:
+| Feature | Default | Flag |
+|---------|---------|------|
+| Caching (in-memory) | on | `cache=True` / `False` / `"disk"` / `Path` |
+| Remote execution | off | `remote=True` / `False` |
+| Notifications | off | `notify=True` / `"topic"` / `{"server": ...}` |
+
+All three are independent. Use any combination:
 
 ```python
 # Just caching (default) -- local sampling, results cached in memory
 with cp.wrap(model):
     idata = pm.sample(draws=2000)
 
-# Cloud + cache -- remote sampling, results cached
-with cp.wrap(model, remote=True):
+# Cloud + disk cache
+with cp.wrap(model, remote=True, cache="disk"):
     idata = pm.sample(draws=2000)
 
-# Everything -- cloud, cache, phone notifications
-with cp.wrap(model, remote=True, notify=True):
+# Everything
+with cp.wrap(model, remote=True, cache="disk", notify=True):
     idata = pm.sample(draws=2000)
 
 # Local + disk cache + notifications (no cloud)
@@ -136,12 +161,19 @@ pip install cloudposterior
 For cloud execution, you'll also need a [Modal](https://modal.com) account:
 
 ```bash
-modal setup  # one-time auth
+pip install modal
+modal setup  # one-time browser auth
 ```
 
 ## Configuration
 
 ### Instance sizes
+
+When `remote=True` and no `instance` is specified, resources are auto-sized based on the model:
+- **CPU**: 1 core per chain (min 4, max 32)
+- **Memory**: scales with observed data size and parameter count
+
+You can override with a preset:
 
 | Name     | CPUs | Memory |
 |----------|------|--------|
@@ -161,9 +193,9 @@ modal setup  # one-time auth
 ## How it works
 
 1. **Serialize**: The PyMC model and observed data are serialized with cloudpickle + lz4 compression. A version manifest captures your exact package versions.
-2. **Ship**: The payload is sent to Modal, which builds a container image matching your local environment (cached after first run).
+2. **Ship**: The payload is sent to Modal, which builds a container image matching your local environment (cached after first run). Resources are auto-sized or use the preset you specified.
 3. **Sample**: `pm.sample()` runs on the remote VM with a custom callback that streams per-chain progress back via msgpack-encoded generator yields.
-4. **Return**: The InferenceData trace is compressed as NetCDF, sent back, and optionally cached for instant re-use.
+4. **Return**: The InferenceData trace is compressed as NetCDF, sent back, and cached for instant re-use.
 
 ## Explicit API
 

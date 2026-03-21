@@ -86,7 +86,7 @@ def serialize_observed_data(model) -> bytes:
             observed[rv.name] = np.asarray(obs_data)
 
     buf = io.BytesIO()
-    np.savez_compressed(buf, **observed)
+    np.savez(buf, **observed)  # uncompressed -- lz4 handles compression in one pass
     return lz4.frame.compress(buf.getvalue())
 
 

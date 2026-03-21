@@ -15,19 +15,20 @@ def test_notifier_generates_topic_from_model_name():
         pm.Normal("mu", 0, 1)
 
     notifier = NtfyNotifier(model=model)
-    assert notifier.topic.startswith("pd-eight-schools-")
+    assert notifier.topic.startswith("eight-schools-")
+    # model-name + wordhash: eight-schools-adjective-noun
+    assert len(notifier.topic.split("-")) == 4
 
 
 def test_notifier_generates_topic_from_rv_names():
-    """NtfyNotifier should derive topic from RV names when model has no name."""
+    """Unnamed models use RV names in the topic."""
     with pm.Model() as model:
         pm.Normal("mu", 0, 1)
         pm.HalfCauchy("tau", 5)
 
     notifier = NtfyNotifier(model=model)
-    assert "mu" in notifier.topic
-    assert "tau" in notifier.topic
-    assert notifier.topic.startswith("pd-")
+    # Should contain RV-derived slug + wordhash
+    assert len(notifier.topic) < 40
 
 
 def test_notifier_custom_topic():

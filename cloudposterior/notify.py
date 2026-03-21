@@ -30,30 +30,12 @@ def _ascii_bar(fraction: float, width: int = 12) -> str:
 
 
 def _model_topic_name(model) -> str:
-    """Generate a readable ntfy topic name from a PyMC model.
+    """Generate an ntfy topic like 'eight-schools-subtle-pug'."""
+    from cloudposterior.naming import get_model_name, slugify
+    from cloudposterior.wordhash import wordhash
 
-    Uses the model name if set, otherwise derives a name from
-    the free random variable names. Appends a short hash for uniqueness.
-    """
-    import re
-
-    suffix = uuid.uuid4().hex[:6]
-
-    if model is not None and hasattr(model, "name") and model.name:
-        # Clean the model name for URL safety
-        slug = re.sub(r"[^a-zA-Z0-9]+", "-", model.name).strip("-").lower()
-        return f"pd-{slug}-{suffix}"
-
-    # Derive from RV names
-    if model is not None and hasattr(model, "free_RVs") and model.free_RVs:
-        rv_names = [rv.name.split("::")[-1] for rv in model.free_RVs[:3]]
-        slug = "-".join(rv_names)
-        slug = re.sub(r"[^a-zA-Z0-9]+", "-", slug).strip("-").lower()
-        if len(model.free_RVs) > 3:
-            slug += f"-plus{len(model.free_RVs) - 3}"
-        return f"pd-{slug}-{suffix}"
-
-    return f"pd-{suffix}"
+    name = slugify(get_model_name(model, stack_offset=5), separator="-")
+    return f"{name}-{wordhash(uuid.uuid4().bytes)}"
 
 
 class NtfyNotifier:

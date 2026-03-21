@@ -98,6 +98,7 @@ def run_sampling(
     chain_start_times: dict[int, float] = {}
     chain_divergences: dict[int, int] = {}
     chain_tree_depths: dict[int, list[float]] = {}
+    chain_phase: dict[int, bool] = {}  # track tuning state per chain
     sample_start = time.time()
 
     def progress_callback(trace, draw):
@@ -109,6 +110,13 @@ def run_sampling(
             chain_draw_counts[chain] = 0
             chain_divergences[chain] = 0
             chain_tree_depths[chain] = []
+            chain_phase[chain] = is_tuning
+
+        # Reset counter when transitioning from tuning to sampling
+        if chain_phase.get(chain) and not is_tuning:
+            chain_draw_counts[chain] = 0
+            chain_start_times[chain] = time.time()
+            chain_phase[chain] = False
 
         chain_draw_counts[chain] += 1
         current_draw = chain_draw_counts[chain]

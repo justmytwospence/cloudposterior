@@ -7,7 +7,7 @@ Usage:
 import numpy as np
 import pymc as pm
 
-import cloudposterior as pd
+import cloudposterior as cp
 
 # Eight Schools data
 y = np.array([28, 8, -3, 7, -1, 1, 18, 12], dtype=np.float64)
@@ -19,8 +19,8 @@ with pm.Model() as eight_schools:
     theta = pm.Normal("theta", mu=mu, sigma=tau, shape=8)
     pm.Normal("obs", mu=theta, sigma=sigma, observed=y)
 
-# Wrap the model -- pm.sample() inside runs on Modal with caching
-with pd.wrap(eight_schools, remote=True):
+# Wrap the model -- pm.sample() inside runs on Modal with disk caching
+with cp.wrap(eight_schools, remote=True, cache="disk"):
     idata = pm.sample(draws=1000, tune=1000, chains=4)
 
 print("\nSampling complete!")

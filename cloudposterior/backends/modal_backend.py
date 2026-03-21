@@ -152,9 +152,10 @@ class ModalSamplingJob(SamplingJob):
             tmp.write(raw)
             tmp_path = tmp.name
         try:
-            # Load eagerly so we can delete the temp file
+            # Load every group eagerly into memory so the temp file can be deleted
             idata = az.from_netcdf(tmp_path)
-            idata.load()
+            for group in idata.groups():
+                getattr(idata, group).load()
             return idata
         finally:
             os.unlink(tmp_path)
@@ -203,8 +204,8 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
 class ModalBackend(ComputeBackend):
     """Modal compute backend."""
 
-    def __init__(self, instance: str | None = None, nuts_sampler: str = "pymc"):
-        self._config = RemoteConfig.from_instance(instance)
+    def __init__(self, config: RemoteConfig | None = None, nuts_sampler: str = "pymc"):
+        self._config = config or RemoteConfig()
         self._nuts_sampler = nuts_sampler
 
     def submit(self, payload: SamplingPayload) -> ModalSamplingJob:

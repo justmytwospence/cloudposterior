@@ -1,14 +1,15 @@
-"""Result caching based on model + data + sampling config hash.
+"""Result caching based on model + data + sampling config.
 
 Two backends:
 - MemoryCache (default): fast, lives for the session
-- DiskCache: persistent across sessions, configurable directory
+- DiskCache: persistent across sessions, project-local
 
 Disk layout::
 
-    ~/.cache/cloudposterior/
-        eight_schools/              # model name (or "unnamed")
-            a1b2c3d4e5f6.nc        # short hash of full key
+    .cloudposterior/
+        eight_schools/                     # model name
+            gentle-fox/                    # wordhash of observed data
+                draws2000_tune1000_chains4.nc   # human-readable MCMC params
 """
 
 from __future__ import annotations
@@ -31,18 +32,34 @@ def compute_cache_key(model_bytes: bytes, data_bytes: bytes, sample_kwargs: dict
 
 def _model_slug(model) -> str:
     """Derive a filesystem-safe directory name from a PyMC model."""
-    if model is not None and hasattr(model, "name") and model.name:
-        return re.sub(r"[^a-zA-Z0-9]+", "_", model.name).strip("_").lower()
-    if model is not None and hasattr(model, "free_RVs") and model.free_RVs:
-        names = [rv.name.split("::")[-1] for rv in model.free_RVs[:4]]
-        slug = "_".join(names)
-        return re.sub(r"[^a-zA-Z0-9]+", "_", slug).strip("_").lower()
-    return "unnamed"
+    from cloudposterior.naming import get_model_name, slugify
+    return slugify(get_model_name(model, stack_offset=4))
+
+
+def _data_slug(data_bytes: bytes) -> str:
+    """Wordhash of the observed data for the directory name."""
+    from cloudposterior.wordhash import wordhash
+    return f"data-{wordhash(data_bytes)}"
+
+
+def _params_filename(sample_kwargs: dict) -> str:
+    """Human-readable filename from MCMC sampling params."""
+    parts = []
+    for key in ("draws", "tune", "chains", "cores", "nuts_sampler", "target_accept"):
+        if key in sample_kwargs and sample_kwargs[key] is not None:
+            val = sample_kwargs[key]
+            # Skip defaults that don't add info
+            if key == "nuts_sampler" and val == "pymc":
+                continue
+            parts.append(f"{key}{val}")
+    if not parts:
+        parts.append("default")
+    return "_".join(parts)
 
 
 class CacheBackend(Protocol):
-    def load(self, key: str): ...
-    def save(self, key: str, idata) -> None: ...
+    def load(self, key: str, **kwargs): ...
+    def save(self, key: str, idata, **kwargs) -> None: ...
 
 
 class MemoryCache:
@@ -51,44 +68,52 @@ class MemoryCache:
     def __init__(self):
         self._store: dict[str, object] = {}
 
-    def load(self, key: str):
+    def load(self, key: str, **kwargs):
         return self._store.get(key)
 
-    def save(self, key: str, idata) -> None:
+    def save(self, key: str, idata, **kwargs) -> None:
         self._store[key] = idata
 
 
 class DiskCache:
-    """Persistent disk cache with model-based directory hierarchy.
+    """Persistent disk cache with human-readable directory hierarchy.
 
-    Layout: {base_dir}/{model_slug}/{short_hash}.nc
+    Layout: {base_dir}/{model_name}/{data_slug}/{params}.nc
 
     Args:
-        base_dir: Root cache directory. Defaults to ~/.cache/cloudposterior
-        model: PyMC model, used to derive the subdirectory name
+        base_dir: Root cache directory. Defaults to ./.cloudposterior
+        model: PyMC model, used to derive the top-level directory name
     """
 
     def __init__(self, base_dir: str | Path | None = None, model=None):
-        self._base = Path(base_dir) if base_dir else Path.home() / ".cache" / "cloudposterior"
-        self._model_dir = self._base / _model_slug(model)
-        self._model_dir.mkdir(parents=True, exist_ok=True)
+        self._base = Path(base_dir) if base_dir else Path(".cloudposterior")
+        self._model_slug = _model_slug(model)
 
-    def _path(self, key: str) -> Path:
-        short = key[:12]
-        return self._model_dir / f"{short}.nc"
+    def _path(self, key: str, data_bytes: bytes | None = None, sample_kwargs: dict | None = None) -> Path:
+        if data_bytes is not None and sample_kwargs is not None:
+            data_dir = self._base / self._model_slug / _data_slug(data_bytes)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            return data_dir / f"{_params_filename(sample_kwargs)}.nc"
+        # Fallback: flat hash-based path
+        from cloudposterior.wordhash import wordhash
+        fallback_dir = self._base / self._model_slug
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        return fallback_dir / f"{wordhash(key)}.nc"
 
-    def load(self, key: str):
+    def load(self, key: str, data_bytes: bytes | None = None, sample_kwargs: dict | None = None):
         import arviz as az
 
-        path = self._path(key)
+        path = self._path(key, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
         if path.exists():
             idata = az.from_netcdf(str(path))
-            idata.load()
+            for group in idata.groups():
+                getattr(idata, group).load()
             return idata
         return None
 
-    def save(self, key: str, idata) -> None:
-        path = self._path(key)
+    def save(self, key: str, idata, data_bytes: bytes | None = None, sample_kwargs: dict | None = None) -> None:
+        path = self._path(key, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+        path.parent.mkdir(parents=True, exist_ok=True)
         idata.to_netcdf(str(path))
 
 
@@ -101,15 +126,11 @@ def get_default_cache() -> MemoryCache:
 
 
 def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
-    """Resolve the cache argument from pd.wrap() into a CacheBackend.
+    """Resolve the cache argument from cp.wrap() into a CacheBackend.
 
     Args:
-        cache_arg: True (memory), False (disabled), "disk" (default disk path),
+        cache_arg: True (memory), False (disabled), "disk" (project-local),
                    Path/str (custom disk path), or a CacheBackend instance
-        model: PyMC model for directory naming
-
-    Returns:
-        A CacheBackend or None if disabled.
     """
     if cache_arg is False:
         return None
@@ -119,7 +140,6 @@ def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
         return DiskCache(model=model)
     if isinstance(cache_arg, (str, Path)):
         return DiskCache(base_dir=cache_arg, model=model)
-    # Assume it's a CacheBackend instance
     if hasattr(cache_arg, "load") and hasattr(cache_arg, "save"):
         return cache_arg
     return get_default_cache()

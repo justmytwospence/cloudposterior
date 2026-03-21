@@ -104,12 +104,18 @@ def _run_sample(
     from cloudposterior.cache import compute_cache_key, resolve_cache
     from cloudposterior.serialize import serialize_model, serialize_observed_data
 
+    # -- Resolve resource config (auto-size or preset) --
+    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+    if remote:
+        instance_desc = f"Modal ({config.describe()})"
+    else:
+        instance_desc = "local"
+
     # -- Build sinks --
     sinks = _build_sinks(
         progress=progress,
         notify=notify,
-        instance=instance,
-        remote=remote,
+        instance_desc=instance_desc,
         model=model,
     )
 
@@ -137,7 +143,7 @@ def _run_sample(
 
     if cache_backend is not None:
         cache_key = compute_cache_key(model_bytes, data_bytes, sample_kwargs)
-        cached = cache_backend.load(cache_key)
+        cached = cache_backend.load(cache_key, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
         if cached is not None:
             emit(PhaseUpdate(
                 phase=JobPhase.CACHE_HIT,
@@ -154,7 +160,7 @@ def _run_sample(
             model=model,
             model_bytes=model_bytes,
             data_bytes=data_bytes,
-            instance=instance,
+            config=config,
             nuts_sampler=nuts_sampler,
             sinks=sinks,
             emit=emit,
@@ -171,21 +177,15 @@ def _run_sample(
 
     # -- Cache store --
     if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata)
+        cache_backend.save(cache_key, idata, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
 
     _stop_sinks(sinks)
     return idata
 
 
-def _build_sinks(*, progress: bool, notify, instance: str | None, remote: bool, model=None) -> list:
+def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None) -> list:
     """Create display + notification sinks."""
     sinks = []
-
-    config = RemoteConfig.from_instance(instance)
-    if remote:
-        instance_desc = f"Modal ({config.cpu:.0f} cores, {config.memory / 1024:.0f}GB)"
-    else:
-        instance_desc = "local"
 
     if progress:
         from cloudposterior.display import _is_notebook, NotebookDisplay, TerminalDisplay
@@ -279,7 +279,7 @@ def _run_remote(
     model,
     model_bytes: bytes,
     data_bytes: bytes,
-    instance: str | None,
+    config: RemoteConfig,
     nuts_sampler: str,
     sinks: list,
     emit,
@@ -297,7 +297,7 @@ def _run_remote(
         sample_kwargs=sample_kwargs,
     )
 
-    backend = ModalBackend(instance=instance, nuts_sampler=nuts_sampler)
+    backend = ModalBackend(config=config, nuts_sampler=nuts_sampler)
     job = backend.submit(payload)
 
     # Get output widget from notebook display if present
@@ -433,5 +433,6 @@ def submit(
         sample_kwargs["cores"] = cores
 
     payload = create_payload(model, sample_kwargs)
-    backend = ModalBackend(instance=instance, nuts_sampler=nuts_sampler)
+    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+    backend = ModalBackend(config=config, nuts_sampler=nuts_sampler)
     return backend.submit(payload)

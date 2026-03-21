@@ -11,3 +11,4 @@ build/
 venv/
 *.nc
 .modal/
+.cloudposterior/

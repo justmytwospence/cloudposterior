@@ -60,26 +60,30 @@ def test_memory_cache_roundtrip():
 
 
 def test_disk_cache_roundtrip(tmp_path):
-    """DiskCache stores and retrieves InferenceData."""
+    """DiskCache stores and retrieves InferenceData with structured paths."""
     model = _make_model("test_model")
     with model:
         idata = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
 
-    cache = DiskCache(base_dir=tmp_path, model=model)
-    assert cache.load("testkey123456") is None
+    sample_kwargs = {"draws": 10, "tune": 10, "chains": 1}
+    data_bytes = b"fake-observed-data"
 
-    cache.save("testkey123456", idata)
-    loaded = cache.load("testkey123456")
+    cache = DiskCache(base_dir=tmp_path, model=model)
+    assert cache.load("testkey", data_bytes=data_bytes, sample_kwargs=sample_kwargs) is None
+
+    cache.save("testkey", idata, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+    loaded = cache.load("testkey", data_bytes=data_bytes, sample_kwargs=sample_kwargs)
     assert loaded is not None
     assert "posterior" in loaded.groups()
-    # Named models prefix RVs with "model_name::"
     rv_names = list(loaded.posterior.data_vars)
     assert any("mu" in name for name in rv_names)
 
-    # Check directory structure
+    # Check directory structure: model_name/data_slug/params.nc
     nc_files = list(tmp_path.rglob("*.nc"))
     assert len(nc_files) == 1
-    assert "test_model" in str(nc_files[0].parent)
+    path = nc_files[0]
+    assert "test_model" in str(path)
+    assert "draws10_tune10_chains1" in path.name
 
 
 def test_model_slug_named():
