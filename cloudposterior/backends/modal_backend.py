@@ -44,7 +44,11 @@ def _handle_modal_error(exc: Exception) -> Exception:
     return exc
 
 
-def _build_pip_specs(manifest: dict[str, str], gpu: str | None = None) -> list[str]:
+def _build_pip_specs(
+    manifest: dict[str, str],
+    gpu: str | None = None,
+    nuts_sampler: str = "pymc",
+) -> list[str]:
     """Convert a version manifest into pinned pip install specs."""
     specs = []
     for pkg in DEFAULT_PACKAGES:
@@ -58,14 +62,23 @@ def _build_pip_specs(manifest: dict[str, str], gpu: str | None = None) -> list[s
         if key in manifest:
             specs.append(f"{pip_name}=={manifest[key]}")
 
-    # JAX GPU support: install jax[cuda12] when GPU is provisioned
-    # and a JAX-based sampler is present
-    if gpu and ("numpyro" in manifest or "jax" in manifest):
+    # GPU containers: always install numpyro + jax[cuda12] since GPU
+    # is only useful for JAX-based samplers. This ensures the container
+    # is ready when pm.sample(nuts_sampler="numpyro") is called.
+    if gpu:
+        if "numpyro" not in manifest:
+            specs.append("numpyro")
         jax_version = manifest.get("jax", "")
         if jax_version:
             specs.append(f"jax[cuda12]=={jax_version}")
         else:
             specs.append("jax[cuda12]")
+    # Non-GPU: install numpyro/jax if requested by sampler
+    elif nuts_sampler in ("numpyro", "blackjax"):
+        if "numpyro" not in manifest:
+            specs.append("numpyro")
+        if "jax" not in manifest:
+            specs.append("jax")
 
     return specs
 
