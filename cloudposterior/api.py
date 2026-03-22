@@ -85,6 +85,7 @@ class cloud:
         self._env = None
         self._model_bytes: bytes | None = None
         self._data_bytes: bytes | None = None
+        self._gpu_provisioned: bool = (instance == "gpu")
 
     def __enter__(self):
         import pymc as pm
@@ -140,6 +141,24 @@ class cloud:
             dashboard=use_dashboard,
         )
 
+    def _reprovision_with_gpu(self, nuts_sampler: str):
+        """Re-provision the environment with a GPU for JAX-based samplers."""
+        from cloudposterior.backends.modal_backend import ModalBackend
+        from cloudposterior.serialize import get_version_manifest
+
+        config = RemoteConfig.from_instance(
+            "gpu", model=self.model, sample_kwargs={},
+        )
+        manifest = get_version_manifest()
+        backend = ModalBackend(config=config)
+        use_dashboard = self.notify == "dashboard"
+        self._env = backend.provision(
+            self._model_bytes, self.model, manifest, config,
+            project=self.project, idle_timeout=600,
+            dashboard=use_dashboard,
+        )
+        self._gpu_provisioned = True
+
     def destroy(self):
         """Tear down the environment and clean up the project volume.
 
@@ -163,6 +182,13 @@ class cloud:
         def intercepted_sample(**kwargs):
             # Extract nuts_sampler from pm.sample() kwargs
             nuts_sampler = kwargs.pop("nuts_sampler", "pymc")
+
+            # Re-provision with GPU if JAX sampler detected on a CPU-only env
+            if (ctx._env is not None
+                    and nuts_sampler in ("numpyro", "blackjax")
+                    and not ctx._gpu_provisioned):
+                ctx._env.teardown()
+                ctx._reprovision_with_gpu(nuts_sampler)
 
             # Use persistent environment path if provisioned
             if ctx._env is not None:
