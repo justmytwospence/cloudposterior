@@ -17,6 +17,7 @@ class JobPhase(str, Enum):
     UPLOADING = "uploading"
     PROVISIONING = "provisioning"
     CONTAINER_READY = "container_ready"
+    DEVICE = "device"
     COMPILING = "compiling"
     SAMPLING = "sampling"
     DOWNLOADING = "downloading"

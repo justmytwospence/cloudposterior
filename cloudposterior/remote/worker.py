@@ -39,7 +39,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
                 device_msg = f"JAX using CPU (no GPU found)"
             yield msgpack.packb({
                 "type": "phase",
-                "phase": "container_ready",
+                "phase": "device",
                 "status": "done",
                 "message": device_msg,
                 "elapsed": 0.0,
