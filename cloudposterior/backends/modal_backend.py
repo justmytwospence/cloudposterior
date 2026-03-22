@@ -44,7 +44,7 @@ def _handle_modal_error(exc: Exception) -> Exception:
     return exc
 
 
-def _build_pip_specs(manifest: dict[str, str]) -> list[str]:
+def _build_pip_specs(manifest: dict[str, str], gpu: str | None = None) -> list[str]:
     """Convert a version manifest into pinned pip install specs."""
     specs = []
     for pkg in DEFAULT_PACKAGES:
@@ -58,6 +58,15 @@ def _build_pip_specs(manifest: dict[str, str]) -> list[str]:
         if key in manifest:
             specs.append(f"{pip_name}=={manifest[key]}")
 
+    # JAX GPU support: install jax[cuda12] when GPU is provisioned
+    # and a JAX-based sampler is present
+    if gpu and ("numpyro" in manifest or "jax" in manifest):
+        jax_version = manifest.get("jax", "")
+        if jax_version:
+            specs.append(f"jax[cuda12]=={jax_version}")
+        else:
+            specs.append("jax[cuda12]")
+
     return specs
 
 
@@ -68,7 +77,7 @@ def _create_modal_app(manifest: dict[str, str], config: RemoteConfig):
     python_version = manifest.get("python", "3.11.0")
     py_major_minor = ".".join(python_version.split(".")[:2])
 
-    pip_specs = _build_pip_specs(manifest)
+    pip_specs = _build_pip_specs(manifest, gpu=config.gpu)
 
     image = (
         modal.Image.debian_slim(python_version=py_major_minor)
@@ -218,13 +227,13 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
     return None
 
 
-def _build_image(manifest: dict[str, str]):
+def _build_image(manifest: dict[str, str], gpu: str | None = None):
     """Build a Modal image with packages matching the version manifest."""
     import modal
 
     python_version = manifest.get("python", "3.11.0")
     py_major_minor = ".".join(python_version.split(".")[:2])
-    pip_specs = _build_pip_specs(manifest)
+    pip_specs = _build_pip_specs(manifest, gpu=gpu)
 
     return (
         modal.Image.debian_slim(python_version=py_major_minor)
@@ -248,7 +257,7 @@ def _create_persistent_app(
     """
     import modal
 
-    image = _build_image(manifest)
+    image = _build_image(manifest, gpu=config.gpu)
     app = modal.App("cloudposterior-persistent")
 
     max_scaledown = 1200  # Modal caps at 20 minutes
