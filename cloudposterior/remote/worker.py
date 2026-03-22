@@ -28,6 +28,14 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
 
     # -- Check JAX device for GPU samplers --
     if nuts_sampler in ("numpyro", "blackjax"):
+        yield msgpack.packb({
+            "type": "phase",
+            "phase": "device",
+            "status": "in_progress",
+            "message": "initializing JAX",
+            "elapsed": 0.0,
+        })
+        jax_start = time.time()
         try:
             import jax
             devices = jax.devices()
@@ -44,7 +52,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
             "phase": "device",
             "status": "done",
             "message": device_msg,
-            "elapsed": 0.0,
+            "elapsed": time.time() - jax_start,
         })
 
     # -- Phase: compiling (if nutpie/numpyro) --
