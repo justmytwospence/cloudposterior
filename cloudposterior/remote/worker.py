@@ -26,6 +26,27 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
     import msgpack
     import pymc as pm
 
+    # -- Check JAX device for GPU samplers --
+    if nuts_sampler in ("numpyro", "blackjax"):
+        try:
+            import jax
+            devices = jax.devices()
+            device_types = [d.platform for d in devices]
+            if "gpu" in device_types:
+                gpu_devices = [d for d in devices if d.platform == "gpu"]
+                device_msg = f"JAX using GPU ({gpu_devices[0].device_kind})"
+            else:
+                device_msg = f"JAX using CPU (no GPU found)"
+            yield msgpack.packb({
+                "type": "phase",
+                "phase": "container_ready",
+                "status": "done",
+                "message": device_msg,
+                "elapsed": 0.0,
+            })
+        except ImportError:
+            pass
+
     # -- Phase: compiling (if nutpie/numpyro) --
     if nuts_sampler == "nutpie":
         compile_start = time.time()
