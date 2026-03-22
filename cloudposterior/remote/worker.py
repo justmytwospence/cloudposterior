@@ -37,15 +37,15 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
                 device_msg = f"JAX using GPU ({gpu_devices[0].device_kind})"
             else:
                 device_msg = f"JAX using CPU (no GPU found)"
-            yield msgpack.packb({
-                "type": "phase",
-                "phase": "device",
-                "status": "done",
-                "message": device_msg,
-                "elapsed": 0.0,
-            })
-        except ImportError:
-            pass
+        except Exception as e:
+            device_msg = f"JAX device check failed: {e}"
+        yield msgpack.packb({
+            "type": "phase",
+            "phase": "device",
+            "status": "done",
+            "message": device_msg,
+            "elapsed": 0.0,
+        })
 
     # -- Phase: compiling (if nutpie/numpyro) --
     if nuts_sampler == "nutpie":
