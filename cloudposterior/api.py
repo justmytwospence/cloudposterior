@@ -85,7 +85,6 @@ class cloud:
         self._env = None
         self._model_bytes: bytes | None = None
         self._data_bytes: bytes | None = None
-        self._gpu_provisioned: bool = (instance == "gpu")
 
     def __enter__(self):
         import pymc as pm
@@ -103,10 +102,6 @@ class cloud:
         self._model_bytes = self.model._cp_model_bytes
         self._data_bytes = self.model._cp_data_bytes
 
-        # Provision persistent environment for remote execution
-        if self.remote:
-            self._provision_environment()
-
         pm.sample = self._make_intercepted_sample()
         self.model.__enter__()
         return self.model
@@ -120,34 +115,13 @@ class cloud:
             self._env = None
         return self.model.__exit__(*exc)
 
-    def _provision_environment(self):
-        from cloudposterior.backends.modal_backend import ModalBackend
-        from cloudposterior.serialize import get_version_manifest, serialize_model, serialize_observed_data
-
-        # Serialize model + data (needed for cache key and Volume upload)
-        self._model_bytes = serialize_model(self.model)
-        self._data_bytes = serialize_observed_data(self.model)
-
-        # Create Modal app and Volume reference (no upload yet -- deferred to first cache miss)
-        config = RemoteConfig.from_instance(
-            self.instance, model=self.model, sample_kwargs={},
-        )
-        manifest = get_version_manifest()
-        backend = ModalBackend(config=config)
-        use_dashboard = self.notify == "dashboard"
-        self._env = backend.provision(
-            self._model_bytes, self.model, manifest, config,
-            project=self.project, idle_timeout=600,
-            dashboard=use_dashboard,
-        )
-
-    def _reprovision_with_gpu(self, nuts_sampler: str):
-        """Re-provision the environment with a GPU for JAX-based samplers."""
+    def _provision_environment(self, nuts_sampler: str = "pymc"):
         from cloudposterior.backends.modal_backend import ModalBackend
         from cloudposterior.serialize import get_version_manifest
 
         config = RemoteConfig.from_instance(
-            "gpu", model=self.model, sample_kwargs={},
+            self.instance, model=self.model, sample_kwargs={},
+            nuts_sampler=nuts_sampler,
         )
         manifest = get_version_manifest()
         backend = ModalBackend(config=config)
@@ -157,7 +131,6 @@ class cloud:
             project=self.project, idle_timeout=600,
             dashboard=use_dashboard,
         )
-        self._gpu_provisioned = True
 
     def destroy(self):
         """Tear down the environment and clean up the project volume.
@@ -183,12 +156,10 @@ class cloud:
             # Extract nuts_sampler from pm.sample() kwargs
             nuts_sampler = kwargs.pop("nuts_sampler", "pymc")
 
-            # Re-provision with GPU if JAX sampler detected on a CPU-only env
-            if (ctx._env is not None
-                    and nuts_sampler in ("numpyro", "blackjax")
-                    and not ctx._gpu_provisioned):
-                ctx._env.teardown()
-                ctx._reprovision_with_gpu(nuts_sampler)
+            # Lazy provisioning: provision on first pm.sample() call
+            # so we know nuts_sampler and can auto-provision GPU if needed
+            if ctx.remote and ctx._env is None:
+                ctx._provision_environment(nuts_sampler)
 
             # Use persistent environment path if provisioned
             if ctx._env is not None:
@@ -591,7 +562,7 @@ def _run_sample_persistent(
     emit(PhaseUpdate(
         phase=JobPhase.PROVISIONING,
         status="in_progress",
-        message="waiting for container",
+        message="provisioning container",
         elapsed=0.0,
     ))
 
