@@ -1,0 +1,173 @@
+"""Live progress dashboard served via Modal web endpoint."""
+
+from __future__ import annotations
+
+from cloudposterior.progress import (
+    JobPhase,
+    PhaseUpdate,
+    SamplingProgress,
+)
+
+
+class DashboardSink:
+    """Sink that writes progress state to a Modal Dict for the dashboard endpoint."""
+
+    def __init__(self, progress_dict):
+        self._dict = progress_dict
+        self._phases: list[dict] = []
+        self._sampling: dict | None = None
+        self._complete = False
+
+    def show_phase(self, update: PhaseUpdate):
+        detail = update.message
+        if update.status == "done" and update.elapsed > 0.1:
+            detail += f" ({update.elapsed:.1f}s)"
+
+        found = False
+        for i, phase in enumerate(self._phases):
+            if phase["label"] == update.phase.value:
+                self._phases[i] = {"status": update.status, "label": update.phase.value, "detail": detail}
+                found = True
+                break
+        if not found:
+            self._phases.append({"status": update.status, "label": update.phase.value, "detail": detail})
+
+        if update.phase == JobPhase.DOWNLOADING and update.status == "done":
+            self._complete = True
+
+        self._write()
+
+    def show_sampling(self, progress: SamplingProgress):
+        chains = {}
+        for chain_id, cp in progress.chains.items():
+            chains[str(chain_id)] = {
+                "draw": cp.draw,
+                "total": cp.total,
+                "phase": cp.phase,
+                "draws_per_sec": cp.draws_per_sec,
+                "eta_seconds": cp.eta_seconds,
+                "divergences": cp.divergences,
+                "step_size": cp.step_size,
+                "tree_size": cp.tree_size,
+            }
+        self._sampling = {
+            "chains": chains,
+            "total_divergences": progress.total_divergences,
+            "elapsed": progress.elapsed,
+        }
+        self._write()
+
+    def _write(self):
+        try:
+            self._dict["progress"] = {
+                "phases": self._phases,
+                "sampling": self._sampling,
+                "complete": self._complete,
+            }
+        except Exception:
+            pass  # best-effort
+
+
+def render_dashboard_html(progress_url: str) -> str:
+    """Render dashboard HTML with the progress endpoint URL baked in."""
+    return DASHBOARD_HTML.replace("__PROGRESS_URL__", progress_url)
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloudposterior</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Menlo', 'Monaco', monospace; font-size: 14px;
+         background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { font-size: 18px; color: #fff; margin-bottom: 16px; }
+  .phase { padding: 3px 0; }
+  .phase .icon { display: inline-block; width: 16px; }
+  .done { color: #5cb85c; }
+  .in_progress { color: #f0ad4e; }
+  .error { color: #d9534f; }
+  .detail { color: #888; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #333; color: #aaa; font-weight: normal; }
+  td { padding: 4px 8px; }
+  .bar-bg { background: #333; border-radius: 3px; height: 14px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .bar-ok { background: #1764f4; }
+  .bar-div { background: #d9534f; }
+  .footer { color: #666; margin-top: 8px; font-size: 12px; }
+  .complete-banner { background: #2d4a2d; color: #5cb85c; padding: 12px; border-radius: 6px;
+                     margin-top: 16px; text-align: center; font-size: 16px; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #555;
+             border-top-color: #f0ad4e; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (max-width: 600px) { body { padding: 12px; font-size: 13px; } }
+</style>
+</head>
+<body>
+<h1>cloudposterior</h1>
+<div id="phases"><div class="phase"><span class="spinner"></span> <span class="detail">waiting for sampling to start...</span></div></div>
+<div id="sampling"></div>
+<div id="banner"></div>
+<script>
+let polling = true;
+async function poll() {
+  if (!polling) return;
+  try {
+    const r = await fetch('__PROGRESS_URL__');
+    const data = await r.json();
+    renderPhases(data.phases || []);
+    renderSampling(data.sampling);
+    if (data.complete) {
+      document.getElementById('banner').innerHTML =
+        '<div class="complete-banner">Sampling complete</div>';
+      polling = false;
+    }
+  } catch (e) {
+    document.getElementById('banner').innerHTML =
+      '<div style="color:#d9534f;padding:8px;font-size:12px;">fetch error: ' + e.message
+      + '<br>url: ' + base + '/progress</div>';
+  }
+  if (polling) setTimeout(poll, 1000);
+}
+function renderPhases(phases) {
+  let html = '';
+  for (const p of phases) {
+    let icon;
+    if (p.status === 'done') icon = '<span class="done">&#10003;</span>';
+    else if (p.status === 'in_progress') icon = '<span class="spinner"></span>';
+    else icon = '<span class="error">&#10007;</span>';
+    html += '<div class="phase">' + icon + ' <span class="detail">' + p.detail + '</span></div>';
+  }
+  document.getElementById('phases').innerHTML = html;
+}
+function renderSampling(s) {
+  if (!s || !s.chains) { document.getElementById('sampling').innerHTML = ''; return; }
+  let html = '<table><tr><th>Chain</th><th>Progress</th><th>Draws</th><th>Div</th><th>Step</th><th>Speed</th><th>ETA</th></tr>';
+  const ids = Object.keys(s.chains).sort((a,b) => +a - +b);
+  for (const id of ids) {
+    const c = s.chains[id];
+    const pct = c.total > 0 ? (c.draw / c.total * 100) : 0;
+    const barClass = c.divergences > 0 ? 'bar-div' : 'bar-ok';
+    const speed = c.draws_per_sec > 0 ? Math.round(c.draws_per_sec) + '/s' : '--';
+    const eta = c.eta_seconds > 0 ? c.eta_seconds.toFixed(0) + 's' : '--';
+    html += '<tr>'
+      + '<td>' + id + ' <span class="detail">[' + c.phase.slice(0,4) + ']</span></td>'
+      + '<td><div class="bar-bg"><div class="bar-fill ' + barClass + '" style="width:' + pct + '%"></div></div></td>'
+      + '<td>' + c.draw + '/' + c.total + '</td>'
+      + '<td' + (c.divergences > 0 ? ' class="error"' : '') + '>' + c.divergences + '</td>'
+      + '<td>' + c.step_size.toFixed(3) + '</td>'
+      + '<td>' + speed + '</td>'
+      + '<td>' + eta + '</td>'
+      + '</tr>';
+  }
+  html += '</table>';
+  html += '<div class="footer">Divergences: ' + s.total_divergences + ' | Elapsed: ' + s.elapsed.toFixed(1) + 's</div>';
+  document.getElementById('sampling').innerHTML = html;
+}
+poll();
+</script>
+</body>
+</html>"""

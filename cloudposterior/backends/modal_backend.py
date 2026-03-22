@@ -237,11 +237,14 @@ def _create_persistent_app(
     manifest: dict[str, str],
     config: RemoteConfig,
     volume,
+    dashboard_dict_name: str | None = None,
+    model_label: str = "model",
 ):
     """Create a Modal app with a class-based sampler and mounted Volume.
 
     The Volume contains model payloads at human-readable paths. The sampler
     loads a payload by path on each call (fast local read from mounted volume).
+    If dashboard_dict is provided, a web endpoint is added for live progress.
     """
     import modal
 
@@ -270,7 +273,42 @@ def _create_persistent_app(
                 f"/data/{payload_path}", sample_kwargs, nuts_sampler,
             )
 
-    return app, Sampler
+    # Add dashboard web endpoints if requested
+    dashboard_fn = None
+    progress_fn = None
+    if dashboard_dict_name is not None:
+        _dict_name = dashboard_dict_name
+        _uid = dashboard_dict_name.replace("cp-dash-", "")[:6]
+
+        @app.function(serialized=True, image=image)
+        @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}")
+        def serve_dashboard():
+            from fastapi.responses import HTMLResponse
+            from cloudposterior.dashboard import render_dashboard_html
+            import modal as _modal
+            try:
+                d = _modal.Dict.from_name(_dict_name)
+                progress_url = d["progress_url"]
+            except (KeyError, Exception):
+                progress_url = ""
+            return HTMLResponse(render_dashboard_html(progress_url))
+
+        @app.function(serialized=True, image=image)
+        @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}-progress")
+        def serve_progress():
+            from fastapi.responses import JSONResponse
+            import modal as _modal
+            try:
+                d = _modal.Dict.from_name(_dict_name)
+                data = d["progress"]
+            except (KeyError, Exception):
+                data = {"phases": [], "sampling": None, "complete": False}
+            return JSONResponse(data)
+
+        dashboard_fn = serve_dashboard
+        progress_fn = serve_progress
+
+    return app, Sampler, dashboard_fn, progress_fn
 
 
 class PersistentModalSamplingJob(SamplingJob):
@@ -358,12 +396,18 @@ def _compute_payload_path(m_slug: str, model_bytes: bytes, data_bytes: bytes) ->
 class ModalEnvironment(RemoteEnvironment):
     """A provisioned Modal environment with payloads in a Volume."""
 
-    def __init__(self, app, sampler_cls, volume, project: str, model_slug: str):
+    def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
+                 dashboard_dict=None, dashboard_fn=None, progress_fn=None):
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
         self._project = project
         self._model_slug = model_slug
+        self._dashboard_dict = dashboard_dict
+        self._dashboard_fn = dashboard_fn
+        self._progress_fn = progress_fn
+        self._dashboard_url: str | None = None
+        self._progress_url: str | None = None
         self._exit_stack = contextlib.ExitStack()
         self._running = False
         self._uploaded_hashes: set[str] = set()
@@ -375,6 +419,21 @@ class ModalEnvironment(RemoteEnvironment):
             except Exception as exc:
                 raise _handle_modal_error(exc)
             self._running = True
+
+            # Capture dashboard URLs after app starts
+            if self._dashboard_fn is not None:
+                try:
+                    self._dashboard_url = self._dashboard_fn.get_web_url()
+                except Exception:
+                    pass
+            if self._progress_fn is not None:
+                try:
+                    self._progress_url = self._progress_fn.get_web_url()
+                    # Store progress URL in Dict so dashboard endpoint can find it
+                    if self._dashboard_dict is not None and self._progress_url:
+                        self._dashboard_dict["progress_url"] = self._progress_url
+                except Exception:
+                    pass
 
     def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
         """Upload model payload to Volume if not already there. Returns True if uploaded."""
@@ -450,9 +509,11 @@ class ModalBackend(ComputeBackend):
         config: RemoteConfig,
         project: str = "cloudposterior",
         idle_timeout: int = 600,
+        dashboard: bool = False,
     ) -> ModalEnvironment:
         """Provision a persistent environment (no upload -- deferred to first cache miss)."""
         import modal
+        import uuid
 
         from cloudposterior.naming import model_slug as compute_model_slug
 
@@ -465,8 +526,24 @@ class ModalBackend(ComputeBackend):
 
         m_slug = compute_model_slug(model)
 
-        app, sampler_cls = _create_persistent_app(version_manifest, config, volume)
-        return ModalEnvironment(app, sampler_cls, volume, project, m_slug)
+        # Create dashboard Dict if requested
+        dashboard_dict = None
+        dashboard_dict_name = None
+        if dashboard:
+            dashboard_dict_name = f"cp-dash-{uuid.uuid4().hex[:8]}"
+            dashboard_dict = modal.Dict.from_name(dashboard_dict_name, create_if_missing=True)
+
+        app, sampler_cls, dashboard_fn, progress_fn = _create_persistent_app(
+            version_manifest, config, volume,
+            dashboard_dict_name=dashboard_dict_name,
+            model_label=m_slug.replace("_", "-"),
+        )
+        return ModalEnvironment(
+            app, sampler_cls, volume, project, m_slug,
+            dashboard_dict=dashboard_dict,
+            dashboard_fn=dashboard_fn,
+            progress_fn=progress_fn,
+        )
 
     @staticmethod
     def cleanup_volumes(project: str = "cloudposterior") -> None:

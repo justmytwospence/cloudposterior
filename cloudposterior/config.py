@@ -92,6 +92,7 @@ DEFAULT_PACKAGES = [
     "cloudpickle",
     "lz4",
     "msgpack",
+    "fastapi[standard]",
 ]
 
 OPTIONAL_PACKAGES = {

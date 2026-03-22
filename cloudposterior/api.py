@@ -50,7 +50,8 @@ class cloud:
         with cp.cloud(model, remote=True):             # run on Modal VM
         with cp.cloud(model, cache="disk"):            # persistent disk cache
         with cp.cloud(model, cache=False):             # disable caching
-        with cp.cloud(model, notify=True):             # ntfy.sh notifications
+        with cp.cloud(model, remote=True, notify=True):  # live dashboard
+        with cp.cloud(model, notify=True):               # ntfy notifications (local)
 
         # Container reuse within a session:
         with cp.cloud(model, remote=True):
@@ -73,7 +74,11 @@ class cloud:
         self.model = model
         self.remote = remote
         self.cache = cache
-        self.notify = notify
+        # notify=True defaults to dashboard for remote, ntfy for local
+        if notify is True and remote:
+            self.notify = "dashboard"
+        else:
+            self.notify = notify
         self.instance = instance
         self.nuts_sampler = nuts_sampler
         self.progress = progress
@@ -119,9 +124,11 @@ class cloud:
         )
         manifest = get_version_manifest()
         backend = ModalBackend(config=config, nuts_sampler=self.nuts_sampler)
+        use_dashboard = self.notify == "dashboard"
         self._env = backend.provision(
             self._model_bytes, self.model, manifest, config,
             project=self.project, idle_timeout=600,
+            dashboard=use_dashboard,
         )
 
     def destroy(self):
@@ -224,7 +231,6 @@ def _run_sample(
         instance_desc = "local"
 
     # For local runs, skip progress display -- let PyMC show its native output.
-    # Only build notification sinks if needed.
     if remote:
         sinks = _build_sinks(
             progress=progress,
@@ -276,7 +282,8 @@ def _run_sample(
     return idata
 
 
-def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None) -> list:
+def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None,
+                 dashboard_dict=None) -> list:
     """Create display + notification sinks."""
     sinks = []
 
@@ -290,7 +297,12 @@ def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None) -> l
             display.start()
         sinks.append(display)
 
-    if notify:
+    if notify == "dashboard" and dashboard_dict is not None:
+        from cloudposterior.dashboard import DashboardSink
+
+        sink = DashboardSink(dashboard_dict)
+        sinks.append(sink)
+    elif notify and notify != "dashboard":
         from cloudposterior.notify import NtfyNotifier
 
         if isinstance(notify, dict):
@@ -312,13 +324,13 @@ def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None) -> l
         )
         sinks.append(notifier)
 
-        _show_ntfy_link(notifier.url, show_qr=auto_generated)
+        _show_link(notifier.url, label="Notifications", show_qr=auto_generated)
 
     return sinks
 
 
-def _show_ntfy_link(url: str, show_qr: bool = False):
-    """Display the ntfy notification URL, with optional QR code."""
+def _show_link(url: str, label: str = "Link", show_qr: bool = False):
+    """Display a URL with optional QR code."""
     from cloudposterior.display import _is_notebook
 
     if _is_notebook():
@@ -326,7 +338,7 @@ def _show_ntfy_link(url: str, show_qr: bool = False):
 
         parts = [
             f'<div style="font-family:monospace;font-size:12px;padding:4px 0;">',
-            f'Notifications: <a href="{url}" target="_blank">{url}</a>',
+            f'{label}: <a href="{url}" target="_blank">{url}</a>',
         ]
         if show_qr:
             try:
@@ -347,7 +359,7 @@ def _show_ntfy_link(url: str, show_qr: bool = False):
         from rich.console import Console
 
         console = Console()
-        console.print(f"[dim]Notifications: {url}[/dim]")
+        console.print(f"[dim]{label}: {url}[/dim]")
         if show_qr:
             try:
                 import qrcode
@@ -479,7 +491,18 @@ def _run_sample_persistent(
         notify=notify,
         instance_desc=instance_desc,
         model=model,
+        dashboard_dict=getattr(env, "_dashboard_dict", None),
     )
+
+    # Start the app early if dashboard is requested, so we can show the URL
+    if notify == "dashboard" and env._dashboard_fn is not None:
+        env._ensure_running()
+        dashboard_url = env._dashboard_url
+        if dashboard_url:
+            # Ensure URL ends with / so the ASGI app serves from root
+            if not dashboard_url.endswith("/"):
+                dashboard_url += "/"
+            _show_link(dashboard_url, label="Dashboard", show_qr=True)
 
     def emit(event):
         for sink in sinks:
@@ -527,6 +550,7 @@ def _run_sample_persistent(
 
     provision_start = time.time()
     first_event = True
+    download_start = None
     for event in job.stream_progress():
         if first_event:
             emit(PhaseUpdate(
@@ -537,8 +561,25 @@ def _run_sample_persistent(
             ))
             first_event = False
         emit(event)
+        # Start download timer when sampling completes (remote compression + transfer follows)
+        if isinstance(event, PhaseUpdate) and event.phase == JobPhase.SAMPLING and event.status == "done":
+            download_start = time.time()
+            emit(PhaseUpdate(
+                phase=JobPhase.DOWNLOADING,
+                status="in_progress",
+                message="compressing and transferring trace",
+                elapsed=0.0,
+            ))
 
+    # result() does local lz4 decompression + netcdf parsing
     idata = job.result()
+
+    emit(PhaseUpdate(
+        phase=JobPhase.DOWNLOADING,
+        status="done",
+        message="trace loaded",
+        elapsed=time.time() - (download_start or time.time()),
+    ))
 
     if cache_backend is not None and cache_key:
         cache_backend.save(cache_key, idata, sample_kwargs=sample_kwargs)

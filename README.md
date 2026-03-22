@@ -118,36 +118,23 @@ Results are stored in a human-readable directory tree:
 
 Model names come from `pm.Model(name="radon_intercepts")`. The hash suffix ensures uniqueness when non-displayed parameters (like `random_seed`) differ.
 
-### Phone notifications
+### Monitoring
 
-Monitor sampling from your phone (or anywhere) via [ntfy](https://ntfy.sh) push notifications. Progress updates live with per-chain stats, divergence counts, and speed.
+Two ways to monitor sampling:
+
+**Live dashboard** (default for remote) -- a web page with per-chain progress bars updating in real time:
 
 ```python
 with cp.cloud(model, remote=True, notify=True):
-    idata = pm.sample(draws=10000, chains=8)
+    idata = pm.sample(draws=5000, chains=8)
 ```
 
-cloudposterior prints a link and QR code you can scan to subscribe:
+Scan the QR code or open the URL on your phone. No app install needed.
 
-```
-Notifications: https://ntfy.sh/eight-schools-subtle-pug
-[QR CODE]
-```
-
-Notifications include a live-updating markdown table:
-
-```
-[done] serializing (0.1s) | [done] uploaded (1.2s) | [done] provisioned (3.1s)
-
-| Chain | Progress    | Draws     | Div | Step  | Speed  |
-|-------|-------------|-----------|-----|-------|--------|
-| 0     | ========>.. | 1200/2000 | 0   | 0.832 | 421/s  |
-| 1     | =======>... | 1180/2000 | 2   | 0.741 | 398/s  |
-```
-
-Custom topic or self-hosted server:
+**Push notifications** (default for local) -- get notified when sampling starts and completes via [ntfy](https://ntfy.sh):
 
 ```python
+with cp.cloud(model, notify=True):                                           # ntfy (local)
 with cp.cloud(model, notify="my-channel"):                                   # custom topic
 with cp.cloud(model, notify={"server": "https://ntfy.example.com"}):         # self-hosted
 ```

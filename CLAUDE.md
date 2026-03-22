@@ -59,6 +59,12 @@ Human-readable names for browsability, machine hashes for correctness:
 
 Shared utilities in `naming.py`: `model_slug()`, `data_slug()`, `payload_hash()`, `wordhash()`
 
+### Live dashboard (`notify="dashboard"` or `notify=True` with `remote=True`)
+
+`dashboard.py` contains `DashboardSink` (writes progress to a Modal Dict) and `DASHBOARD_HTML` (self-contained page with JS polling). Two `@modal.fastapi_endpoint` functions serve the HTML and progress JSON. The dashboard URL includes the model name for readability (e.g., `radon-intercepts-a3f7b2-dev.modal.run`).
+
+When `notify=True` and `remote=True`, defaults to dashboard. When local, defaults to ntfy (start + complete notifications only).
+
 ### Remote worker
 
 `remote/worker.py` runs inside Modal containers. It is never imported locally -- Modal serializes and executes it. It deserializes the model, runs sampling with a progress callback that streams per-chain stats via a queue, and returns lz4-compressed NetCDF.
