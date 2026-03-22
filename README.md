@@ -253,7 +253,7 @@ idata = cp.sample(model, draws=2000, chains=4, remote=True)
 
 ## Example
 
-See [examples/radon.ipynb](examples/radon.ipynb) for a complete walkthrough using the Minnesota Radon dataset: remote execution, caching, and model iteration.
+See [examples/radon.ipynb](examples/radon.ipynb) for a complete walkthrough using the Minnesota Radon dataset: remote execution, caching, and model iteration. Clone and run locally for the full interactive progress display.
 
 ---
 
