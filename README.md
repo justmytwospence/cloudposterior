@@ -7,7 +7,7 @@ cloudposterior lets you run PyMC models on cloud VMs without changing your sampl
 ```python
 import cloudposterior as cp
 
-with cp.wrap(model, remote=True):
+with cp.cloud(model, remote=True):
     idata = pm.sample(draws=5000, chains=8)  # 8 cores in the cloud, zero config
 ```
 
@@ -46,7 +46,7 @@ with pm.Model() as my_model:
     pm.Normal("obs", mu, sigma, observed=data)
 
 # This is the only line you add:
-with cp.wrap(my_model, remote=True, cache="disk"):
+with cp.cloud(my_model, remote=True, cache="disk"):
     idata = pm.sample(draws=2000, chains=4)
 ```
 
@@ -61,7 +61,7 @@ Second time you run that cell? Instant. The result is already cached.
 Offload MCMC to cloud VMs. No Docker, no infrastructure, no config files. [Modal](https://modal.com) handles containers, scaling, and cleanup.
 
 ```python
-with cp.wrap(model, remote=True):
+with cp.cloud(model, remote=True):
     idata = pm.sample(draws=5000, chains=8)
 ```
 
@@ -83,7 +83,7 @@ cloudposterior -- Modal (auto-sized: 8 cores, 8GB)
 Want explicit control? Use a preset:
 
 ```python
-with cp.wrap(model, remote=True, instance="xlarge"):  # 32 cores, 64GB
+with cp.cloud(model, remote=True, instance="xlarge"):  # 32 cores, 64GB
     ...
 ```
 
@@ -92,17 +92,17 @@ with cp.wrap(model, remote=True, instance="xlarge"):  # 32 cores, 64GB
 Re-running a notebook cell? If the model, data, and sampling config haven't changed, cloudposterior returns the cached result instantly. No wasted compute. Caching is **on by default**.
 
 ```python
-with cp.wrap(model):
+with cp.cloud(model):
     idata = pm.sample(draws=2000)  # samples normally
 
-with cp.wrap(model):
+with cp.cloud(model):
     idata = pm.sample(draws=2000)  # instant -- cached
 ```
 
 For persistence across kernel restarts, use disk caching:
 
 ```python
-with cp.wrap(model, cache="disk"):
+with cp.cloud(model, cache="disk"):
     idata = pm.sample(draws=2000)
 ```
 
@@ -110,22 +110,20 @@ Results are stored in a human-readable directory tree:
 
 ```
 .cloudposterior/
-    eight_schools/
-        data-gentle-fox/
-            draws2000_tune1000_chains4.nc
-    my_regression/
-        data-watchful-panda/
-            draws5000_tune2000_chains8.nc
+├── radon_intercepts/
+│   └── draws2000_tune1000_chains4-a3f7b2c9.nc
+└── radon_slopes/
+    └── draws2000_tune1000_chains4-7c2e5fa8.nc
 ```
 
-Model names are derived automatically from your code -- `pm.Model(name="eight_schools")`, or the variable name you used (`with pm.Model() as my_regression:`), or the names of your random variables.
+Model names come from `pm.Model(name="radon_intercepts")`. The hash suffix ensures uniqueness when non-displayed parameters (like `random_seed`) differ.
 
 ### Phone notifications
 
 Monitor sampling from your phone (or anywhere) via [ntfy](https://ntfy.sh) push notifications. Progress updates live with per-chain stats, divergence counts, and speed.
 
 ```python
-with cp.wrap(model, remote=True, notify=True):
+with cp.cloud(model, remote=True, notify=True):
     idata = pm.sample(draws=10000, chains=8)
 ```
 
@@ -150,8 +148,8 @@ Notifications include a live-updating markdown table:
 Custom topic or self-hosted server:
 
 ```python
-with cp.wrap(model, notify="my-channel"):                                   # custom topic
-with cp.wrap(model, notify={"server": "https://ntfy.example.com"}):         # self-hosted
+with cp.cloud(model, notify="my-channel"):                                   # custom topic
+with cp.cloud(model, notify={"server": "https://ntfy.example.com"}):         # self-hosted
 ```
 
 ### Live progress display
@@ -179,10 +177,10 @@ Notebooks get an ipywidgets GUI. Terminals get a Rich TUI. Progress bars turn re
 Mix and match:
 
 ```python
-with cp.wrap(model):                                          # local + memory cache
-with cp.wrap(model, cache="disk"):                            # local + disk cache
-with cp.wrap(model, remote=True):                             # cloud + memory cache
-with cp.wrap(model, remote=True, cache="disk", notify=True):  # everything
+with cp.cloud(model):                                          # local + memory cache
+with cp.cloud(model, cache="disk"):                            # local + disk cache
+with cp.cloud(model, remote=True):                             # cloud + memory cache
+with cp.cloud(model, remote=True, cache="disk", notify=True):  # everything
 ```
 
 ---
@@ -224,9 +222,22 @@ The backend is abstracted behind a `ComputeBackend` interface. Support for addit
 ## How it works
 
 1. **Serialize** -- Model and observed data are serialized with cloudpickle + lz4. A version manifest captures your exact package versions.
-2. **Ship** -- Payload is sent to Modal, which builds a matching container image (cached after first run). VM resources are auto-sized to your model.
-3. **Sample** -- `pm.sample()` runs remotely with a callback that streams per-chain progress back in real time via msgpack.
+2. **Upload once** -- The serialized payload is uploaded to a Modal Volume the first time. Subsequent calls with the same model + data skip the upload entirely.
+3. **Sample** -- `pm.sample()` runs remotely. The container loads the payload from the mounted Volume (fast local read) and streams per-chain progress back in real time via msgpack. Only sample kwargs are sent over the wire per call.
 4. **Return** -- The InferenceData trace is compressed as NetCDF, sent back, and cached.
+
+Containers stay warm for 20 minutes after the last run, so iterating on sampling settings is near-instant.
+
+---
+
+## Cleanup
+
+Model payloads are stored in a project-scoped Modal Volume. Delete when you're done:
+
+```python
+cp.cleanup_volumes()                        # delete default project volume
+cp.cleanup_volumes(project="my-research")   # delete specific project
+```
 
 ---
 
@@ -240,9 +251,15 @@ idata = cp.sample(model, draws=2000, chains=4, remote=True)
 
 ---
 
+## Example
+
+See [examples/radon.ipynb](examples/radon.ipynb) for a complete walkthrough using the Minnesota Radon dataset: remote execution, caching, and model iteration.
+
+---
+
 ## Status
 
-This is an early proof of concept. It works end-to-end with 30 passing tests, but expect rough edges. Contributions and feedback welcome.
+Early proof of concept. Works end-to-end with 43 passing tests, but expect rough edges. Contributions and feedback welcome.
 
 ## License
 

@@ -99,6 +99,15 @@ def _sampling_table_html(progress: SamplingProgress) -> str:
     )
 
 
+_CSS_SPINNER = (
+    '<style>@keyframes cp-spin{to{transform:rotate(360deg)}}</style>'
+    '<span style="display:inline-block;width:10px;height:10px;'
+    'border:2px solid #555;border-top-color:#f0ad4e;border-radius:50%;'
+    'animation:cp-spin 0.8s linear infinite;vertical-align:middle;'
+    'margin-right:6px;"></span>'
+)
+
+
 def _phase_html(phases: list[tuple[str, str, str]]) -> str:
     """Render phase checklist as HTML. Each tuple: (status, label, detail)."""
     lines = []
@@ -111,7 +120,7 @@ def _phase_html(phases: list[tuple[str, str, str]]) -> str:
             icon = '<span style="color:#d9534f;">&#10007;</span>'
         lines.append(
             f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
-            f'  {icon} {label} '
+            f'  {icon} '
             f'<span style="color:#888;">{detail}</span>'
             f'</div>'
         )
@@ -138,61 +147,45 @@ class NotebookDisplay:
             f'{" -- " + instance_desc if instance_desc else ""}</div>'
         )
         self._phase_widget = widgets.HTML(value="")
+        self._status_widget = widgets.HTML(value="")
         self._sampling_widget = widgets.HTML(value="")
-        self._modal_output = widgets.Output(layout=widgets.Layout(
-            max_height="200px",
-            overflow_y="auto",
-            border="1px solid #444",
-            padding="4px",
-            margin="2px 0 4px 0",
-        ))
-        self._modal_accordion = widgets.Accordion(children=[self._modal_output])
-        self._modal_accordion.set_title(0, "Modal build logs")
-        self._modal_accordion.selected_index = None  # collapsed
 
         self._container = widgets.VBox([
             self._header,
             self._phase_widget,
+            self._status_widget,
             self._sampling_widget,
         ])
         self._handle = self._display(self._container, display_id=True)
-        self._modal_shown = False
-
-    @property
-    def modal_output_widget(self):
-        """The Output widget that captures Modal's stdout."""
-        return self._modal_output
 
     def show_phase(self, update: PhaseUpdate):
         detail = update.message
-        if update.status == "done":
+        if update.status == "done" and update.elapsed > 0.1:
             detail += f" ({_format_time(update.elapsed)})"
 
-        # Update or add phase
-        found = False
-        for i, (s, label, d) in enumerate(self._phases):
-            if label == update.phase.value:
-                self._phases[i] = (update.status, update.phase.value, detail)
-                found = True
-                break
-        if not found:
-            self._phases.append((update.status, update.phase.value, detail))
+        if update.status == "in_progress":
+            # Show only the spinner, not a checklist entry
+            self._status_widget.value = (
+                f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
+                f'  {_CSS_SPINNER}'
+                f'<span style="color:#888;">{update.message}...</span>'
+                f'</div>'
+            )
+        else:
+            # Clear spinner and add completed/error entry to checklist
+            self._status_widget.value = ""
 
-        self._phase_widget.value = _phase_html(self._phases)
+            # Update existing or add new
+            found = False
+            for i, (s, label, d) in enumerate(self._phases):
+                if label == update.phase.value:
+                    self._phases[i] = (update.status, update.phase.value, detail)
+                    found = True
+                    break
+            if not found:
+                self._phases.append((update.status, update.phase.value, detail))
 
-        # Show modal accordion during provisioning
-        if update.phase == JobPhase.PROVISIONING and update.status == "in_progress":
-            if not self._modal_shown:
-                self._container.children = [
-                    self._header,
-                    self._phase_widget,
-                    self._modal_accordion,
-                    self._sampling_widget,
-                ]
-                self._modal_accordion.selected_index = 0  # expanded
-                self._modal_shown = True
-        elif update.phase == JobPhase.PROVISIONING and update.status == "done":
-            self._modal_accordion.selected_index = None  # collapse
+            self._phase_widget.value = _phase_html(self._phases)
 
     def show_sampling(self, progress: SamplingProgress):
         self._sampling_widget.value = _sampling_table_html(progress)
@@ -215,7 +208,8 @@ class TerminalDisplay:
 
         self._console = Console()
         self._instance_desc = instance_desc
-        self._phases: list[tuple[str, str, str]] = []
+        self._phases: list[tuple[str, str, str]] = []  # completed/error phases only
+        self._active_phase: str | None = None  # in-progress message for spinner
         self._sampling: SamplingProgress | None = None
         self._live = Live(console=self._console, refresh_per_second=4)
 
@@ -229,17 +223,22 @@ class TerminalDisplay:
 
     def show_phase(self, update: PhaseUpdate):
         detail = update.message
-        if update.status == "done":
+        if update.status == "done" and update.elapsed > 0.1:
             detail += f" ({_format_time(update.elapsed)})"
 
-        found = False
-        for i, (s, label, d) in enumerate(self._phases):
-            if label == update.phase.value:
-                self._phases[i] = (update.status, update.phase.value, detail)
-                found = True
-                break
-        if not found:
-            self._phases.append((update.status, update.phase.value, detail))
+        if update.status == "in_progress":
+            self._active_phase = update.message
+        else:
+            self._active_phase = None
+            # Add to completed checklist
+            found = False
+            for i, (s, label, d) in enumerate(self._phases):
+                if label == update.phase.value:
+                    self._phases[i] = (update.status, update.phase.value, detail)
+                    found = True
+                    break
+            if not found:
+                self._phases.append((update.status, update.phase.value, detail))
 
         self._update_live()
 
@@ -248,11 +247,11 @@ class TerminalDisplay:
         self._update_live()
 
     def _update_live(self):
+        from rich.columns import Columns
         from rich.console import Group
+        from rich.spinner import Spinner
         from rich.table import Table
         from rich.text import Text
-        from rich.panel import Panel
-        from rich.style import Style
 
         parts = []
 
@@ -261,15 +260,21 @@ class TerminalDisplay:
         parts.append(Text(header, style="bold"))
         parts.append(Text(""))
 
-        # Phase checklist
+        # Completed phases
         for status, label, detail in self._phases:
             if status == "done":
-                icon = "[green]\u2713[/green]"
-            elif status == "in_progress":
-                icon = "[yellow]\u25cf[/yellow]"
+                parts.append(Text.from_markup(
+                    f"  [green]\u2713[/green] [dim]{detail}[/dim]"
+                ))
             else:
-                icon = "[red]\u2717[/red]"
-            parts.append(Text.from_markup(f"  {icon} {label}  [dim]{detail}[/dim]"))
+                parts.append(Text.from_markup(
+                    f"  [red]\u2717[/red] [dim]{detail}[/dim]"
+                ))
+
+        # Active spinner for in-progress phase
+        if self._active_phase:
+            spinner = Spinner("dots", f"[dim]{self._active_phase}...[/dim]", style="yellow")
+            parts.append(Columns(["  ", spinner], padding=0))
 
         # Sampling table
         if self._sampling and self._sampling.chains:

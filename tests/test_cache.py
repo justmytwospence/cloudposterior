@@ -7,11 +7,10 @@ import pymc as pm
 from cloudposterior.cache import (
     MemoryCache,
     DiskCache,
-    compute_cache_key,
     resolve_cache,
-    _model_slug,
 )
-from cloudposterior.serialize import serialize_model, serialize_observed_data
+from cloudposterior.naming import cache_key, model_slug
+from cloudposterior.serialize import serialize_model
 
 
 def _make_model(name=""):
@@ -26,14 +25,13 @@ def _make_model(name=""):
 
 
 def test_cache_key_deterministic():
-    """Same model + data + kwargs should produce the same key."""
+    """Same model + kwargs should produce the same key."""
     model = _make_model()
     mb = serialize_model(model)
-    db = serialize_observed_data(model)
     kwargs = {"draws": 100, "tune": 50, "chains": 2}
 
-    key1 = compute_cache_key(mb, db, kwargs)
-    key2 = compute_cache_key(mb, db, kwargs)
+    key1 = cache_key(mb, kwargs)
+    key2 = cache_key(mb, kwargs)
     assert key1 == key2
     assert len(key1) == 64  # SHA-256 hex
 
@@ -42,10 +40,9 @@ def test_cache_key_changes_with_kwargs():
     """Different kwargs should produce a different key."""
     model = _make_model()
     mb = serialize_model(model)
-    db = serialize_observed_data(model)
 
-    key1 = compute_cache_key(mb, db, {"draws": 100})
-    key2 = compute_cache_key(mb, db, {"draws": 200})
+    key1 = cache_key(mb, {"draws": 100})
+    key2 = cache_key(mb, {"draws": 200})
     assert key1 != key2
 
 
@@ -66,34 +63,35 @@ def test_disk_cache_roundtrip(tmp_path):
         idata = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
 
     sample_kwargs = {"draws": 10, "tune": 10, "chains": 1}
-    data_bytes = b"fake-observed-data"
+    key = "a1b2c3d4e5f6g7h8"  # simulate a real cache key hash
 
     cache = DiskCache(base_dir=tmp_path, model=model)
-    assert cache.load("testkey", data_bytes=data_bytes, sample_kwargs=sample_kwargs) is None
+    assert cache.load(key, sample_kwargs=sample_kwargs) is None
 
-    cache.save("testkey", idata, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
-    loaded = cache.load("testkey", data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+    cache.save(key, idata, sample_kwargs=sample_kwargs)
+    loaded = cache.load(key, sample_kwargs=sample_kwargs)
     assert loaded is not None
     assert "posterior" in loaded.groups()
     rv_names = list(loaded.posterior.data_vars)
     assert any("mu" in name for name in rv_names)
 
-    # Check directory structure: model_name/data_slug/params.nc
+    # Check directory structure: model_name/params-hash.nc
     nc_files = list(tmp_path.rglob("*.nc"))
     assert len(nc_files) == 1
     path = nc_files[0]
     assert "test_model" in str(path)
     assert "draws10_tune10_chains1" in path.name
+    assert key[:8] in path.name  # hash suffix for uniqueness
 
 
 def test_model_slug_named():
     model = _make_model("Eight Schools")
-    assert _model_slug(model) == "eight_schools"
+    assert model_slug(model) == "eight_schools"
 
 
 def test_model_slug_unnamed():
     model = _make_model()
-    slug = _model_slug(model)
+    slug = model_slug(model)
     assert "mu" in slug
     assert "tau" in slug
 

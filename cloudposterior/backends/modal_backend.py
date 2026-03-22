@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
+import tempfile
 import time
 from contextlib import nullcontext as _nullcontext
 from typing import Iterator
 
 import msgpack
 
-from cloudposterior.backends import ComputeBackend, SamplingJob
+from cloudposterior.backends import ComputeBackend, RemoteEnvironment, SamplingJob
 from cloudposterior.config import DEFAULT_PACKAGES, OPTIONAL_PACKAGES, RemoteConfig
 from cloudposterior.progress import (
     ChainProgress,
@@ -19,6 +21,27 @@ from cloudposterior.progress import (
     SamplingProgress,
 )
 from cloudposterior.serialize import SamplingPayload
+
+
+_MODAL_SETUP_MSG = (
+    "Modal is not authenticated. To set up cloud execution:\n"
+    "\n"
+    "  uv add modal\n"
+    "  uv run modal setup\n"
+    "\n"
+    "This opens a browser window to link your Modal account.\n"
+    "See https://modal.com/docs/guide for details."
+)
+
+
+def _handle_modal_error(exc: Exception) -> Exception:
+    """Wrap Modal auth/connection errors with a friendly message."""
+    msg = str(exc).lower()
+    if "authenticate" in msg or "token" in msg or "credential" in msg or "setup" in msg:
+        err = RuntimeError(_MODAL_SETUP_MSG)
+        err.__cause__ = exc
+        return err
+    return exc
 
 
 def _build_pip_specs(manifest: dict[str, str]) -> list[str]:
@@ -88,12 +111,7 @@ class ModalSamplingJob(SamplingJob):
         self._events: list[ProgressEvent] = []
 
     def stream_progress(self, output_widget=None) -> Iterator[ProgressEvent]:
-        """Submit to Modal and yield progress events.
-
-        Args:
-            output_widget: Optional ipywidgets.Output to capture Modal's stdout into.
-                           If provided, Modal output goes into the widget instead of stdout.
-        """
+        """Submit to Modal and yield progress events."""
         import modal
 
         app, remote_sample = _create_modal_app(
@@ -101,15 +119,14 @@ class ModalSamplingJob(SamplingJob):
             self._config,
         )
 
-        # In notebooks, capture Modal output into the widget
-        # In terminal, let Modal render normally
-        modal_ctx = modal.enable_output()
-        widget_ctx = output_widget if output_widget is not None else _nullcontext()
-
-        with modal_ctx as output_manager:
-            if output_widget is not None:
-                output_manager.set_quiet_mode(True)
-            with widget_ctx, app.run():
+        # Don't call modal.enable_output() -- it enables a spinner and status
+        # lines that interleave with our own progress display. Without it,
+        # Modal runs silently and we show progress via our own Rich/ipywidgets UI.
+        try:
+            run_ctx = app.run()
+        except Exception as exc:
+            raise _handle_modal_error(exc)
+        with run_ctx:
                 gen = remote_sample.remote_gen(
                     self._payload.model_bytes,
                     self._payload.data_bytes,
@@ -201,6 +218,220 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
     return None
 
 
+def _build_image(manifest: dict[str, str]):
+    """Build a Modal image with packages matching the version manifest."""
+    import modal
+
+    python_version = manifest.get("python", "3.11.0")
+    py_major_minor = ".".join(python_version.split(".")[:2])
+    pip_specs = _build_pip_specs(manifest)
+
+    return (
+        modal.Image.debian_slim(python_version=py_major_minor)
+        .uv_pip_install(pip_specs)
+        .add_local_python_source("cloudposterior")
+    )
+
+
+def _create_persistent_app(
+    manifest: dict[str, str],
+    config: RemoteConfig,
+    volume,
+):
+    """Create a Modal app with a class-based sampler and mounted Volume.
+
+    The Volume contains model payloads at human-readable paths. The sampler
+    loads a payload by path on each call (fast local read from mounted volume).
+    """
+    import modal
+
+    image = _build_image(manifest)
+    app = modal.App("cloudposterior-persistent")
+
+    max_scaledown = 1200  # Modal caps at 20 minutes
+    scaledown = min(config.idle_timeout, max_scaledown)
+
+    @app.cls(
+        image=image,
+        serialized=True,
+        cpu=config.cpu,
+        memory=config.memory,
+        timeout=config.timeout,
+        scaledown_window=scaledown,
+        volumes={"/data": volume},
+        **({"gpu": config.gpu} if config.gpu else {}),
+    )
+    class Sampler:
+        @modal.method(is_generator=True)
+        def sample(self, payload_path: str, sample_kwargs: dict, nuts_sampler: str = "pymc"):
+            from cloudposterior.remote.worker import run_sampling_from_volume
+
+            yield from run_sampling_from_volume(
+                f"/data/{payload_path}", sample_kwargs, nuts_sampler,
+            )
+
+    return app, Sampler
+
+
+class PersistentModalSamplingJob(SamplingJob):
+    """Sampling job that uses an already-provisioned Modal environment."""
+
+    def __init__(
+        self,
+        sampler_cls,
+        payload_path: str,
+        sample_kwargs: dict,
+        nuts_sampler: str,
+    ):
+        self._sampler_cls = sampler_cls
+        self._payload_path = payload_path
+        self._sample_kwargs = sample_kwargs
+        self._nuts_sampler = nuts_sampler
+        self._idata_bytes: bytes | None = None
+        self._events: list[ProgressEvent] = []
+
+    def stream_progress(self, output_widget=None) -> Iterator[ProgressEvent]:
+        sampler = self._sampler_cls()
+        gen = sampler.sample.remote_gen(
+            self._payload_path,
+            self._sample_kwargs,
+            self._nuts_sampler,
+        )
+
+        for chunk in gen:
+            try:
+                decoded = msgpack.unpackb(chunk, raw=False)
+            except Exception:
+                self._idata_bytes = chunk
+                continue
+
+            event = _decode_progress_event(decoded)
+            if event is not None:
+                self._events.append(event)
+                yield event
+            elif decoded.get("type") == "result":
+                pass
+
+    def result(self):
+        import arviz as az
+        import lz4.frame
+
+        if self._idata_bytes is None:
+            for _ in self.stream_progress():
+                pass
+
+        if self._idata_bytes is None:
+            raise RuntimeError("Sampling did not produce results")
+
+        import os
+
+        raw = lz4.frame.decompress(self._idata_bytes)
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            idata = az.from_netcdf(tmp_path)
+            for group in idata.groups():
+                getattr(idata, group).load()
+            return idata
+        finally:
+            os.unlink(tmp_path)
+
+    def cancel(self):
+        pass
+
+
+def _compute_payload_path(m_slug: str, model_bytes: bytes, data_bytes: bytes) -> str:
+    """Compute the Volume path for a model payload.
+
+    Human-readable directory structure, machine-correct filename.
+    Args:
+        m_slug: Pre-computed model slug (stable, not stack-dependent).
+    """
+    from cloudposterior.naming import data_slug, payload_hash
+
+    d_slug = data_slug(data_bytes)
+    p_hash = payload_hash(model_bytes)
+    return f"{m_slug}/{d_slug}/payload-{p_hash}.bin"
+
+
+class ModalEnvironment(RemoteEnvironment):
+    """A provisioned Modal environment with payloads in a Volume."""
+
+    def __init__(self, app, sampler_cls, volume, project: str, model_slug: str):
+        self._app = app
+        self._sampler_cls = sampler_cls
+        self._volume = volume
+        self._project = project
+        self._model_slug = model_slug
+        self._exit_stack = contextlib.ExitStack()
+        self._running = False
+        self._uploaded_hashes: set[str] = set()
+
+    def _ensure_running(self):
+        if not self._running:
+            try:
+                self._exit_stack.enter_context(self._app.run())
+            except Exception as exc:
+                raise _handle_modal_error(exc)
+            self._running = True
+
+    def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
+        """Upload model payload to Volume if not already there. Returns True if uploaded."""
+        from cloudposterior.naming import payload_hash
+
+        p_hash = payload_hash(model_bytes)
+        if p_hash in self._uploaded_hashes:
+            return False
+
+        # Check Volume
+        try:
+            dir_path = "/".join(payload_path.split("/")[:-1])
+            entries = self._volume.listdir(f"/{dir_path}")
+            filename = payload_path.split("/")[-1]
+            if any(e.path == filename for e in entries):
+                self._uploaded_hashes.add(p_hash)
+                return False
+        except Exception:
+            pass
+
+        # Upload with force=True to overwrite if already exists
+        import os
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(model_bytes)
+            tmp_path = tmp.name
+        try:
+            with self._volume.batch_upload(force=True) as upload:
+                upload.put_file(tmp_path, f"/{payload_path}")
+        finally:
+            os.unlink(tmp_path)
+
+        self._uploaded_hashes.add(p_hash)
+        return True
+
+    def submit(
+        self, model_bytes: bytes, sample_kwargs: dict, nuts_sampler: str,
+        payload_path: str | None = None,
+    ) -> PersistentModalSamplingJob:
+        self._ensure_running()
+
+        if payload_path is None:
+            raise ValueError("payload_path is required for persistent environments")
+
+        # Upload is handled by the caller (after cache check) via _upload_if_needed
+        return PersistentModalSamplingJob(
+            self._sampler_cls,
+            payload_path,
+            sample_kwargs,
+            nuts_sampler,
+        )
+
+    def teardown(self) -> None:
+        self._exit_stack.close()
+        self._running = False
+
+
 class ModalBackend(ComputeBackend):
     """Modal compute backend."""
 
@@ -210,3 +441,40 @@ class ModalBackend(ComputeBackend):
 
     def submit(self, payload: SamplingPayload) -> ModalSamplingJob:
         return ModalSamplingJob(payload, self._config, self._nuts_sampler)
+
+    def provision(
+        self,
+        model_bytes: bytes,
+        model,
+        version_manifest: dict[str, str],
+        config: RemoteConfig,
+        project: str = "cloudposterior",
+        idle_timeout: int = 600,
+    ) -> ModalEnvironment:
+        """Provision a persistent environment (no upload -- deferred to first cache miss)."""
+        import modal
+
+        from cloudposterior.naming import model_slug as compute_model_slug
+
+        config.idle_timeout = idle_timeout
+        volume_name = f"cp-{project}"
+        try:
+            volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+        except Exception as exc:
+            raise _handle_modal_error(exc)
+
+        m_slug = compute_model_slug(model)
+
+        app, sampler_cls = _create_persistent_app(version_manifest, config, volume)
+        return ModalEnvironment(app, sampler_cls, volume, project, m_slug)
+
+    @staticmethod
+    def cleanup_volumes(project: str = "cloudposterior") -> None:
+        """Delete the Volume for a project."""
+        import modal
+
+        volume_name = f"cp-{project}"
+        try:
+            modal.Volume.objects.delete(volume_name)
+        except Exception:
+            pass

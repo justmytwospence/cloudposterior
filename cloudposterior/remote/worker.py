@@ -15,44 +15,16 @@ from queue import Queue
 from threading import Thread
 
 
-def run_sampling(
-    model_bytes: bytes,
-    data_bytes: bytes,
-    sample_kwargs: dict,
-    nuts_sampler: str = "pymc",
-) -> tuple:
-    """Run PyMC sampling and return (progress_events, idata_bytes).
+def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
+    """Run MCMC sampling and yield msgpack-encoded progress + results.
 
-    This is the core function that executes on the remote machine.
-    It's called as a generator by Modal, yielding msgpack-encoded
-    progress events and finally the compressed InferenceData.
+    Shared core logic used by both one-shot and persistent paths.
+    The caller is responsible for loading the model; this function
+    handles compilation, sampling, progress streaming, and result serialization.
     """
-    import arviz as az
-    import cloudpickle
     import lz4.frame
     import msgpack
-    import numpy as np
     import pymc as pm
-
-    # -- Phase: deserializing --
-    phase_start = time.time()
-    model_raw = lz4.frame.decompress(model_bytes)
-    import pickle
-    model = pickle.loads(model_raw)
-
-    # Reattach observed data if sent separately
-    data_raw = lz4.frame.decompress(data_bytes)
-    buf = io.BytesIO(data_raw)
-    observed = dict(np.load(buf))
-
-    elapsed = time.time() - phase_start
-    yield msgpack.packb({
-        "type": "phase",
-        "phase": "provisioning",
-        "status": "done",
-        "message": "environment ready",
-        "elapsed": elapsed,
-    })
 
     # -- Phase: compiling (if nutpie/numpyro) --
     if nuts_sampler == "nutpie":
@@ -66,13 +38,12 @@ def run_sampling(
         })
         import nutpie
         compiled = nutpie.compile_pymc_model(model)
-        elapsed = time.time() - compile_start
         yield msgpack.packb({
             "type": "phase",
             "phase": "compiling",
             "status": "done",
-            "message": f"nutpie compilation complete",
-            "elapsed": elapsed,
+            "message": "nutpie compilation complete",
+            "elapsed": time.time() - compile_start,
         })
 
     # -- Phase: sampling --
@@ -93,12 +64,11 @@ def run_sampling(
     sampling_error = None
     idata = None
 
-    # Callback for progress tracking
     chain_draw_counts: dict[int, int] = {}
     chain_start_times: dict[int, float] = {}
     chain_divergences: dict[int, int] = {}
     chain_tree_depths: dict[int, list[float]] = {}
-    chain_phase: dict[int, bool] = {}  # track tuning state per chain
+    chain_phase: dict[int, bool] = {}
     sample_start = time.time()
 
     def progress_callback(trace, draw):
@@ -112,7 +82,6 @@ def run_sampling(
             chain_tree_depths[chain] = []
             chain_phase[chain] = is_tuning
 
-        # Reset counter when transitioning from tuning to sampling
         if chain_phase.get(chain) and not is_tuning:
             chain_draw_counts[chain] = 0
             chain_start_times[chain] = time.time()
@@ -151,7 +120,6 @@ def run_sampling(
             "tree_size": tree_size,
         })
 
-    # Run sampling in a thread so we can yield progress from the main thread
     def do_sample():
         nonlocal idata, sampling_error
         try:
@@ -174,11 +142,9 @@ def run_sampling(
     sample_thread = Thread(target=do_sample)
     sample_thread.start()
 
-    # Persistent chain state -- accumulates across all drain cycles
     all_chain_states: dict[str, dict] = {}
 
     def _drain_and_yield():
-        """Drain queue into persistent state and yield a snapshot."""
         updated = False
         while not progress_queue.empty():
             try:
@@ -197,7 +163,6 @@ def run_sampling(
             })
         return None
 
-    # Yield progress snapshots while sampling runs
     while sample_thread.is_alive():
         time.sleep(0.5)
         snapshot = _drain_and_yield()
@@ -206,7 +171,6 @@ def run_sampling(
 
     sample_thread.join()
 
-    # Final drain after thread completes
     snapshot = _drain_and_yield()
     if snapshot:
         yield snapshot
@@ -230,8 +194,8 @@ def run_sampling(
     })
 
     # -- Serialize and return InferenceData --
-    import tempfile
     import os
+    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -246,5 +210,68 @@ def run_sampling(
         "size_mb": round(len(idata_compressed) / (1024 * 1024), 2),
     })
 
-    # Final yield is the raw compressed InferenceData bytes
     yield idata_compressed
+
+
+def run_sampling(
+    model_bytes: bytes,
+    data_bytes: bytes,
+    sample_kwargs: dict,
+    nuts_sampler: str = "pymc",
+    persistent: bool = False,
+):
+    """One-shot path: deserialize model from bytes and run sampling."""
+    import lz4.frame
+    import msgpack
+    import numpy as np
+
+    phase_start = time.time()
+    model_raw = lz4.frame.decompress(model_bytes)
+    import pickle
+    model = pickle.loads(model_raw)
+
+    data_raw = lz4.frame.decompress(data_bytes)
+    buf = io.BytesIO(data_raw)
+    observed = dict(np.load(buf))
+
+    elapsed = time.time() - phase_start
+    phase_name = "container_ready" if persistent else "provisioning"
+    phase_message = "container ready" if persistent else "environment ready"
+    yield msgpack.packb({
+        "type": "phase",
+        "phase": phase_name,
+        "status": "done",
+        "message": phase_message,
+        "elapsed": elapsed,
+    })
+
+    yield from _sample_and_stream(model, sample_kwargs, nuts_sampler)
+
+
+def run_sampling_from_volume(
+    payload_path: str,
+    sample_kwargs: dict,
+    nuts_sampler: str = "pymc",
+):
+    """Persistent path: load model from Volume and run sampling."""
+    import lz4.frame
+    import msgpack
+    import pickle
+
+    phase_start = time.time()
+    with open(payload_path, "rb") as f:
+        model_bytes = f.read()
+
+    model_raw = lz4.frame.decompress(model_bytes)
+    model = pickle.loads(model_raw)
+
+    elapsed = time.time() - phase_start
+    yield msgpack.packb({
+        "type": "phase",
+        "phase": "container_ready",
+        "status": "done",
+        "message": "model loaded from volume",
+        "elapsed": elapsed,
+    })
+
+    yield from _sample_and_stream(model, sample_kwargs, nuts_sampler)

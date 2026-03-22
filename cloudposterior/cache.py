@@ -1,4 +1,4 @@
-"""Result caching based on model + data + sampling config.
+"""Result caching based on model + sampling config.
 
 Two backends:
 - MemoryCache (default): fast, lives for the session
@@ -7,48 +7,28 @@ Two backends:
 Disk layout::
 
     .cloudposterior/
-        eight_schools/                     # model name
-            gentle-fox/                    # wordhash of observed data
-                draws2000_tune1000_chains4.nc   # human-readable MCMC params
+        radon_intercepts/
+            draws2000_tune1000_chains4-a3f7b2c9.nc
+        radon_slopes/
+            draws2000_tune1000_chains4-7c2e5fa8.nc
+
+Filenames combine human-readable params with a hash suffix for
+uniqueness. Two runs with the same draws/tune/chains but different
+random_seed or target_accept get different files.
 """
 
 from __future__ import annotations
 
-import hashlib
-import re
 from pathlib import Path
 from typing import Protocol
 
 
-def compute_cache_key(model_bytes: bytes, data_bytes: bytes, sample_kwargs: dict) -> str:
-    """Deterministic SHA-256 hash of model + data + sampling config."""
-    h = hashlib.sha256()
-    h.update(model_bytes)
-    h.update(data_bytes)
-    for k, v in sorted(sample_kwargs.items()):
-        h.update(f"{k}={v}".encode())
-    return h.hexdigest()
-
-
-def _model_slug(model) -> str:
-    """Derive a filesystem-safe directory name from a PyMC model."""
-    from cloudposterior.naming import get_model_name, slugify
-    return slugify(get_model_name(model, stack_offset=4))
-
-
-def _data_slug(data_bytes: bytes) -> str:
-    """Wordhash of the observed data for the directory name."""
-    from cloudposterior.wordhash import wordhash
-    return f"data-{wordhash(data_bytes)}"
-
-
-def _params_filename(sample_kwargs: dict) -> str:
-    """Human-readable filename from MCMC sampling params."""
+def _params_label(sample_kwargs: dict) -> str:
+    """Human-readable label from common MCMC sampling params."""
     parts = []
     for key in ("draws", "tune", "chains", "cores", "nuts_sampler", "target_accept"):
         if key in sample_kwargs and sample_kwargs[key] is not None:
             val = sample_kwargs[key]
-            # Skip defaults that don't add info
             if key == "nuts_sampler" and val == "pymc":
                 continue
             parts.append(f"{key}{val}")
@@ -78,7 +58,12 @@ class MemoryCache:
 class DiskCache:
     """Persistent disk cache with human-readable directory hierarchy.
 
-    Layout: {base_dir}/{model_name}/{data_slug}/{params}.nc
+    Layout: {base_dir}/{model_slug}/{params_label}-{key_prefix}.nc
+
+    The filename combines human-readable params (draws, tune, chains) with
+    a hash prefix from the full cache key for uniqueness. This ensures that
+    runs differing only in non-displayed params (random_seed, init, etc.)
+    never collide.
 
     Args:
         base_dir: Root cache directory. Defaults to ./.cloudposterior
@@ -86,24 +71,25 @@ class DiskCache:
     """
 
     def __init__(self, base_dir: str | Path | None = None, model=None):
+        from cloudposterior.naming import model_slug
+
         self._base = Path(base_dir) if base_dir else Path(".cloudposterior")
-        self._model_slug = _model_slug(model)
+        self._model_slug = model_slug(model)
 
-    def _path(self, key: str, data_bytes: bytes | None = None, sample_kwargs: dict | None = None) -> Path:
-        if data_bytes is not None and sample_kwargs is not None:
-            data_dir = self._base / self._model_slug / _data_slug(data_bytes)
-            data_dir.mkdir(parents=True, exist_ok=True)
-            return data_dir / f"{_params_filename(sample_kwargs)}.nc"
-        # Fallback: flat hash-based path
-        from cloudposterior.wordhash import wordhash
-        fallback_dir = self._base / self._model_slug
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        return fallback_dir / f"{wordhash(key)}.nc"
+    def _path(self, key: str, sample_kwargs: dict | None = None) -> Path:
+        cache_dir = self._base / self._model_slug
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Use first 8 chars of cache key hash for uniqueness
+        key_prefix = key[:8] if len(key) >= 8 else key
+        if sample_kwargs is not None:
+            label = _params_label(sample_kwargs)
+            return cache_dir / f"{label}-{key_prefix}.nc"
+        return cache_dir / f"{key_prefix}.nc"
 
-    def load(self, key: str, data_bytes: bytes | None = None, sample_kwargs: dict | None = None):
+    def load(self, key: str, sample_kwargs: dict | None = None):
         import arviz as az
 
-        path = self._path(key, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+        path = self._path(key, sample_kwargs=sample_kwargs)
         if path.exists():
             idata = az.from_netcdf(str(path))
             for group in idata.groups():
@@ -111,8 +97,8 @@ class DiskCache:
             return idata
         return None
 
-    def save(self, key: str, idata, data_bytes: bytes | None = None, sample_kwargs: dict | None = None) -> None:
-        path = self._path(key, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+    def save(self, key: str, idata, sample_kwargs: dict | None = None) -> None:
+        path = self._path(key, sample_kwargs=sample_kwargs)
         path.parent.mkdir(parents=True, exist_ok=True)
         idata.to_netcdf(str(path))
 
@@ -126,7 +112,7 @@ def get_default_cache() -> MemoryCache:
 
 
 def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
-    """Resolve the cache argument from cp.wrap() into a CacheBackend.
+    """Resolve the cache argument from cp.cloud() into a CacheBackend.
 
     Args:
         cache_arg: True (memory), False (disabled), "disk" (project-local),

@@ -34,7 +34,7 @@ def _model_topic_name(model) -> str:
     from cloudposterior.naming import get_model_name, slugify
     from cloudposterior.wordhash import wordhash
 
-    name = slugify(get_model_name(model, stack_offset=5), separator="-")
+    name = slugify(get_model_name(model), separator="-")
     return f"{name}-{wordhash(uuid.uuid4().bytes)}"
 
 

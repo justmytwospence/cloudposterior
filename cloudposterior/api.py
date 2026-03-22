@@ -10,29 +10,52 @@ import arviz as az
 from cloudposterior.backends import SamplingJob
 from cloudposterior.config import RemoteConfig
 from cloudposterior.progress import JobPhase, PhaseUpdate, ProgressEvent, SamplingProgress
-from cloudposterior.serialize import create_payload, payload_size_mb
+from cloudposterior.serialize import create_payload
 
 if TYPE_CHECKING:
     import pymc as pm
 
 
-class wrap:
+def _detect_project_name() -> str:
+    """Detect a project name from the environment.
+
+    Tries (in order):
+    1. Notebook filename (VS Code sets __vsc_ipynb_file__)
+    2. Current working directory basename
+    """
+    import os
+    from pathlib import Path
+
+    # VS Code notebook
+    vsc_file = os.environ.get("__vsc_ipynb_file__")
+    if vsc_file:
+        return Path(vsc_file).stem
+
+    # Fall back to cwd basename
+    return Path.cwd().name
+
+
+class cloud:
     """Context manager that intercepts PyMC operations with remote execution,
     caching, and notifications.
 
+    Remote containers stay warm for 20 minutes after the last run. Data is
+    uploaded to a volume once and reused automatically across runs.
+
     Usage::
 
-        with pd.wrap(model):
+        with cp.cloud(model):
             idata = pm.sample(draws=2000, chains=4)  # local with in-memory caching
 
-        with pd.wrap(model, remote=True):             # run on Modal VM
-        with pd.wrap(model, cache="disk"):            # persistent disk cache
-        with pd.wrap(model, cache="/path/to/cache"):  # custom cache directory
-        with pd.wrap(model, cache=False):             # disable caching
-        with pd.wrap(model, notify=True):                          # ntfy.sh, auto topic
-        with pd.wrap(model, notify="my-topic"):                    # ntfy.sh, custom topic
-        with pd.wrap(model, notify={"server": "https://ntfy.example.com"}):  # self-hosted
-        with pd.wrap(model, notify={"server": "https://ntfy.example.com", "topic": "my-topic"}):
+        with cp.cloud(model, remote=True):             # run on Modal VM
+        with cp.cloud(model, cache="disk"):            # persistent disk cache
+        with cp.cloud(model, cache=False):             # disable caching
+        with cp.cloud(model, notify=True):             # ntfy.sh notifications
+
+        # Container reuse within a session:
+        with cp.cloud(model, remote=True):
+            idata1 = pm.sample(draws=1000)   # provisions container, uploads data
+            idata2 = pm.sample(draws=2000)   # reuses warm container
     """
 
     def __init__(
@@ -40,11 +63,12 @@ class wrap:
         model: pm.Model,
         *,
         remote: bool = False,
-        cache: bool = True,
+        cache: bool | str = True,
         notify: bool | str | dict = False,
         instance: str | None = None,
         nuts_sampler: str = "pymc",
         progress: bool = True,
+        project: str | None = None,
     ):
         self.model = model
         self.remote = remote
@@ -53,12 +77,21 @@ class wrap:
         self.instance = instance
         self.nuts_sampler = nuts_sampler
         self.progress = progress
+        self.project = project or _detect_project_name()
         self._originals: dict[str, object] = {}
+        self._env = None
+        self._model_bytes: bytes | None = None
+        self._data_bytes: bytes | None = None
 
     def __enter__(self):
         import pymc as pm
 
         self._originals["sample"] = pm.sample
+
+        # Provision persistent environment for remote execution
+        if self.remote:
+            self._provision_environment()
+
         pm.sample = self._make_intercepted_sample()
         self.model.__enter__()
         return self.model
@@ -67,12 +100,64 @@ class wrap:
         import pymc as pm
 
         pm.sample = self._originals["sample"]
+        if self._env is not None:
+            self._env.teardown()
+            self._env = None
         return self.model.__exit__(*exc)
+
+    def _provision_environment(self):
+        from cloudposterior.backends.modal_backend import ModalBackend
+        from cloudposterior.serialize import get_version_manifest, serialize_model, serialize_observed_data
+
+        # Serialize model + data (needed for cache key and Volume upload)
+        self._model_bytes = serialize_model(self.model)
+        self._data_bytes = serialize_observed_data(self.model)
+
+        # Create Modal app and Volume reference (no upload yet -- deferred to first cache miss)
+        config = RemoteConfig.from_instance(
+            self.instance, model=self.model, sample_kwargs={},
+        )
+        manifest = get_version_manifest()
+        backend = ModalBackend(config=config, nuts_sampler=self.nuts_sampler)
+        self._env = backend.provision(
+            self._model_bytes, self.model, manifest, config,
+            project=self.project, idle_timeout=600,
+        )
+
+    def destroy(self):
+        """Tear down the environment and clean up the project volume.
+
+        Call after the ``with`` block to immediately stop the container
+        and delete the project's volume::
+
+            session = cp.cloud(model, remote=True)
+            with session:
+                idata = pm.sample(draws=2000)
+            session.destroy()
+        """
+        if self._env is not None:
+            self._env.teardown()
+            self._env = None
+        from cloudposterior.backends.modal_backend import ModalBackend
+        ModalBackend.cleanup_volumes(project=self.project)
 
     def _make_intercepted_sample(self):
         ctx = self
 
         def intercepted_sample(**kwargs):
+            # Use persistent environment path if provisioned
+            if ctx._env is not None:
+                return _run_sample_persistent(
+                    model=ctx.model,
+                    env=ctx._env,
+                    data_bytes=ctx._data_bytes,
+                    cache=ctx.cache,
+                    notify=ctx.notify,
+                    nuts_sampler=ctx.nuts_sampler,
+                    progress=ctx.progress,
+                    instance=ctx.instance,
+                    **kwargs,
+                )
             return _run_sample(
                 model=ctx.model,
                 remote=ctx.remote,
@@ -101,7 +186,8 @@ def _run_sample(
     **sample_kwargs,
 ) -> az.InferenceData:
     """Core sampling logic with cache, remote, and notification support."""
-    from cloudposterior.cache import compute_cache_key, resolve_cache
+    from cloudposterior.cache import resolve_cache
+    from cloudposterior.naming import cache_key as compute_cache_key
     from cloudposterior.serialize import serialize_model, serialize_observed_data
 
     # -- Resolve resource config (auto-size or preset) --
@@ -142,8 +228,8 @@ def _run_sample(
     cache_key = None
 
     if cache_backend is not None:
-        cache_key = compute_cache_key(model_bytes, data_bytes, sample_kwargs)
-        cached = cache_backend.load(cache_key, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+        cache_key = compute_cache_key(model_bytes, sample_kwargs)
+        cached = cache_backend.load(cache_key, sample_kwargs=sample_kwargs)
         if cached is not None:
             emit(PhaseUpdate(
                 phase=JobPhase.CACHE_HIT,
@@ -177,7 +263,7 @@ def _run_sample(
 
     # -- Cache store --
     if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata, data_bytes=data_bytes, sample_kwargs=sample_kwargs)
+        cache_backend.save(cache_key, idata, sample_kwargs=sample_kwargs)
 
     _stop_sinks(sinks)
     return idata
@@ -287,7 +373,6 @@ def _run_remote(
 ) -> az.InferenceData:
     """Run sampling on a remote Modal VM."""
     from cloudposterior.backends.modal_backend import ModalBackend
-    from cloudposterior.display import NotebookDisplay
     from cloudposterior.serialize import SamplingPayload, get_version_manifest
 
     payload = SamplingPayload(
@@ -300,13 +385,6 @@ def _run_remote(
     backend = ModalBackend(config=config, nuts_sampler=nuts_sampler)
     job = backend.submit(payload)
 
-    # Get output widget from notebook display if present
-    output_widget = None
-    for sink in sinks:
-        if isinstance(sink, NotebookDisplay):
-            output_widget = sink.modal_output_widget
-            break
-
     # Stream with upload/download phases
     emit(PhaseUpdate(
         phase=JobPhase.UPLOADING,
@@ -318,7 +396,7 @@ def _run_remote(
     upload_start = time.time()
     first_event = True
 
-    for event in job.stream_progress(output_widget=output_widget):
+    for event in job.stream_progress():
         if first_event:
             emit(PhaseUpdate(
                 phase=JobPhase.UPLOADING,
@@ -337,6 +415,130 @@ def _run_remote(
     ))
 
     return job.result()
+
+
+def _run_sample_persistent(
+    model,
+    *,
+    env,
+    data_bytes: bytes,
+    cache: bool,
+    notify: bool | str | dict,
+    nuts_sampler: str,
+    progress: bool,
+    instance: str | None,
+    **sample_kwargs,
+) -> az.InferenceData:
+    """Sampling via a persistent environment.
+
+    Model payload is in the Volume. Per-call sends only kwargs + a path
+    identifying which payload to load. Volume upload is deferred until
+    after cache check (no upload needed on cache hit).
+    """
+    from cloudposterior.backends.modal_backend import _compute_payload_path
+    from cloudposterior.cache import resolve_cache
+    from cloudposterior.naming import cache_key as compute_cache_key
+    from cloudposterior.serialize import serialize_model
+
+    # Serialize model (needed for cache key)
+    model_bytes = serialize_model(model)
+
+    # Cache check -- before any display or Volume upload
+    cache_backend = resolve_cache(cache, model=model)
+    cache_key = None
+    if cache_backend is not None:
+        cache_key = compute_cache_key(model_bytes, sample_kwargs)
+        cached = cache_backend.load(cache_key, sample_kwargs=sample_kwargs)
+        if cached is not None:
+            if progress:
+                from cloudposterior.display import _is_notebook
+                if _is_notebook():
+                    from IPython.display import display, HTML
+                    display(HTML(
+                        '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
+                        '<span style="color:#5cb85c;">&#10003;</span> cached result'
+                        '</div>'
+                    ))
+                else:
+                    from rich.console import Console
+                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
+            return cached
+
+    # Cache miss -- build progress display
+    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+    instance_desc = f"Modal ({config.describe()})"
+
+    sinks = _build_sinks(
+        progress=progress,
+        notify=notify,
+        instance_desc=instance_desc,
+        model=model,
+    )
+
+    def emit(event):
+        for sink in sinks:
+            if isinstance(event, PhaseUpdate):
+                sink.show_phase(event)
+            elif isinstance(event, SamplingProgress):
+                sink.show_sampling(event)
+
+    # Upload payload to Volume if needed
+    payload_path = _compute_payload_path(env._model_slug, model_bytes, data_bytes)
+
+    payload_mb = len(model_bytes) / (1024 * 1024)
+    emit(PhaseUpdate(
+        phase=JobPhase.DATA_UPLOADING,
+        status="in_progress",
+        message=f"uploading to volume ({payload_mb:.1f} MB)",
+        elapsed=0.0,
+    ))
+    upload_start = time.time()
+    uploaded = env._upload_if_needed(model_bytes, payload_path)
+    if uploaded:
+        emit(PhaseUpdate(
+            phase=JobPhase.DATA_UPLOADING,
+            status="done",
+            message="uploaded to volume",
+            elapsed=time.time() - upload_start,
+        ))
+    else:
+        emit(PhaseUpdate(
+            phase=JobPhase.DATA_UPLOADING,
+            status="done",
+            message="volume up to date",
+            elapsed=time.time() - upload_start,
+        ))
+
+    # Submit to container (env no longer uploads -- we already did)
+    job = env.submit(model_bytes, sample_kwargs, nuts_sampler, payload_path=payload_path)
+
+    emit(PhaseUpdate(
+        phase=JobPhase.PROVISIONING,
+        status="in_progress",
+        message="waiting for container",
+        elapsed=0.0,
+    ))
+
+    provision_start = time.time()
+    first_event = True
+    for event in job.stream_progress():
+        if first_event:
+            emit(PhaseUpdate(
+                phase=JobPhase.PROVISIONING,
+                status="done",
+                message="container ready",
+                elapsed=time.time() - provision_start,
+            ))
+            first_event = False
+        emit(event)
+
+    idata = job.result()
+
+    if cache_backend is not None and cache_key:
+        cache_backend.save(cache_key, idata, sample_kwargs=sample_kwargs)
+
+    _stop_sinks(sinks)
+    return idata
 
 
 def _run_local(
@@ -436,3 +638,16 @@ def submit(
     config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
     backend = ModalBackend(config=config, nuts_sampler=nuts_sampler)
     return backend.submit(payload)
+
+
+def cleanup_volumes(project: str | None = None) -> None:
+    """Delete the Volume for a project.
+
+    Examples::
+
+        cp.cleanup_volumes()                        # delete default project volume
+        cp.cleanup_volumes(project="my-research")   # delete specific project volume
+    """
+    from cloudposterior.backends.modal_backend import ModalBackend
+
+    ModalBackend.cleanup_volumes(project=project or _detect_project_name())

@@ -1,38 +1,30 @@
-"""Derive human-readable names from PyMC models.
+"""Derive human-readable and machine-correct identifiers from PyMC models.
 
-Used by cache (directory names) and notify (topic names). Tries three
-strategies in order:
+Used by cache (directory names + keys), notify (topic names), and volumes.
 
-1. model.name (explicit PyMC model name)
-2. Caller's variable name (stack frame introspection)
-3. Free RV names (e.g. "mu_tau_theta")
+Two layers:
+- Human-readable: model_slug, data_slug (for directory browsability)
+- Machine-correct: payload_hash, cache_key (for identity checks)
 """
 
 from __future__ import annotations
 
-import inspect
+import hashlib
 import re
 
 
-def get_model_name(model, stack_offset: int = 2) -> str:
+def get_model_name(model) -> str:
     """Get the best human-readable name for a PyMC model.
 
-    Args:
-        model: A PyMC model object.
-        stack_offset: How many frames to go up to find the caller's variable.
-                      Default 2 works when called from a function that was
-                      called by user code.
+    Tries two strategies:
+    1. model.name (explicit PyMC model name)
+    2. Free RV names (e.g. "mu_tau_theta")
     """
     # 1. Explicit model name
     if model is not None and hasattr(model, "name") and model.name:
         return model.name
 
-    # 2. Introspect the variable name from the caller's frame
-    var_name = _introspect_var_name(model, stack_offset)
-    if var_name and var_name not in ("model", "m", "self", "_"):
-        return var_name
-
-    # 3. Derive from free RV names
+    # 2. Derive from free RV names
     if model is not None and hasattr(model, "free_RVs") and model.free_RVs:
         names = [rv.name.split("::")[-1] for rv in model.free_RVs[:4]]
         result = "_".join(names)
@@ -43,26 +35,40 @@ def get_model_name(model, stack_offset: int = 2) -> str:
     return "unnamed"
 
 
-def _introspect_var_name(obj, stack_offset: int) -> str | None:
-    """Try to find the variable name bound to obj in a caller's frame."""
-    try:
-        frame = inspect.currentframe()
-        for _ in range(stack_offset + 1):  # +1 for this function's own frame
-            if frame is None:
-                return None
-            frame = frame.f_back
-        if frame is None:
-            return None
-        for name, val in frame.f_locals.items():
-            if val is obj:
-                return name
-    except Exception:
-        pass
-    finally:
-        del frame  # avoid reference cycles
-    return None
-
-
 def slugify(name: str, separator: str = "_") -> str:
     """Convert a name to a filesystem/URL-safe slug."""
     return re.sub(r"[^a-zA-Z0-9]+", separator, name).strip(separator).lower()
+
+
+def model_slug(model) -> str:
+    """Filesystem-safe slug from a PyMC model name, e.g. 'radon'."""
+    return slugify(get_model_name(model))
+
+
+def data_slug(data_bytes: bytes) -> str:
+    """Deterministic human-readable slug for observed data, e.g. 'data-gentle-fox'."""
+    from cloudposterior.wordhash import wordhash
+
+    return f"data-{wordhash(data_bytes)}"
+
+
+def payload_hash(model_bytes: bytes) -> str:
+    """SHA-256 hex prefix of serialized model bytes (16 chars).
+
+    Used for Volume payload filenames. Captures model + data identity
+    since PyMC bundles observed data into the model pickle.
+    """
+    return hashlib.sha256(model_bytes).hexdigest()[:16]
+
+
+def cache_key(model_bytes: bytes, sample_kwargs: dict) -> str:
+    """Full SHA-256 of model + sampling config.
+
+    Used for trace result caching. model_bytes already contains observed
+    data (PyMC bundles it), so no separate data_bytes parameter needed.
+    """
+    h = hashlib.sha256()
+    h.update(model_bytes)
+    for k, v in sorted(sample_kwargs.items()):
+        h.update(f"{k}={v}".encode())
+    return h.hexdigest()

@@ -1,3 +1,3 @@
-from cloudposterior.api import sample, submit, wrap
+from cloudposterior.api import cleanup_volumes, sample, submit, cloud
 
-__all__ = ["sample", "submit", "wrap"]
+__all__ = ["cleanup_volumes", "sample", "submit", "cloud"]

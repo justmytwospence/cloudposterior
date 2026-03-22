@@ -13,6 +13,7 @@ class RemoteConfig:
     timeout: int = 3600  # seconds
     gpu: str | None = None
     auto_sized: bool = False  # True if config was auto-determined
+    idle_timeout: int = 600  # seconds before idle container is torn down
 
     @classmethod
     def from_instance(cls, instance: str | None, model=None, sample_kwargs: dict | None = None) -> RemoteConfig:

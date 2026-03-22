@@ -13,8 +13,10 @@ from typing import Iterator
 class JobPhase(str, Enum):
     SERIALIZING = "serializing"
     CACHE_HIT = "cache_hit"
+    DATA_UPLOADING = "data_uploading"
     UPLOADING = "uploading"
     PROVISIONING = "provisioning"
+    CONTAINER_READY = "container_ready"
     COMPILING = "compiling"
     SAMPLING = "sampling"
     DOWNLOADING = "downloading"
