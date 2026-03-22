@@ -58,12 +58,11 @@ class NtfyNotifier:
             or os.environ.get("CLOUDPOSTERIOR_NTFY_SERVER")
             or "https://ntfy.sh"
         ).rstrip("/")
-        self.event_id = f"pd-{uuid.uuid4().hex[:8]}"
         self._base_url = f"{self.server}/{self.topic}"
         self._instance_desc = instance_desc
         self._phases: list[tuple[str, str, str]] = []
         self._sampling: SamplingProgress | None = None
-        self._announced = False
+        self._sent_count: int = 0
 
     def _resolve_topic(self, model=None) -> str:
         env_topic = os.environ.get("CLOUDPOSTERIOR_NTFY_TOPIC")
@@ -77,7 +76,7 @@ class NtfyNotifier:
 
     def show_phase(self, update: PhaseUpdate):
         detail = update.message
-        if update.status == "done":
+        if update.status == "done" and update.elapsed > 0.1:
             detail += f" ({_format_time(update.elapsed)})"
 
         found = False
@@ -89,11 +88,13 @@ class NtfyNotifier:
         if not found:
             self._phases.append((update.status, update.phase.value, detail))
 
-        self._send_update()
+        # Send on sampling start and completion only
+        if update.phase == JobPhase.SAMPLING:
+            self._send_update()
 
     def show_sampling(self, progress: SamplingProgress):
+        # Track latest progress for the completion summary, but don't send
         self._sampling = progress
-        self._send_update()
 
     def _build_body(self) -> str:
         lines = []
@@ -142,6 +143,7 @@ class NtfyNotifier:
 
     def _send_update(self):
         complete = self._is_complete()
+
         title = "cloudposterior"
         if self._instance_desc:
             title += f" -- {self._instance_desc}"

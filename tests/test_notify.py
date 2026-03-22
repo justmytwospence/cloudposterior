@@ -61,14 +61,14 @@ def test_notifier_env_topic(monkeypatch):
 
 
 @patch("cloudposterior.notify.requests.post")
-def test_notifier_sends_phase(mock_post):
-    """Phase updates should trigger an HTTP POST to ntfy."""
+def test_notifier_sends_on_sampling_start(mock_post):
+    """Sampling start should trigger a notification."""
     notifier = NtfyNotifier(topic="test-topic")
     notifier.show_phase(PhaseUpdate(
-        phase=JobPhase.SERIALIZING,
-        status="done",
-        message="model + data packaged",
-        elapsed=0.5,
+        phase=JobPhase.SAMPLING,
+        status="in_progress",
+        message="MCMC sampling started",
+        elapsed=0.0,
     ))
 
     mock_post.assert_called_once()
@@ -78,23 +78,32 @@ def test_notifier_sends_phase(mock_post):
 
 
 @patch("cloudposterior.notify.requests.post")
-def test_notifier_sends_sampling_progress(mock_post):
-    """Sampling progress should include chain table in body."""
+def test_notifier_sends_on_sampling_complete(mock_post):
+    """Sampling completion should include progress summary in body."""
     notifier = NtfyNotifier(topic="test-topic")
+    # Feed sampling progress (not sent)
     notifier.show_sampling(SamplingProgress(
         chains={
-            0: ChainProgress(draw=500, total=1000, phase="sampling", draws_per_sec=100, divergences=2, step_size=0.5, tree_size=15),
-            1: ChainProgress(draw=400, total=1000, phase="tuning", draws_per_sec=90, divergences=0, step_size=0.8, tree_size=7),
+            0: ChainProgress(draw=1000, total=1000, phase="sampling", draws_per_sec=100, divergences=2, step_size=0.5, tree_size=15),
+            1: ChainProgress(draw=1000, total=1000, phase="sampling", draws_per_sec=90, divergences=0, step_size=0.8, tree_size=7),
         },
         total_divergences=2,
-        elapsed=5.0,
+        elapsed=10.0,
+    ))
+    mock_post.assert_not_called()
+
+    # Sampling complete triggers send with accumulated progress
+    notifier.show_phase(PhaseUpdate(
+        phase=JobPhase.SAMPLING,
+        status="done",
+        message="sampling complete",
+        elapsed=10.0,
     ))
 
     mock_post.assert_called_once()
     body = mock_post.call_args[1]["data"].decode()
     assert "Chain" in body
-    assert "500/1000" in body
-    assert "400/1000" in body
+    assert "1000/1000" in body
 
 
 @patch("cloudposterior.notify.requests.post")
@@ -104,8 +113,8 @@ def test_notifier_best_effort(mock_post):
     notifier = NtfyNotifier(topic="test-topic")
     # Should not raise
     notifier.show_phase(PhaseUpdate(
-        phase=JobPhase.SERIALIZING,
-        status="done",
+        phase=JobPhase.SAMPLING,
+        status="in_progress",
         message="test",
         elapsed=0.0,
     ))

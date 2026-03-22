@@ -190,40 +190,11 @@ def _run_sample(
     from cloudposterior.naming import cache_key as compute_cache_key
     from cloudposterior.serialize import serialize_model, serialize_observed_data
 
-    # -- Resolve resource config (auto-size or preset) --
-    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
-    if remote:
-        instance_desc = f"Modal ({config.describe()})"
-    else:
-        instance_desc = "local"
-
-    # -- Build sinks --
-    sinks = _build_sinks(
-        progress=progress,
-        notify=notify,
-        instance_desc=instance_desc,
-        model=model,
-    )
-
-    def emit(event):
-        for sink in sinks:
-            if isinstance(event, PhaseUpdate):
-                sink.show_phase(event)
-            elif isinstance(event, SamplingProgress):
-                sink.show_sampling(event)
-
     # -- Serialize for cache key --
-    serial_start = time.time()
     model_bytes = serialize_model(model)
     data_bytes = serialize_observed_data(model)
-    emit(PhaseUpdate(
-        phase=JobPhase.SERIALIZING,
-        status="done",
-        message="model + data packaged",
-        elapsed=time.time() - serial_start,
-    ))
 
-    # -- Resolve cache backend --
+    # -- Check cache before building any display --
     cache_backend = resolve_cache(cache, model=model)
     cache_key = None
 
@@ -231,14 +202,50 @@ def _run_sample(
         cache_key = compute_cache_key(model_bytes, sample_kwargs)
         cached = cache_backend.load(cache_key, sample_kwargs=sample_kwargs)
         if cached is not None:
-            emit(PhaseUpdate(
-                phase=JobPhase.CACHE_HIT,
-                status="done",
-                message="returning cached result",
-                elapsed=0.0,
-            ))
-            _stop_sinks(sinks)
+            if progress:
+                from cloudposterior.display import _is_notebook
+                if _is_notebook():
+                    from IPython.display import display, HTML
+                    display(HTML(
+                        '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
+                        '<span style="color:#5cb85c;">&#10003;</span> cached result'
+                        '</div>'
+                    ))
+                else:
+                    from rich.console import Console
+                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
             return cached
+
+    # -- Build sinks (only needed for cache miss) --
+    if remote:
+        config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+        instance_desc = f"Modal ({config.describe()})"
+    else:
+        instance_desc = "local"
+
+    # For local runs, skip progress display -- let PyMC show its native output.
+    # Only build notification sinks if needed.
+    if remote:
+        sinks = _build_sinks(
+            progress=progress,
+            notify=notify,
+            instance_desc=instance_desc,
+            model=model,
+        )
+    else:
+        sinks = _build_sinks(
+            progress=False,
+            notify=notify,
+            instance_desc=instance_desc,
+            model=model,
+        )
+
+    def emit(event):
+        for sink in sinks:
+            if isinstance(event, PhaseUpdate):
+                sink.show_phase(event)
+            elif isinstance(event, SamplingProgress):
+                sink.show_sampling(event)
 
     # -- Run sampling --
     if remote:
@@ -305,8 +312,7 @@ def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None) -> l
         )
         sinks.append(notifier)
 
-        if progress:
-            _show_ntfy_link(notifier.url, show_qr=auto_generated)
+        _show_ntfy_link(notifier.url, show_qr=auto_generated)
 
     return sinks
 
@@ -550,6 +556,11 @@ def _run_local(
     **sample_kwargs,
 ) -> az.InferenceData:
     """Run sampling locally using the original pm.sample."""
+    from queue import Queue
+    from threading import Thread
+
+    from cloudposterior.progress import ProgressAggregator, make_sampling_callback
+
     emit(PhaseUpdate(
         phase=JobPhase.SAMPLING,
         status="in_progress",
@@ -558,8 +569,33 @@ def _run_local(
     ))
 
     sample_start = time.time()
-    with model:
-        idata = original_sample(**sample_kwargs)
+
+    # If we have sinks (notifications), inject a progress callback
+    if sinks:
+        tune = sample_kwargs.get("tune", 1000)
+        draws = sample_kwargs.get("draws", 1000)
+        progress_queue: Queue = Queue()
+        callback = make_sampling_callback(progress_queue, tune, draws)
+        aggregator = ProgressAggregator(progress_queue)
+
+        def stream_progress():
+            for snapshot in aggregator.snapshots():
+                emit(snapshot)
+
+        progress_thread = Thread(target=stream_progress, daemon=True)
+        progress_thread.start()
+
+        with model:
+            idata = original_sample(
+                callback=callback,
+                **sample_kwargs,
+            )
+
+        aggregator.stop()
+        progress_thread.join(timeout=2)
+    else:
+        with model:
+            idata = original_sample(**sample_kwargs)
 
     emit(PhaseUpdate(
         phase=JobPhase.SAMPLING,
