@@ -67,7 +67,6 @@ class cloud:
         cache: bool | str = True,
         notify: bool | str | dict = False,
         instance: str | None = None,
-        nuts_sampler: str = "pymc",
         progress: bool = True,
         project: str | None = None,
     ):
@@ -80,7 +79,6 @@ class cloud:
         else:
             self.notify = notify
         self.instance = instance
-        self.nuts_sampler = nuts_sampler
         self.progress = progress
         self.project = project or _detect_project_name()
         self._originals: dict[str, object] = {}
@@ -90,8 +88,19 @@ class cloud:
 
     def __enter__(self):
         import pymc as pm
+        from cloudposterior.serialize import serialize_model, serialize_observed_data
 
         self._originals["sample"] = pm.sample
+
+        # Serialize model BEFORE any sampling mutates it.
+        # pm.sample() modifies the model in place (compiled functions, etc.),
+        # which changes the serialization. We cache the bytes on the model
+        # object so subsequent cp.cloud() calls get the same hash.
+        if not hasattr(self.model, "_cp_model_bytes"):
+            self.model._cp_model_bytes = serialize_model(self.model)
+            self.model._cp_data_bytes = serialize_observed_data(self.model)
+        self._model_bytes = self.model._cp_model_bytes
+        self._data_bytes = self.model._cp_data_bytes
 
         # Provision persistent environment for remote execution
         if self.remote:
@@ -123,7 +132,7 @@ class cloud:
             self.instance, model=self.model, sample_kwargs={},
         )
         manifest = get_version_manifest()
-        backend = ModalBackend(config=config, nuts_sampler=self.nuts_sampler)
+        backend = ModalBackend(config=config)
         use_dashboard = self.notify == "dashboard"
         self._env = backend.provision(
             self._model_bytes, self.model, manifest, config,
@@ -152,6 +161,9 @@ class cloud:
         ctx = self
 
         def intercepted_sample(**kwargs):
+            # Extract nuts_sampler from pm.sample() kwargs
+            nuts_sampler = kwargs.pop("nuts_sampler", "pymc")
+
             # Use persistent environment path if provisioned
             if ctx._env is not None:
                 return _run_sample_persistent(
@@ -160,7 +172,7 @@ class cloud:
                     data_bytes=ctx._data_bytes,
                     cache=ctx.cache,
                     notify=ctx.notify,
-                    nuts_sampler=ctx.nuts_sampler,
+                    nuts_sampler=nuts_sampler,
                     progress=ctx.progress,
                     instance=ctx.instance,
                     **kwargs,
@@ -171,9 +183,11 @@ class cloud:
                 cache=ctx.cache,
                 notify=ctx.notify,
                 instance=ctx.instance,
-                nuts_sampler=ctx.nuts_sampler,
+                nuts_sampler=nuts_sampler,
                 progress=ctx.progress,
                 original_sample=ctx._originals["sample"],
+                model_bytes=ctx._model_bytes,
+                data_bytes=ctx._data_bytes,
                 **kwargs,
             )
 
@@ -190,6 +204,8 @@ def _run_sample(
     nuts_sampler: str,
     progress: bool,
     original_sample,
+    model_bytes: bytes | None = None,
+    data_bytes: bytes | None = None,
     **sample_kwargs,
 ) -> az.InferenceData:
     """Core sampling logic with cache, remote, and notification support."""
@@ -197,17 +213,20 @@ def _run_sample(
     from cloudposterior.naming import cache_key as compute_cache_key
     from cloudposterior.serialize import serialize_model, serialize_observed_data
 
-    # -- Serialize for cache key --
-    model_bytes = serialize_model(model)
-    data_bytes = serialize_observed_data(model)
+    # Use pre-computed bytes if available (avoids re-serializing after sampling mutates model)
+    if model_bytes is None:
+        model_bytes = serialize_model(model)
+    if data_bytes is None:
+        data_bytes = serialize_observed_data(model)
 
-    # -- Check cache before building any display --
+    # -- Check cache (include nuts_sampler so different samplers don't collide) --
+    cache_kwargs = {**sample_kwargs, "nuts_sampler": nuts_sampler}
     cache_backend = resolve_cache(cache, model=model)
     cache_key = None
 
     if cache_backend is not None:
-        cache_key = compute_cache_key(model_bytes, sample_kwargs)
-        cached = cache_backend.load(cache_key, sample_kwargs=sample_kwargs)
+        cache_key = compute_cache_key(model_bytes, cache_kwargs)
+        cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             if progress:
                 from cloudposterior.display import _is_notebook
@@ -225,7 +244,7 @@ def _run_sample(
 
     # -- Build sinks (only needed for cache miss) --
     if remote:
-        config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+        config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs, nuts_sampler=nuts_sampler)
         instance_desc = f"Modal ({config.describe()})"
     else:
         instance_desc = "local"
@@ -276,7 +295,7 @@ def _run_sample(
 
     # -- Cache store --
     if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata, sample_kwargs=sample_kwargs)
+        cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
 
     _stop_sinks(sinks)
     return idata
@@ -461,12 +480,14 @@ def _run_sample_persistent(
     # Serialize model (needed for cache key)
     model_bytes = serialize_model(model)
 
-    # Cache check -- before any display or Volume upload
+    # Cache check -- include nuts_sampler in key so different samplers don't collide
+    cache_kwargs = {**sample_kwargs, "nuts_sampler": nuts_sampler}
+
     cache_backend = resolve_cache(cache, model=model)
     cache_key = None
     if cache_backend is not None:
-        cache_key = compute_cache_key(model_bytes, sample_kwargs)
-        cached = cache_backend.load(cache_key, sample_kwargs=sample_kwargs)
+        cache_key = compute_cache_key(model_bytes, cache_kwargs)
+        cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             if progress:
                 from cloudposterior.display import _is_notebook
@@ -483,7 +504,7 @@ def _run_sample_persistent(
             return cached
 
     # Cache miss -- build progress display
-    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs, nuts_sampler=nuts_sampler)
     instance_desc = f"Modal ({config.describe()})"
 
     sinks = _build_sinks(
@@ -582,7 +603,7 @@ def _run_sample_persistent(
     ))
 
     if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata, sample_kwargs=sample_kwargs)
+        cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
 
     _stop_sinks(sinks)
     return idata
@@ -712,7 +733,7 @@ def submit(
         sample_kwargs["cores"] = cores
 
     payload = create_payload(model, sample_kwargs)
-    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs)
+    config = RemoteConfig.from_instance(instance, model=model, sample_kwargs=sample_kwargs, nuts_sampler=nuts_sampler)
     backend = ModalBackend(config=config, nuts_sampler=nuts_sampler)
     return backend.submit(payload)
 

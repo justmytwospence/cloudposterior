@@ -16,7 +16,13 @@ class RemoteConfig:
     idle_timeout: int = 600  # seconds before idle container is torn down
 
     @classmethod
-    def from_instance(cls, instance: str | None, model=None, sample_kwargs: dict | None = None) -> RemoteConfig:
+    def from_instance(
+        cls,
+        instance: str | None,
+        model=None,
+        sample_kwargs: dict | None = None,
+        nuts_sampler: str = "pymc",
+    ) -> RemoteConfig:
         """Resolve resource config from instance hint, or auto-size from the model.
 
         If instance is a preset name ("small", "large", etc.), use the preset.
@@ -36,12 +42,12 @@ class RemoteConfig:
 
         # Auto-size from model + sampling config
         if model is not None and sample_kwargs is not None:
-            return cls._auto(model, sample_kwargs)
+            return cls._auto(model, sample_kwargs, nuts_sampler)
 
         return cls()
 
     @classmethod
-    def _auto(cls, model, sample_kwargs: dict) -> RemoteConfig:
+    def _auto(cls, model, sample_kwargs: dict, nuts_sampler: str = "pymc") -> RemoteConfig:
         """Estimate optimal resources from model characteristics."""
         import numpy as np
 
@@ -73,7 +79,12 @@ class RemoteConfig:
         memory_gb = max(4, 2 ** math.ceil(math.log2(max(1, memory_mb / 1024))))
         memory_mb = min(65536, memory_gb * 1024)
 
-        return cls(cpu=cpu, memory=memory_mb, auto_sized=True)
+        # -- GPU: provision for JAX-based samplers --
+        gpu = None
+        if nuts_sampler in ("numpyro", "blackjax"):
+            gpu = "A10G"
+
+        return cls(cpu=cpu, memory=memory_mb, gpu=gpu, auto_sized=True)
 
     def describe(self) -> str:
         """Human-readable description for progress display."""

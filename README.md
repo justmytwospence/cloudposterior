@@ -242,8 +242,9 @@ idata = cp.sample(model, draws=2000, chains=4, remote=True)
 
 Clone and run locally for the full interactive progress display.
 
-- [examples/radon.ipynb](examples/radon.ipynb) -- remote execution, caching, and model iteration with the Minnesota Radon dataset
-- [examples/notifications.ipynb](examples/notifications.ipynb) -- phone notifications with ntfy
+- [examples/basics.ipynb](examples/basics.ipynb) -- cloud execution and GPU acceleration with the Minnesota Radon dataset
+- [examples/caching.ipynb](examples/caching.ipynb) -- local and disk caching, model iteration
+- [examples/notifications.ipynb](examples/notifications.ipynb) -- live dashboard and push notifications
 
 ---
 

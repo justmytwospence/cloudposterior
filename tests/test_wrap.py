@@ -63,8 +63,8 @@ def test_cloud_delegates_to_run_sample():
     with patch("cloudposterior.api._run_sample") as mock_run:
         mock_run.return_value = MagicMock()  # fake InferenceData
 
-        with cp.cloud(model, instance="large", nuts_sampler="nutpie"):
-            pm.sample(draws=500, chains=2)
+        with cp.cloud(model, instance="large"):
+            pm.sample(draws=500, chains=2, nuts_sampler="nutpie")
 
         mock_run.assert_called_once()
         call_kwargs = mock_run.call_args[1]
