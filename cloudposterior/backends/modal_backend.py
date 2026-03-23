@@ -288,11 +288,13 @@ def _create_persistent_app(
     )
     class Sampler:
         @modal.method(is_generator=True)
-        def sample(self, payload_path: str, sample_kwargs: dict, nuts_sampler: str = "pymc"):
+        def sample(self, payload_path: str, sample_kwargs: dict, nuts_sampler: str = "pymc",
+                   stop_dict_name: str | None = None):
             from cloudposterior.remote.worker import run_sampling_from_volume
 
             yield from run_sampling_from_volume(
                 f"/data/{payload_path}", sample_kwargs, nuts_sampler,
+                stop_dict_name=stop_dict_name,
             )
 
     # Add dashboard web endpoints if requested
@@ -310,10 +312,12 @@ def _create_persistent_app(
             import modal as _modal
             try:
                 d = _modal.Dict.from_name(_dict_name)
-                progress_url = d["progress_url"]
-            except (KeyError, Exception):
+                progress_url = d.get("progress_url", "")
+                stop_url = d.get("stop_url", "")
+            except Exception:
                 progress_url = ""
-            return HTMLResponse(render_dashboard_html(progress_url))
+                stop_url = ""
+            return HTMLResponse(render_dashboard_html(progress_url, stop_url))
 
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}-progress")
@@ -326,6 +330,18 @@ def _create_persistent_app(
             except (KeyError, Exception):
                 data = {"phases": [], "sampling": None, "complete": False}
             return JSONResponse(data)
+
+        @app.function(serialized=True, image=image)
+        @modal.fastapi_endpoint(method="POST", label=f"{model_label}-{_uid}-stop")
+        def serve_stop():
+            from fastapi.responses import JSONResponse
+            import modal as _modal
+            try:
+                d = _modal.Dict.from_name(_dict_name)
+                d["stop"] = True
+            except Exception:
+                pass
+            return JSONResponse({"stopped": True})
 
         dashboard_fn = serve_dashboard
         progress_fn = serve_progress
@@ -342,11 +358,13 @@ class PersistentModalSamplingJob(SamplingJob):
         payload_path: str,
         sample_kwargs: dict,
         nuts_sampler: str,
+        stop_dict_name: str | None = None,
     ):
         self._sampler_cls = sampler_cls
         self._payload_path = payload_path
         self._sample_kwargs = sample_kwargs
         self._nuts_sampler = nuts_sampler
+        self._stop_dict_name = stop_dict_name
         self._idata_bytes: bytes | None = None
         self._events: list[ProgressEvent] = []
 
@@ -356,6 +374,7 @@ class PersistentModalSamplingJob(SamplingJob):
             self._payload_path,
             self._sample_kwargs,
             self._nuts_sampler,
+            stop_dict_name=self._stop_dict_name,
         )
 
         for chunk in gen:
@@ -419,13 +438,15 @@ class ModalEnvironment(RemoteEnvironment):
     """A provisioned Modal environment with payloads in a Volume."""
 
     def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
-                 dashboard_dict=None, dashboard_fn=None, progress_fn=None):
+                 dashboard_dict=None, dashboard_dict_name: str | None = None,
+                 dashboard_fn=None, progress_fn=None):
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
         self._project = project
         self._model_slug = model_slug
         self._dashboard_dict = dashboard_dict
+        self._dashboard_dict_name = dashboard_dict_name
         self._dashboard_fn = dashboard_fn
         self._progress_fn = progress_fn
         self._dashboard_url: str | None = None
@@ -451,11 +472,25 @@ class ModalEnvironment(RemoteEnvironment):
             if self._progress_fn is not None:
                 try:
                     self._progress_url = self._progress_fn.get_web_url()
-                    # Store progress URL in Dict so dashboard endpoint can find it
-                    if self._dashboard_dict is not None and self._progress_url:
-                        self._dashboard_dict["progress_url"] = self._progress_url
                 except Exception:
                     pass
+
+            # Store endpoint URLs in Dict so dashboard endpoint can find them
+            if self._dashboard_dict is not None:
+                urls = {}
+                if self._progress_url:
+                    urls["progress_url"] = self._progress_url
+                # Find stop URL from registered endpoints
+                for fn in self._app.registered_web_endpoints:
+                    try:
+                        url = fn.get_web_url()
+                        if url and "stop" in url:
+                            urls["stop_url"] = url
+                            break
+                    except Exception:
+                        pass
+                if urls:
+                    self._dashboard_dict.update(urls)
 
     def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
         """Upload model payload to Volume if not already there. Returns True if uploaded."""
@@ -506,6 +541,7 @@ class ModalEnvironment(RemoteEnvironment):
             payload_path,
             sample_kwargs,
             nuts_sampler,
+            stop_dict_name=self._dashboard_dict_name,
         )
 
     def teardown(self) -> None:
@@ -563,6 +599,7 @@ class ModalBackend(ComputeBackend):
         return ModalEnvironment(
             app, sampler_cls, volume, project, m_slug,
             dashboard_dict=dashboard_dict,
+            dashboard_dict_name=dashboard_dict_name,
             dashboard_fn=dashboard_fn,
             progress_fn=progress_fn,
         )

@@ -15,12 +15,15 @@ from queue import Queue
 from threading import Thread
 
 
-def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
+def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name=None):
     """Run MCMC sampling and yield msgpack-encoded progress + results.
 
     Shared core logic used by both one-shot and persistent paths.
     The caller is responsible for loading the model; this function
     handles compilation, sampling, progress streaming, and result serialization.
+
+    If stop_dict_name is provided, the callback checks for an early stop
+    signal every 10 draws via a Modal Dict.
     """
     import lz4.frame
     import msgpack
@@ -93,14 +96,36 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
     sampling_error = None
     idata = None
 
+    # Set up early stop check via Modal Dict
+    _stop_dict = None
+    if stop_dict_name:
+        try:
+            import modal
+            _stop_dict = modal.Dict.from_name(stop_dict_name)
+        except Exception:
+            pass
+
     chain_draw_counts: dict[int, int] = {}
     chain_start_times: dict[int, float] = {}
     chain_divergences: dict[int, int] = {}
     chain_tree_depths: dict[int, list[float]] = {}
     chain_phase: dict[int, bool] = {}
+    _total_draws: int = 0
     sample_start = time.time()
 
     def progress_callback(trace, draw):
+        nonlocal _total_draws
+        _total_draws += 1
+
+        # Check for early stop signal every 10 draws
+        if _stop_dict is not None and _total_draws % 10 == 0:
+            try:
+                if _stop_dict.get("stop", False):
+                    raise KeyboardInterrupt("early stop requested")
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                pass
         chain = draw.chain
         is_tuning = draw.tuning
 
@@ -149,8 +174,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
             "tree_size": tree_size,
         })
 
+    stopped_early = False
+
     def do_sample():
-        nonlocal idata, sampling_error
+        nonlocal idata, sampling_error, stopped_early
         try:
             if nuts_sampler == "nutpie":
                 idata = nutpie.sample(compiled, draws=draws, tune=tune, chains=chains, progress_bar=False)
@@ -165,6 +192,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
                         progressbar=False,
                         **sample_kwargs,
                     )
+        except KeyboardInterrupt:
+            # Early stop: PyMC preserves partial trace in idata
+            stopped_early = True
         except Exception as e:
             sampling_error = e
 
@@ -214,15 +244,27 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
         })
         raise sampling_error
 
-    yield msgpack.packb({
-        "type": "phase",
-        "phase": "sampling",
-        "status": "done",
-        "message": "sampling complete",
-        "elapsed": round(time.time() - sample_start, 1),
-    })
+    if stopped_early:
+        yield msgpack.packb({
+            "type": "phase",
+            "phase": "sampling",
+            "status": "done",
+            "message": f"stopped early ({_total_draws} draws)",
+            "elapsed": round(time.time() - sample_start, 1),
+        })
+    else:
+        yield msgpack.packb({
+            "type": "phase",
+            "phase": "sampling",
+            "status": "done",
+            "message": "sampling complete",
+            "elapsed": round(time.time() - sample_start, 1),
+        })
 
     # -- Serialize and return InferenceData --
+    if idata is None:
+        raise RuntimeError("Sampling produced no results")
+
     import os
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
@@ -281,6 +323,7 @@ def run_sampling_from_volume(
     payload_path: str,
     sample_kwargs: dict,
     nuts_sampler: str = "pymc",
+    stop_dict_name: str | None = None,
 ):
     """Persistent path: load model from Volume and run sampling."""
     import lz4.frame
@@ -303,4 +346,4 @@ def run_sampling_from_volume(
         "elapsed": elapsed,
     })
 
-    yield from _sample_and_stream(model, sample_kwargs, nuts_sampler)
+    yield from _sample_and_stream(model, sample_kwargs, nuts_sampler, stop_dict_name=stop_dict_name)

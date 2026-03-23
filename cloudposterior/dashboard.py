@@ -68,9 +68,12 @@ class DashboardSink:
             pass  # best-effort
 
 
-def render_dashboard_html(progress_url: str) -> str:
-    """Render dashboard HTML with the progress endpoint URL baked in."""
-    return DASHBOARD_HTML.replace("__PROGRESS_URL__", progress_url)
+def render_dashboard_html(progress_url: str, stop_url: str = "") -> str:
+    """Render dashboard HTML with endpoint URLs baked in."""
+    return (DASHBOARD_HTML
+        .replace("__PROGRESS_URL__", progress_url)
+        .replace("__STOP_URL__", stop_url)
+    )
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -100,6 +103,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .footer { color: #666; margin-top: 8px; font-size: 12px; }
   .complete-banner { background: #2d4a2d; color: #5cb85c; padding: 12px; border-radius: 6px;
                      margin-top: 16px; text-align: center; font-size: 16px; }
+  .stop-btn { width: 100%; padding: 14px; margin: 12px 0; border: none; border-radius: 6px;
+              font-family: inherit; font-size: 15px; font-weight: bold; cursor: pointer;
+              background: #d9534f; color: #fff; transition: opacity 0.2s; }
+  .stop-btn:hover { opacity: 0.85; }
+  .stop-btn:disabled { background: #555; cursor: not-allowed; opacity: 0.6; }
   .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #555;
              border-top-color: #f0ad4e; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -109,10 +117,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <h1>cloudposterior</h1>
 <div id="phases"><div class="phase"><span class="spinner"></span> <span class="detail">waiting for sampling to start...</span></div></div>
+<button id="stopBtn" class="stop-btn" disabled>Waiting for sampling...</button>
 <div id="sampling"></div>
 <div id="banner"></div>
 <script>
 let polling = true;
+let stopRequested = false;
+const stopBtn = document.getElementById('stopBtn');
+
+stopBtn.addEventListener('click', async () => {
+  if (stopRequested) return;
+  stopRequested = true;
+  stopBtn.textContent = 'Stopping...';
+  stopBtn.disabled = true;
+  try {
+    await fetch('__STOP_URL__', {method: 'POST'});
+  } catch (e) {}
+});
+
 async function poll() {
   if (!polling) return;
   try {
@@ -120,15 +142,23 @@ async function poll() {
     const data = await r.json();
     renderPhases(data.phases || []);
     renderSampling(data.sampling);
-    if (data.complete) {
+
+    // Enable stop button during sampling (not tuning)
+    const isSampling = (data.sampling && data.sampling.chains &&
+      Object.values(data.sampling.chains).some(c => c.phase === 'sampling'));
+    if (isSampling && !stopRequested && !data.complete) {
+      stopBtn.textContent = 'Stop sampling';
+      stopBtn.disabled = false;
+    } else if (data.complete) {
+      stopBtn.textContent = 'Sampling complete';
+      stopBtn.disabled = true;
       document.getElementById('banner').innerHTML =
         '<div class="complete-banner">Sampling complete</div>';
       polling = false;
     }
   } catch (e) {
     document.getElementById('banner').innerHTML =
-      '<div style="color:#d9534f;padding:8px;font-size:12px;">fetch error: ' + e.message
-      + '<br>url: ' + base + '/progress</div>';
+      '<div style="color:#d9534f;padding:8px;font-size:12px;">fetch error: ' + e.message + '</div>';
   }
   if (polling) setTimeout(poll, 1000);
 }
