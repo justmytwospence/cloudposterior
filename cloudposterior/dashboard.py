@@ -259,9 +259,9 @@ function kde(values, nPoints) {
   const std = Math.sqrt(values.reduce((s, v) => { const d = v - values.reduce((a, b) => a + b, 0) / n; return s + d * d; }, 0) / n);
   const bw = 0.9 * Math.min(std, iqr / 1.34) * Math.pow(n, -0.2); // Silverman's rule
   if (bw === 0 || isNaN(bw)) return {x: [0], y: [0]};
-  const pad = 3 * bw;
-  const lo = sorted[0] - pad;
-  const hi = sorted[n - 1] + pad;
+  // Use 0.5th-99.5th percentile to exclude outliers (like ArviZ)
+  const lo = sorted[Math.max(0, Math.floor(n * 0.005))] - 3 * bw;
+  const hi = sorted[Math.min(n - 1, Math.floor(n * 0.995))] + 3 * bw;
   const step = (hi - lo) / (nPoints - 1);
   const x = Array.from({length: nPoints}, (_, i) => lo + i * step);
   const y = x.map(xi => {
@@ -285,6 +285,14 @@ function renderTraces(traces) {
     const chainData = traces[param];
     if (!chainData || chainData.length === 0) continue;
     const nChains = chainData.length;
+
+    // Compute robust y-range from all chains (0.5th-99.5th percentile)
+    const allVals = chainData.flat().slice().sort((a, b) => a - b);
+    const yLo = allVals[Math.max(0, Math.floor(allVals.length * 0.005))];
+    const yHi = allVals[Math.min(allVals.length - 1, Math.floor(allVals.length * 0.995))];
+    const yPad = (yHi - yLo) * 0.05;
+    const yMin = yLo - yPad;
+    const yMax = yHi + yPad;
 
     // -- Build trace data (right panel) --
     const maxLen = Math.max(...chainData.map(c => c.length));
@@ -319,7 +327,7 @@ function renderTraces(traces) {
         return k.y[idx] + t * (k.y[idx + 1] - k.y[idx]);
       });
       kdeData.push(interp);
-      kdeSeries.push({label: 'Chain ' + c, stroke: chainColors[c % chainColors.length], width: 2, fill: chainColors[c % chainColors.length] + '20'});
+      kdeSeries.push({label: 'Chain ' + c, stroke: chainColors[c % chainColors.length], width: 2, fill: chainColors[c % chainColors.length] + '20', points: {show: false}});
     }
 
     const traceId = 'trace-' + param;
@@ -343,6 +351,7 @@ function renderTraces(traces) {
       const row = document.createElement('div');
       row.style.display = 'flex';
       row.style.gap = '8px';
+      row.style.flexWrap = 'wrap';
       const kdeDiv = document.createElement('div');
       kdeDiv.id = kdeId;
       const traceDiv = document.createElement('div');
@@ -355,15 +364,25 @@ function renderTraces(traces) {
       const chartH = 140;
       kdeCharts[param] = new uPlot({
         width: halfW, height: chartH, series: kdeSeries,
+        scales: {x: {range: (u, dMin, dMax) => [yMin, yMax]}},
         axes: [{size: 30, stroke: '#555', ticks: {stroke: '#333'}}, {size: 40, stroke: '#555', ticks: {stroke: '#333'}}],
         legend: {show: false}, cursor: {show: false},
       }, kdeData, kdeDiv);
       traceCharts[param] = new uPlot({
         width: halfW, height: chartH, series: traceSeries,
+        scales: {y: {range: (u, dMin, dMax) => [yMin, yMax]}},
         axes: [{size: 30, stroke: '#555', ticks: {stroke: '#333'}}, {size: 40, stroke: '#555', ticks: {stroke: '#333'}}],
         legend: {show: false}, cursor: {show: false},
       }, traceData, traceDiv);
     } else {
+      // Resize charts and update scale ranges
+      const newCw = container.clientWidth || 700;
+      const newHalf = Math.floor((newCw - 16) / 2);
+      kdeCharts[param].setSize({width: newHalf, height: 140});
+      traceCharts[param].setSize({width: newHalf, height: 140});
+      // Update scale ranges for new data
+      kdeCharts[param].scales.x.range = (u, dMin, dMax) => [yMin, yMax];
+      traceCharts[param].scales.y.range = (u, dMin, dMax) => [yMin, yMax];
       kdeCharts[param].setData(kdeData);
       traceCharts[param].setData(traceData);
     }

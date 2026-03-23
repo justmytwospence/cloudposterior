@@ -338,6 +338,13 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
         })
         raise sampling_error
 
+    # Check if stop was requested (either via exception or Dict flag)
+    if not stopped_early and _stop_dict is not None:
+        try:
+            stopped_early = _stop_dict.get("stop", False)
+        except Exception:
+            pass
+
     if stopped_early:
         yield msgpack.packb({
             "type": "phase",
