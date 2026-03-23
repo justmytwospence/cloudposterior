@@ -284,10 +284,27 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
                 }
 
             if convergence:
+                # Also include subsampled trace values for live traceplots
+                traces = {}
+                max_trace_points = 500
+                for param in sorted(param_names):
+                    chain_values = []
+                    for chain_id in sorted(chain_traces.keys()):
+                        if param in chain_traces[chain_id]:
+                            vals = chain_traces[chain_id][param]
+                            # Subsample to max_trace_points
+                            if len(vals) > max_trace_points:
+                                step = len(vals) // max_trace_points
+                                vals = vals[::step][:max_trace_points]
+                            chain_values.append(vals)
+                    if chain_values:
+                        traces[param] = chain_values
+
                 return msgpack.packb({
                     "type": "convergence",
                     "params": convergence,
                     "draws": min_draws,
+                    "traces": traces,
                 })
         except Exception:
             pass

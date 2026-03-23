@@ -246,7 +246,8 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
                 ess_bulk=pdata["ess_bulk"],
                 ess_tail=pdata["ess_tail"],
             )
-        return ConvergenceUpdate(params=params, draws=data.get("draws", 0))
+        traces = data.get("traces", {})
+        return ConvergenceUpdate(params=params, draws=data.get("draws", 0), traces=traces)
 
     return None
 

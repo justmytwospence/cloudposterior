@@ -63,6 +63,7 @@ class DashboardSink:
             for name, p in update.params.items()
         }
         self._convergence_draws = update.draws
+        self._traces = update.traces if update.traces else {}
         self._write()
 
     def _write(self):
@@ -77,6 +78,8 @@ class DashboardSink:
                     "params": self._convergence,
                     "draws": self._convergence_draws,
                 }
+            if hasattr(self, "_traces") and self._traces:
+                data["traces"] = self._traces
             self._dict["progress"] = data
         except Exception:
             pass  # best-effort
@@ -96,6 +99,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cloudposterior</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'SF Mono', 'Menlo', 'Monaco', monospace; font-size: 14px;
@@ -141,6 +146,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <button id="stopBtn" class="stop-btn" disabled>Waiting for sampling...</button>
 <div id="convergence"></div>
 <div id="sampling"></div>
+<div id="traces"></div>
 <div id="banner"></div>
 <script>
 let polling = true;
@@ -165,6 +171,7 @@ async function poll() {
     renderPhases(data.phases || []);
     renderSampling(data.sampling);
     if (data.convergence) renderConvergence(data.convergence);
+    if (data.traces) renderTraces(data.traces);
 
     // Enable stop button during sampling (not tuning)
     const isSampling = (data.sampling && data.sampling.chains &&
@@ -220,6 +227,61 @@ function renderSampling(s) {
   html += '<div class="footer">Divergences: ' + s.total_divergences + ' | Elapsed: ' + s.elapsed.toFixed(1) + 's</div>';
   document.getElementById('sampling').innerHTML = html;
 }
+const traceCharts = {};
+const chainColors = ['#1764f4', '#d9534f', '#5cb85c', '#f0ad4e', '#9b59b6', '#1abc9c', '#e67e22', '#3498db'];
+
+function renderTraces(traces) {
+  const container = document.getElementById('traces');
+  const paramNames = Object.keys(traces).sort();
+
+  for (const param of paramNames) {
+    const chainData = traces[param];
+    if (!chainData || chainData.length === 0) continue;
+
+    const maxLen = Math.max(...chainData.map(c => c.length));
+    const xValues = Array.from({length: maxLen}, (_, i) => i);
+    const data = [xValues];
+    const series = [{label: 'Draw'}];
+
+    for (let c = 0; c < chainData.length; c++) {
+      data.push(chainData[c]);
+      series.push({
+        label: 'Chain ' + c,
+        stroke: chainColors[c % chainColors.length],
+        width: 1,
+      });
+    }
+
+    const divId = 'trace-' + param;
+    if (!traceCharts[param]) {
+      // Create new chart
+      let div = document.getElementById(divId);
+      if (!div) {
+        const wrapper = document.createElement('div');
+        wrapper.style.marginTop = '12px';
+        wrapper.innerHTML = '<div style="color:#888;font-size:12px;margin-bottom:4px;">' + param + '</div>';
+        div = document.createElement('div');
+        div.id = divId;
+        wrapper.appendChild(div);
+        container.appendChild(wrapper);
+      }
+      const width = Math.min(container.clientWidth || 400, 600);
+      const opts = {
+        width: width,
+        height: 120,
+        series: series,
+        axes: [{show: false}, {}],
+        legend: {show: false},
+        cursor: {show: false},
+      };
+      traceCharts[param] = new uPlot(opts, data, div);
+    } else {
+      // Update existing chart
+      traceCharts[param].setData(data);
+    }
+  }
+}
+
 function renderConvergence(conv) {
   if (!conv || !conv.params) { document.getElementById('convergence').innerHTML = ''; return; }
   const params = conv.params;

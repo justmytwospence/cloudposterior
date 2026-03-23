@@ -64,6 +64,7 @@ class ParamConvergence:
 class ConvergenceUpdate:
     params: dict[str, ParamConvergence]
     draws: int = 0
+    traces: dict[str, list[list[float]]] = field(default_factory=dict)  # param -> [[chain0_vals], [chain1_vals], ...]
 
 
 # Union type for progress events streamed from remote
