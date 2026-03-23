@@ -110,7 +110,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
     chain_divergences: dict[int, int] = {}
     chain_tree_depths: dict[int, list[float]] = {}
     chain_phase: dict[int, bool] = {}
+    # Accumulate trace values for convergence diagnostics
+    chain_traces: dict[int, dict[str, list]] = {}  # chain -> {param_name: [values...]}
     _total_draws: int = 0
+    _last_convergence_draw: int = 0
     sample_start = time.time()
 
     def progress_callback(trace, draw):
@@ -160,6 +163,18 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
         remaining = total - current_draw
         eta = remaining / dps if dps > 0 else 0.0
         mean_td = sum(chain_tree_depths[chain][-100:]) / min(len(chain_tree_depths[chain]), 100)
+
+        # Accumulate parameter values for convergence (only during sampling, not tuning)
+        if not is_tuning and hasattr(draw, 'point') and draw.point:
+            if chain not in chain_traces:
+                chain_traces[chain] = {}
+            for param_name, value in draw.point.items():
+                import numpy as _np
+                val = _np.asarray(value)
+                if val.ndim == 0:  # scalar params only
+                    if param_name not in chain_traces[chain]:
+                        chain_traces[chain][param_name] = []
+                    chain_traces[chain][param_name].append(float(val))
 
         progress_queue.put({
             "chain": chain,
@@ -222,11 +237,71 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
             })
         return None
 
+    def _compute_convergence():
+        """Compute R-hat and ESS on accumulated traces. Returns msgpack or None."""
+        nonlocal _last_convergence_draw
+        import numpy as _np
+
+        # Need at least 2 chains with 50+ draws each
+        if len(chain_traces) < 2:
+            return None
+        min_draws = min(len(v) for ct in chain_traces.values() for v in ct.values()) if chain_traces else 0
+        if min_draws < 50:
+            return None
+        # Only compute every 100 draws
+        if _total_draws - _last_convergence_draw < 100:
+            return None
+        _last_convergence_draw = _total_draws
+
+        try:
+            import arviz as az
+
+            # Build a dict of {param: array(chains, draws)} from accumulated traces
+            param_names = set()
+            for ct in chain_traces.values():
+                param_names.update(ct.keys())
+
+            convergence = {}
+            for param in sorted(param_names):
+                # Get draws per chain, truncate to shortest
+                chain_values = []
+                for chain_id in sorted(chain_traces.keys()):
+                    if param in chain_traces[chain_id]:
+                        chain_values.append(chain_traces[chain_id][param])
+                if len(chain_values) < 2:
+                    continue
+                min_len = min(len(cv) for cv in chain_values)
+                if min_len < 50:
+                    continue
+                arr = _np.array([cv[:min_len] for cv in chain_values])  # (chains, draws)
+                rhat = float(az.rhat({"x": arr[_np.newaxis, ...]}).x.values)
+                ess_bulk = float(az.ess({"x": arr[_np.newaxis, ...]}).x.values)
+                ess_tail = float(az.ess({"x": arr[_np.newaxis, ...]}, method="tail").x.values)
+                convergence[param] = {
+                    "rhat": round(rhat, 4),
+                    "ess_bulk": round(ess_bulk),
+                    "ess_tail": round(ess_tail),
+                }
+
+            if convergence:
+                return msgpack.packb({
+                    "type": "convergence",
+                    "params": convergence,
+                    "draws": min_draws,
+                })
+        except Exception:
+            pass
+        return None
+
     while sample_thread.is_alive():
         time.sleep(0.5)
         snapshot = _drain_and_yield()
         if snapshot:
             yield snapshot
+        # Periodically compute and yield convergence diagnostics
+        conv = _compute_convergence()
+        if conv:
+            yield conv
 
     sample_thread.join()
 

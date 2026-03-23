@@ -57,13 +57,27 @@ class DashboardSink:
         }
         self._write()
 
+    def show_convergence(self, update):
+        self._convergence = {
+            name: {"rhat": p.rhat, "ess_bulk": p.ess_bulk, "ess_tail": p.ess_tail}
+            for name, p in update.params.items()
+        }
+        self._convergence_draws = update.draws
+        self._write()
+
     def _write(self):
         try:
-            self._dict["progress"] = {
+            data = {
                 "phases": self._phases,
                 "sampling": self._sampling,
                 "complete": self._complete,
             }
+            if hasattr(self, "_convergence") and self._convergence:
+                data["convergence"] = {
+                    "params": self._convergence,
+                    "draws": self._convergence_draws,
+                }
+            self._dict["progress"] = data
         except Exception:
             pass  # best-effort
 
@@ -108,6 +122,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               background: #d9534f; color: #fff; transition: opacity 0.2s; }
   .stop-btn:hover { opacity: 0.85; }
   .stop-btn:disabled { background: #555; cursor: not-allowed; opacity: 0.6; }
+  .conv-good { color: #5cb85c; }
+  .conv-warn { color: #f0ad4e; }
+  .conv-bad { color: #d9534f; }
+  .verdict { padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-size: 13px; text-align: center; }
+  .verdict-good { background: #2d4a2d; color: #5cb85c; }
+  .verdict-bad { background: #4a2d2d; color: #d9534f; }
+  .verdict-warn { background: #4a3d2d; color: #f0ad4e; }
   .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #555;
              border-top-color: #f0ad4e; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -118,6 +139,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <h1>cloudposterior</h1>
 <div id="phases"><div class="phase"><span class="spinner"></span> <span class="detail">waiting for sampling to start...</span></div></div>
 <button id="stopBtn" class="stop-btn" disabled>Waiting for sampling...</button>
+<div id="convergence"></div>
 <div id="sampling"></div>
 <div id="banner"></div>
 <script>
@@ -142,6 +164,7 @@ async function poll() {
     const data = await r.json();
     renderPhases(data.phases || []);
     renderSampling(data.sampling);
+    if (data.convergence) renderConvergence(data.convergence);
 
     // Enable stop button during sampling (not tuning)
     const isSampling = (data.sampling && data.sampling.chains &&
@@ -196,6 +219,35 @@ function renderSampling(s) {
   html += '</table>';
   html += '<div class="footer">Divergences: ' + s.total_divergences + ' | Elapsed: ' + s.elapsed.toFixed(1) + 's</div>';
   document.getElementById('sampling').innerHTML = html;
+}
+function renderConvergence(conv) {
+  if (!conv || !conv.params) { document.getElementById('convergence').innerHTML = ''; return; }
+  const params = conv.params;
+  const names = Object.keys(params).sort();
+  if (names.length === 0) return;
+
+  function rhatClass(v) { return v < 1.01 ? 'conv-good' : v < 1.05 ? 'conv-warn' : 'conv-bad'; }
+  function essClass(v) { return v >= 400 ? 'conv-good' : v >= 100 ? 'conv-warn' : 'conv-bad'; }
+
+  let allGood = true;
+  let html = '<table><tr><th>Parameter</th><th>R-hat</th><th>Bulk ESS</th><th>Tail ESS</th></tr>';
+  for (const name of names) {
+    const p = params[name];
+    if (p.rhat >= 1.01 || p.ess_bulk < 400 || p.ess_tail < 400) allGood = false;
+    html += '<tr>'
+      + '<td>' + name + '</td>'
+      + '<td class="' + rhatClass(p.rhat) + '">' + p.rhat.toFixed(3) + '</td>'
+      + '<td class="' + essClass(p.ess_bulk) + '">' + p.ess_bulk + '</td>'
+      + '<td class="' + essClass(p.ess_tail) + '">' + p.ess_tail + '</td>'
+      + '</tr>';
+  }
+  html += '</table>';
+
+  const verdictClass = allGood ? 'verdict-good' : 'verdict-warn';
+  const verdictText = allGood ? 'Converged (' + conv.draws + ' draws)' : 'Not yet converged (' + conv.draws + ' draws)';
+  html = '<div class="verdict ' + verdictClass + '">' + verdictText + '</div>' + html;
+
+  document.getElementById('convergence').innerHTML = html;
 }
 poll();
 </script>

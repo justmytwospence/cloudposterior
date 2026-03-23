@@ -53,8 +53,21 @@ class SamplingProgress:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ParamConvergence:
+    rhat: float
+    ess_bulk: int
+    ess_tail: int
+
+
+@dataclass
+class ConvergenceUpdate:
+    params: dict[str, ParamConvergence]
+    draws: int = 0
+
+
 # Union type for progress events streamed from remote
-ProgressEvent = PhaseUpdate | SamplingProgress
+ProgressEvent = PhaseUpdate | SamplingProgress | ConvergenceUpdate
 
 
 def make_sampling_callback(queue: Queue, tune: int, draws: int):

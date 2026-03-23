@@ -237,6 +237,17 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
             elapsed=data.get("elapsed", 0.0),
         )
 
+    if msg_type == "convergence":
+        from cloudposterior.progress import ConvergenceUpdate, ParamConvergence
+        params = {}
+        for name, pdata in data.get("params", {}).items():
+            params[name] = ParamConvergence(
+                rhat=pdata["rhat"],
+                ess_bulk=pdata["ess_bulk"],
+                ess_tail=pdata["ess_tail"],
+            )
+        return ConvergenceUpdate(params=params, draws=data.get("draws", 0))
+
     return None
 
 

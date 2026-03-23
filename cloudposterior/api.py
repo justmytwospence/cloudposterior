@@ -263,11 +263,14 @@ def _run_sample(
         )
 
     def emit(event):
+        from cloudposterior.progress import ConvergenceUpdate
         for sink in sinks:
             if isinstance(event, PhaseUpdate):
                 sink.show_phase(event)
             elif isinstance(event, SamplingProgress):
                 sink.show_sampling(event)
+            elif isinstance(event, ConvergenceUpdate) and hasattr(sink, "show_convergence"):
+                sink.show_convergence(event)
 
     # -- Run sampling --
     if remote:
@@ -523,11 +526,14 @@ def _run_sample_persistent(
             _show_link(dashboard_url, label="Dashboard", show_qr=True)
 
     def emit(event):
+        from cloudposterior.progress import ConvergenceUpdate
         for sink in sinks:
             if isinstance(event, PhaseUpdate):
                 sink.show_phase(event)
             elif isinstance(event, SamplingProgress):
                 sink.show_sampling(event)
+            elif isinstance(event, ConvergenceUpdate) and hasattr(sink, "show_convergence"):
+                sink.show_convergence(event)
 
     # Upload payload to Volume if needed
     payload_path = _compute_payload_path(env._model_slug, model_bytes, data_bytes)
