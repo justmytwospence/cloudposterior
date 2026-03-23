@@ -323,11 +323,14 @@ def _create_persistent_app(
             from fastapi.responses import HTMLResponse
             from cloudposterior.dashboard import render_dashboard_html
             import modal as _modal
+            import sys
             try:
                 d = _modal.Dict.from_name(_dict_name)
                 progress_url = d.get("progress_url", "")
                 stop_url = d.get("stop_url", "")
-            except Exception:
+                print(f"[dashboard] progress_url={progress_url!r}, stop_url={stop_url!r}", file=sys.stderr)
+            except Exception as e:
+                print(f"[dashboard] Dict error: {e}", file=sys.stderr)
                 progress_url = ""
                 stop_url = ""
             return HTMLResponse(render_dashboard_html(progress_url, stop_url))
