@@ -316,29 +316,19 @@ def _create_persistent_app(
     if dashboard_dict_name is not None:
         _dict_name = dashboard_dict_name
         _uid = dashboard_dict_name.replace("cp-dash-", "")[:6]
-
-        @app.function(serialized=True, image=image)
-        @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}")
-        # Dashboard constructs sibling URLs from its own URL pattern
         _progress_label = f"{model_label}-{_uid}-progress"
         _stop_label = f"{model_label}-{_uid}-stop"
+        _dash_label = f"{model_label}-{_uid}"
 
+        @app.function(serialized=True, image=image)
+        @modal.fastapi_endpoint(method="GET", label=_dash_label)
         def serve_dashboard():
             from fastapi.responses import HTMLResponse
             from cloudposterior.dashboard import render_dashboard_html
-            from starlette.requests import Request
-            import re
-
-            # Derive sibling URLs from our own URL by replacing the label
-            # Dashboard URL: https://workspace--{dash_label}-env.modal.run
-            # Progress URL: https://workspace--{prog_label}-env.modal.run
-            dash_label = f"{model_label}-{_uid}"
-            # We can't get our own URL here, so use the labels directly
-            # The client-side JS will construct the URLs from window.location
             return HTMLResponse(render_dashboard_html(
                 progress_label=_progress_label,
                 stop_label=_stop_label,
-                dashboard_label=dash_label,
+                dashboard_label=_dash_label,
             ))
 
         @app.function(serialized=True, image=image)
