@@ -15,12 +15,15 @@ from queue import Queue
 from threading import Thread
 
 
-def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
+def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name=None):
     """Run MCMC sampling and yield msgpack-encoded progress + results.
 
     Shared core logic used by both one-shot and persistent paths.
     The caller is responsible for loading the model; this function
     handles compilation, sampling, progress streaming, and result serialization.
+
+    If stop_dict_name is provided, the callback checks for an early stop
+    signal every 10 draws via a Modal Dict.
     """
     import lz4.frame
     import msgpack
@@ -93,14 +96,39 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
     sampling_error = None
     idata = None
 
+    # Set up early stop check via Modal Dict
+    _stop_dict = None
+    if stop_dict_name:
+        try:
+            import modal
+            _stop_dict = modal.Dict.from_name(stop_dict_name)
+        except Exception:
+            pass
+
     chain_draw_counts: dict[int, int] = {}
     chain_start_times: dict[int, float] = {}
     chain_divergences: dict[int, int] = {}
     chain_tree_depths: dict[int, list[float]] = {}
     chain_phase: dict[int, bool] = {}
+    # Accumulate trace values for convergence diagnostics
+    chain_traces: dict[int, dict[str, list]] = {}  # chain -> {param_name: [values...]}
+    _total_draws: int = 0
+    _last_convergence_draw: int = 0
     sample_start = time.time()
 
     def progress_callback(trace, draw):
+        nonlocal _total_draws
+        _total_draws += 1
+
+        # Check for early stop signal every 10 draws
+        if _stop_dict is not None and _total_draws % 10 == 0:
+            try:
+                if _stop_dict.get("stop", False):
+                    raise KeyboardInterrupt("early stop requested")
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                pass
         chain = draw.chain
         is_tuning = draw.tuning
 
@@ -136,6 +164,18 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
         eta = remaining / dps if dps > 0 else 0.0
         mean_td = sum(chain_tree_depths[chain][-100:]) / min(len(chain_tree_depths[chain]), 100)
 
+        # Accumulate parameter values for convergence and trace plots
+        if hasattr(draw, 'point') and draw.point:
+            if chain not in chain_traces:
+                chain_traces[chain] = {}
+            for param_name, value in draw.point.items():
+                import numpy as _np
+                val = _np.asarray(value)
+                if val.ndim == 0:  # scalar params only
+                    if param_name not in chain_traces[chain]:
+                        chain_traces[chain][param_name] = []
+                    chain_traces[chain][param_name].append(float(val))
+
         progress_queue.put({
             "chain": chain,
             "draw": current_draw,
@@ -149,8 +189,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
             "tree_size": tree_size,
         })
 
+    stopped_early = False
+
     def do_sample():
-        nonlocal idata, sampling_error
+        nonlocal idata, sampling_error, stopped_early
         try:
             if nuts_sampler == "nutpie":
                 idata = nutpie.sample(compiled, draws=draws, tune=tune, chains=chains, progress_bar=False)
@@ -165,6 +207,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
                         progressbar=False,
                         **sample_kwargs,
                     )
+        except KeyboardInterrupt:
+            # Early stop: PyMC preserves partial trace in idata
+            stopped_early = True
         except Exception as e:
             sampling_error = e
 
@@ -189,7 +234,84 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
                 "chains": dict(all_chain_states),
                 "total_divergences": total_div,
                 "elapsed": round(time.time() - sample_start, 1),
+                "total_draws": _total_draws,
             })
+        return None
+
+    def _compute_convergence():
+        """Compute R-hat and ESS on accumulated traces. Returns msgpack or None."""
+        nonlocal _last_convergence_draw
+        import numpy as _np
+
+        # Need at least 2 chains with draws
+        if len(chain_traces) < 2:
+            return None
+
+        # Find minimum draws across all params in all chains
+        all_lens = [len(v) for ct in chain_traces.values() for v in ct.values()]
+        min_draws = min(all_lens) if all_lens else 0
+        if min_draws < 20:
+            return None
+        # Only compute every 50 total draws
+        if _total_draws - _last_convergence_draw < 50:
+            return None
+        _last_convergence_draw = _total_draws
+
+        try:
+            import arviz as az
+
+            # Build a dict of {param: array(chains, draws)} from accumulated traces
+            param_names = set()
+            for ct in chain_traces.values():
+                param_names.update(ct.keys())
+
+            convergence = {}
+            for param in sorted(param_names):
+                # Get draws per chain, truncate to shortest
+                chain_values = []
+                for chain_id in sorted(chain_traces.keys()):
+                    if param in chain_traces[chain_id]:
+                        chain_values.append(chain_traces[chain_id][param])
+                if len(chain_values) < 2:
+                    continue
+                min_len = min(len(cv) for cv in chain_values)
+                if min_len < 50:
+                    continue
+                arr = _np.array([cv[:min_len] for cv in chain_values])  # (chains, draws)
+                rhat = float(az.rhat(arr))
+                ess_bulk = float(az.ess(arr))
+                ess_tail = float(az.ess(arr, method="tail"))
+                convergence[param] = {
+                    "rhat": round(rhat, 4),
+                    "ess_bulk": round(ess_bulk),
+                    "ess_tail": round(ess_tail),
+                }
+
+            if convergence:
+                # Subsampled trace values for live traceplots
+                traces = {}
+                max_trace_points = 500
+                for param in sorted(param_names):
+                    chain_values = []
+                    for chain_id in sorted(chain_traces.keys()):
+                        if param in chain_traces[chain_id]:
+                            vals = chain_traces[chain_id][param]
+                            if len(vals) > max_trace_points:
+                                step = len(vals) // max_trace_points
+                                vals = vals[::step][:max_trace_points]
+                            chain_values.append(vals)
+                    if chain_values:
+                        traces[param] = chain_values
+
+                return msgpack.packb({
+                    "type": "convergence",
+                    "params": convergence,
+                    "draws": min_draws,
+                    "total_draws": _total_draws,
+                    "traces": traces,
+                })
+        except Exception:
+            pass
         return None
 
     while sample_thread.is_alive():
@@ -197,6 +319,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
         snapshot = _drain_and_yield()
         if snapshot:
             yield snapshot
+        # Periodically compute and yield convergence diagnostics
+        conv = _compute_convergence()
+        if conv:
+            yield conv
 
     sample_thread.join()
 
@@ -214,15 +340,34 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc"):
         })
         raise sampling_error
 
-    yield msgpack.packb({
-        "type": "phase",
-        "phase": "sampling",
-        "status": "done",
-        "message": "sampling complete",
-        "elapsed": round(time.time() - sample_start, 1),
-    })
+    # Check if stop was requested (either via exception or Dict flag)
+    if not stopped_early and _stop_dict is not None:
+        try:
+            stopped_early = _stop_dict.get("stop", False)
+        except Exception:
+            pass
+
+    if stopped_early:
+        yield msgpack.packb({
+            "type": "phase",
+            "phase": "sampling",
+            "status": "done",
+            "message": f"stopped early ({_total_draws} draws)",
+            "elapsed": round(time.time() - sample_start, 1),
+        })
+    else:
+        yield msgpack.packb({
+            "type": "phase",
+            "phase": "sampling",
+            "status": "done",
+            "message": "sampling complete",
+            "elapsed": round(time.time() - sample_start, 1),
+        })
 
     # -- Serialize and return InferenceData --
+    if idata is None:
+        raise RuntimeError("Sampling produced no results")
+
     import os
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
@@ -281,6 +426,7 @@ def run_sampling_from_volume(
     payload_path: str,
     sample_kwargs: dict,
     nuts_sampler: str = "pymc",
+    stop_dict_name: str | None = None,
 ):
     """Persistent path: load model from Volume and run sampling."""
     import lz4.frame
@@ -303,4 +449,4 @@ def run_sampling_from_volume(
         "elapsed": elapsed,
     })
 
-    yield from _sample_and_stream(model, sample_kwargs, nuts_sampler)
+    yield from _sample_and_stream(model, sample_kwargs, nuts_sampler, stop_dict_name=stop_dict_name)

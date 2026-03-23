@@ -50,11 +50,26 @@ class SamplingProgress:
     chains: dict[int, ChainProgress]
     total_divergences: int = 0
     elapsed: float = 0.0
+    total_draws: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ParamConvergence:
+    rhat: float
+    ess_bulk: int
+    ess_tail: int
+
+
+@dataclass
+class ConvergenceUpdate:
+    params: dict[str, ParamConvergence]
+    draws: int = 0
+    traces: dict[str, list[list[float]]] = field(default_factory=dict)  # param -> [[chain0_vals], [chain1_vals], ...]
+
+
 # Union type for progress events streamed from remote
-ProgressEvent = PhaseUpdate | SamplingProgress
+ProgressEvent = PhaseUpdate | SamplingProgress | ConvergenceUpdate
 
 
 def make_sampling_callback(queue: Queue, tune: int, draws: int):

@@ -122,21 +122,21 @@ Model names come from `pm.Model(name="radon_intercepts")`. The hash suffix ensur
 
 Two ways to monitor sampling:
 
-**Live dashboard** (default for remote) -- a web page with per-chain progress bars updating in real time:
+**Live dashboard** (on by default for remote) -- convergence diagnostics, trace plots, and a stop button:
 
 ```python
-with cp.cloud(model, remote=True, notify=True):
+with cp.cloud(model, remote=True):
     idata = pm.sample(draws=5000, chains=8)
 ```
 
 Scan the QR code or open the URL on your phone. No app install needed.
 
-**Push notifications** (default for local) -- get notified when sampling starts and completes via [ntfy](https://ntfy.sh):
+**Push notifications** -- get notified when sampling starts and completes via [ntfy](https://ntfy.sh):
 
 ```python
-with cp.cloud(model, notify=True):                                           # ntfy (local)
+with cp.cloud(model, notify=True):                                           # auto topic
 with cp.cloud(model, notify="my-channel"):                                   # custom topic
-with cp.cloud(model, notify={"server": "https://ntfy.example.com"}):         # self-hosted
+with cp.cloud(model, remote=True, notify=True):                              # both dashboard + ntfy
 ```
 
 ### Live progress display
@@ -159,14 +159,15 @@ Notebooks get an ipywidgets GUI. Terminals get a Rich TUI. Progress bars turn re
 |---------|---------|---------|
 | Caching | **on** (in-memory) | `cache=True` / `False` / `"disk"` / `Path(...)` |
 | Cloud execution | off | `remote=True` / `False` |
-| Notifications | off | `notify=True` / `"topic"` / `{"server": ..., "topic": ...}` |
+| Live dashboard | **on** (when remote) | `dashboard=True` / `False` |
+| Push notifications | off | `notify=True` / `"topic"` / `{"server": ..., "topic": ...}` |
 
 Mix and match:
 
 ```python
 with cp.cloud(model):                                          # local + memory cache
 with cp.cloud(model, cache="disk"):                            # local + disk cache
-with cp.cloud(model, remote=True):                             # cloud + memory cache
+with cp.cloud(model, remote=True):                             # cloud + dashboard
 with cp.cloud(model, remote=True, cache="disk", notify=True):  # everything
 ```
 
@@ -244,7 +245,7 @@ Clone and run locally for the full interactive progress display.
 
 - [examples/basics.ipynb](examples/basics.ipynb) -- cloud execution and GPU acceleration with the Minnesota Radon dataset
 - [examples/caching.ipynb](examples/caching.ipynb) -- local and disk caching, model iteration
-- [examples/notifications.ipynb](examples/notifications.ipynb) -- live dashboard and push notifications
+- [examples/monitoring.ipynb](examples/monitoring.ipynb) -- live dashboard and push notifications
 
 ---
 

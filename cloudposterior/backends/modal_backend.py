@@ -158,17 +158,18 @@ class ModalSamplingJob(SamplingJob):
 
                 for chunk in gen:
                     try:
-                        decoded = msgpack.unpackb(chunk, raw=False)
+                        unpacker = msgpack.Unpacker(raw=False)
+                        unpacker.feed(chunk)
+                        for decoded in unpacker:
+                            event = _decode_progress_event(decoded)
+                            if event is not None:
+                                self._events.append(event)
+                                yield event
+                            elif decoded.get("type") == "result":
+                                pass
                     except Exception:
                         self._idata_bytes = chunk
                         continue
-
-                    event = _decode_progress_event(decoded)
-                    if event is not None:
-                        self._events.append(event)
-                        yield event
-                    elif decoded.get("type") == "result":
-                        pass
 
     def result(self):
         """Return the InferenceData. Must call stream_progress first."""
@@ -235,7 +236,20 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
             chains=chains,
             total_divergences=data.get("total_divergences", 0),
             elapsed=data.get("elapsed", 0.0),
+            total_draws=data.get("total_draws", 0),
         )
+
+    if msg_type == "convergence":
+        from cloudposterior.progress import ConvergenceUpdate, ParamConvergence
+        params = {}
+        for name, pdata in data.get("params", {}).items():
+            params[name] = ParamConvergence(
+                rhat=pdata["rhat"],
+                ess_bulk=pdata["ess_bulk"],
+                ess_tail=pdata["ess_tail"],
+            )
+        traces = data.get("traces", {})
+        return ConvergenceUpdate(params=params, draws=data.get("draws", 0), traces=traces)
 
     return None
 
@@ -288,32 +302,36 @@ def _create_persistent_app(
     )
     class Sampler:
         @modal.method(is_generator=True)
-        def sample(self, payload_path: str, sample_kwargs: dict, nuts_sampler: str = "pymc"):
+        def sample(self, payload_path: str, sample_kwargs: dict, nuts_sampler: str = "pymc",
+                   stop_dict_name: str | None = None):
             from cloudposterior.remote.worker import run_sampling_from_volume
 
             yield from run_sampling_from_volume(
                 f"/data/{payload_path}", sample_kwargs, nuts_sampler,
+                stop_dict_name=stop_dict_name,
             )
 
     # Add dashboard web endpoints if requested
     dashboard_fn = None
     progress_fn = None
+    stop_fn = None
     if dashboard_dict_name is not None:
         _dict_name = dashboard_dict_name
         _uid = dashboard_dict_name.replace("cp-dash-", "")[:6]
+        _progress_label = f"{model_label}-{_uid}-progress"
+        _stop_label = f"{model_label}-{_uid}-stop"
+        _dash_label = f"{model_label}-{_uid}"
 
         @app.function(serialized=True, image=image)
-        @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}")
+        @modal.fastapi_endpoint(method="GET", label=_dash_label)
         def serve_dashboard():
             from fastapi.responses import HTMLResponse
             from cloudposterior.dashboard import render_dashboard_html
-            import modal as _modal
-            try:
-                d = _modal.Dict.from_name(_dict_name)
-                progress_url = d["progress_url"]
-            except (KeyError, Exception):
-                progress_url = ""
-            return HTMLResponse(render_dashboard_html(progress_url))
+            return HTMLResponse(render_dashboard_html(
+                progress_label=_progress_label,
+                stop_label=_stop_label,
+                dashboard_label=_dash_label,
+            ))
 
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}-progress")
@@ -327,10 +345,23 @@ def _create_persistent_app(
                 data = {"phases": [], "sampling": None, "complete": False}
             return JSONResponse(data)
 
+        @app.function(serialized=True, image=image)
+        @modal.fastapi_endpoint(method="POST", label=f"{model_label}-{_uid}-stop")
+        def serve_stop():
+            from fastapi.responses import JSONResponse
+            import modal as _modal
+            try:
+                d = _modal.Dict.from_name(_dict_name)
+                d["stop"] = True
+            except Exception:
+                pass
+            return JSONResponse({"stopped": True})
+
         dashboard_fn = serve_dashboard
         progress_fn = serve_progress
+        stop_fn = serve_stop
 
-    return app, Sampler, dashboard_fn, progress_fn
+    return app, Sampler, dashboard_fn, progress_fn, stop_fn
 
 
 class PersistentModalSamplingJob(SamplingJob):
@@ -342,11 +373,13 @@ class PersistentModalSamplingJob(SamplingJob):
         payload_path: str,
         sample_kwargs: dict,
         nuts_sampler: str,
+        stop_dict_name: str | None = None,
     ):
         self._sampler_cls = sampler_cls
         self._payload_path = payload_path
         self._sample_kwargs = sample_kwargs
         self._nuts_sampler = nuts_sampler
+        self._stop_dict_name = stop_dict_name
         self._idata_bytes: bytes | None = None
         self._events: list[ProgressEvent] = []
 
@@ -356,21 +389,25 @@ class PersistentModalSamplingJob(SamplingJob):
             self._payload_path,
             self._sample_kwargs,
             self._nuts_sampler,
+            stop_dict_name=self._stop_dict_name,
         )
 
         for chunk in gen:
+            # Try to decode as msgpack (may contain multiple objects)
             try:
-                decoded = msgpack.unpackb(chunk, raw=False)
+                unpacker = msgpack.Unpacker(raw=False)
+                unpacker.feed(chunk)
+                for decoded in unpacker:
+                    event = _decode_progress_event(decoded)
+                    if event is not None:
+                        self._events.append(event)
+                        yield event
+                    elif decoded.get("type") == "result":
+                        pass
             except Exception:
+                # Non-msgpack chunk = compressed InferenceData bytes
                 self._idata_bytes = chunk
                 continue
-
-            event = _decode_progress_event(decoded)
-            if event is not None:
-                self._events.append(event)
-                yield event
-            elif decoded.get("type") == "result":
-                pass
 
     def result(self):
         import arviz as az
@@ -419,17 +456,21 @@ class ModalEnvironment(RemoteEnvironment):
     """A provisioned Modal environment with payloads in a Volume."""
 
     def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
-                 dashboard_dict=None, dashboard_fn=None, progress_fn=None):
+                 dashboard_dict=None, dashboard_dict_name: str | None = None,
+                 dashboard_fn=None, progress_fn=None, stop_fn=None):
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
         self._project = project
         self._model_slug = model_slug
         self._dashboard_dict = dashboard_dict
+        self._dashboard_dict_name = dashboard_dict_name
         self._dashboard_fn = dashboard_fn
         self._progress_fn = progress_fn
+        self._stop_fn = stop_fn
         self._dashboard_url: str | None = None
         self._progress_url: str | None = None
+        self._stop_url: str | None = None
         self._exit_stack = contextlib.ExitStack()
         self._running = False
         self._uploaded_hashes: set[str] = set()
@@ -451,11 +492,16 @@ class ModalEnvironment(RemoteEnvironment):
             if self._progress_fn is not None:
                 try:
                     self._progress_url = self._progress_fn.get_web_url()
-                    # Store progress URL in Dict so dashboard endpoint can find it
-                    if self._dashboard_dict is not None and self._progress_url:
-                        self._dashboard_dict["progress_url"] = self._progress_url
                 except Exception:
                     pass
+
+            if self._stop_fn is not None:
+                try:
+                    self._stop_url = self._stop_fn.get_web_url()
+                except Exception:
+                    pass
+
+            # No need to store URLs in Dict -- dashboard constructs them from labels
 
     def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
         """Upload model payload to Volume if not already there. Returns True if uploaded."""
@@ -506,6 +552,7 @@ class ModalEnvironment(RemoteEnvironment):
             payload_path,
             sample_kwargs,
             nuts_sampler,
+            stop_dict_name=self._dashboard_dict_name,
         )
 
     def teardown(self) -> None:
@@ -555,7 +602,7 @@ class ModalBackend(ComputeBackend):
             dashboard_dict_name = f"cp-dash-{uuid.uuid4().hex[:8]}"
             dashboard_dict = modal.Dict.from_name(dashboard_dict_name, create_if_missing=True)
 
-        app, sampler_cls, dashboard_fn, progress_fn = _create_persistent_app(
+        app, sampler_cls, dashboard_fn, progress_fn, stop_fn = _create_persistent_app(
             version_manifest, config, volume,
             dashboard_dict_name=dashboard_dict_name,
             model_label=m_slug.replace("_", "-"),
@@ -563,8 +610,10 @@ class ModalBackend(ComputeBackend):
         return ModalEnvironment(
             app, sampler_cls, volume, project, m_slug,
             dashboard_dict=dashboard_dict,
+            dashboard_dict_name=dashboard_dict_name,
             dashboard_fn=dashboard_fn,
             progress_fn=progress_fn,
+            stop_fn=stop_fn,
         )
 
     @staticmethod

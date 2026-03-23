@@ -37,26 +37,17 @@ def _detect_project_name() -> str:
 
 class cloud:
     """Context manager that intercepts PyMC operations with remote execution,
-    caching, and notifications.
+    caching, live dashboard, and push notifications.
 
-    Remote containers stay warm for 20 minutes after the last run. Data is
-    uploaded to a volume once and reused automatically across runs.
+    Remote containers stay warm for 20 minutes after the last run.
 
     Usage::
 
-        with cp.cloud(model):
-            idata = pm.sample(draws=2000, chains=4)  # local with in-memory caching
-
-        with cp.cloud(model, remote=True):             # run on Modal VM
-        with cp.cloud(model, cache="disk"):            # persistent disk cache
-        with cp.cloud(model, cache=False):             # disable caching
-        with cp.cloud(model, remote=True, notify=True):  # live dashboard
-        with cp.cloud(model, notify=True):               # ntfy notifications (local)
-
-        # Container reuse within a session:
-        with cp.cloud(model, remote=True):
-            idata1 = pm.sample(draws=1000)   # provisions container, uploads data
-            idata2 = pm.sample(draws=2000)   # reuses warm container
+        with cp.cloud(model, remote=True):               # cloud + live dashboard
+        with cp.cloud(model, remote=True, notify=True):   # cloud + dashboard + ntfy
+        with cp.cloud(model, remote=True, dashboard=False): # cloud, no dashboard
+        with cp.cloud(model, cache="disk"):               # local + disk cache
+        with cp.cloud(model, notify=True):                # local + ntfy notifications
     """
 
     def __init__(
@@ -65,6 +56,7 @@ class cloud:
         *,
         remote: bool = False,
         cache: bool | str = True,
+        dashboard: bool = True,
         notify: bool | str | dict = False,
         instance: str | None = None,
         progress: bool = True,
@@ -73,11 +65,8 @@ class cloud:
         self.model = model
         self.remote = remote
         self.cache = cache
-        # notify=True defaults to dashboard for remote, ntfy for local
-        if notify is True and remote:
-            self.notify = "dashboard"
-        else:
-            self.notify = notify
+        self.dashboard = dashboard and remote  # dashboard only works with remote
+        self.notify = notify
         self.instance = instance
         self.progress = progress
         self.project = project or _detect_project_name()
@@ -125,11 +114,10 @@ class cloud:
         )
         manifest = get_version_manifest()
         backend = ModalBackend(config=config)
-        use_dashboard = self.notify == "dashboard"
         self._env = backend.provision(
             self._model_bytes, self.model, manifest, config,
             project=self.project, idle_timeout=600,
-            dashboard=use_dashboard,
+            dashboard=self.dashboard,
         )
 
     def destroy(self):
@@ -168,6 +156,7 @@ class cloud:
                     env=ctx._env,
                     data_bytes=ctx._data_bytes,
                     cache=ctx.cache,
+                    dashboard=ctx.dashboard,
                     notify=ctx.notify,
                     nuts_sampler=nuts_sampler,
                     progress=ctx.progress,
@@ -263,11 +252,14 @@ def _run_sample(
         )
 
     def emit(event):
+        from cloudposterior.progress import ConvergenceUpdate
         for sink in sinks:
             if isinstance(event, PhaseUpdate):
                 sink.show_phase(event)
             elif isinstance(event, SamplingProgress):
                 sink.show_sampling(event)
+            elif isinstance(event, ConvergenceUpdate) and hasattr(sink, "show_convergence"):
+                sink.show_convergence(event)
 
     # -- Run sampling --
     if remote:
@@ -298,9 +290,9 @@ def _run_sample(
     return idata
 
 
-def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None,
-                 dashboard_dict=None) -> list:
-    """Create display + notification sinks."""
+def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
+                 instance_desc: str, model=None, dashboard_dict=None) -> list:
+    """Create display, dashboard, and notification sinks."""
     sinks = []
 
     if progress:
@@ -313,12 +305,13 @@ def _build_sinks(*, progress: bool, notify, instance_desc: str, model=None,
             display.start()
         sinks.append(display)
 
-    if notify == "dashboard" and dashboard_dict is not None:
+    # Live dashboard (convergence, traces, stop button)
+    if dashboard and dashboard_dict is not None:
         from cloudposterior.dashboard import DashboardSink
+        sinks.append(DashboardSink(dashboard_dict))
 
-        sink = DashboardSink(dashboard_dict)
-        sinks.append(sink)
-    elif notify and notify != "dashboard":
+    # Push notifications (ntfy)
+    if notify:
         from cloudposterior.notify import NtfyNotifier
 
         if isinstance(notify, dict):
@@ -457,8 +450,9 @@ def _run_sample_persistent(
     env,
     data_bytes: bytes,
     cache: bool,
-    notify: bool | str | dict,
-    nuts_sampler: str,
+    dashboard: bool = False,
+    notify: bool | str | dict = False,
+    nuts_sampler: str = "pymc",
     progress: bool,
     instance: str | None,
     **sample_kwargs,
@@ -506,6 +500,7 @@ def _run_sample_persistent(
 
     sinks = _build_sinks(
         progress=progress,
+        dashboard=dashboard,
         notify=notify,
         instance_desc=instance_desc,
         model=model,
@@ -513,7 +508,7 @@ def _run_sample_persistent(
     )
 
     # Start the app early if dashboard is requested, so we can show the URL
-    if notify == "dashboard" and env._dashboard_fn is not None:
+    if dashboard and env._dashboard_fn is not None:
         env._ensure_running()
         dashboard_url = env._dashboard_url
         if dashboard_url:
@@ -523,11 +518,14 @@ def _run_sample_persistent(
             _show_link(dashboard_url, label="Dashboard", show_qr=True)
 
     def emit(event):
+        from cloudposterior.progress import ConvergenceUpdate
         for sink in sinks:
             if isinstance(event, PhaseUpdate):
                 sink.show_phase(event)
             elif isinstance(event, SamplingProgress):
                 sink.show_sampling(event)
+            elif isinstance(event, ConvergenceUpdate) and hasattr(sink, "show_convergence"):
+                sink.show_convergence(event)
 
     # Upload payload to Volume if needed
     payload_path = _compute_payload_path(env._model_slug, model_bytes, data_bytes)
