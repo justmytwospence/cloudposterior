@@ -241,16 +241,24 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
         """Compute R-hat and ESS on accumulated traces. Returns msgpack or None."""
         nonlocal _last_convergence_draw
         import numpy as _np
+        import sys
 
-        # Need at least 2 chains with 50+ draws each
-        if len(chain_traces) < 2:
+        # Need at least 2 chains with draws
+        n_chains = len(chain_traces)
+        if n_chains < 2:
+            print(f"[conv] skip: only {n_chains} chains", file=sys.stderr)
             return None
-        min_draws = min(len(v) for ct in chain_traces.values() for v in ct.values()) if chain_traces else 0
+
+        # Find minimum draws across all params in all chains
+        all_lens = [len(v) for ct in chain_traces.values() for v in ct.values()]
+        min_draws = min(all_lens) if all_lens else 0
         if min_draws < 20:
+            print(f"[conv] skip: min_draws={min_draws} < 20, chains={n_chains}, total_draws={_total_draws}", file=sys.stderr)
             return None
         # Only compute every 50 total draws
         if _total_draws - _last_convergence_draw < 50:
             return None
+        print(f"[conv] computing: chains={n_chains}, min_draws={min_draws}, total_draws={_total_draws}", file=sys.stderr)
         _last_convergence_draw = _total_draws
 
         try:
