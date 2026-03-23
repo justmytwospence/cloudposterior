@@ -85,11 +85,17 @@ class DashboardSink:
             pass  # best-effort
 
 
-def render_dashboard_html(progress_url: str, stop_url: str = "") -> str:
-    """Render dashboard HTML with endpoint URLs baked in."""
+def render_dashboard_html(progress_label: str = "", stop_label: str = "",
+                          dashboard_label: str = "") -> str:
+    """Render dashboard HTML with endpoint labels baked in.
+
+    The JS constructs full URLs from the labels by deriving the Modal
+    workspace URL pattern from window.location.
+    """
     return (DASHBOARD_HTML
-        .replace("__PROGRESS_URL__", progress_url)
-        .replace("__STOP_URL__", stop_url)
+        .replace("__PROGRESS_LABEL__", progress_label)
+        .replace("__STOP_LABEL__", stop_label)
+        .replace("__DASHBOARD_LABEL__", dashboard_label)
     )
 
 
@@ -153,20 +159,30 @@ let polling = true;
 let stopRequested = false;
 const stopBtn = document.getElementById('stopBtn');
 
+// Construct sibling endpoint URLs from our own URL
+// Dashboard: https://workspace--{dash-label}-env.modal.run
+// Progress: https://workspace--{prog-label}-env.modal.run
+const dashLabel = '__DASHBOARD_LABEL__';
+const progLabel = '__PROGRESS_LABEL__';
+const stopLabel = '__STOP_LABEL__';
+const origin = window.location.origin; // https://workspace--dash-label-env.modal.run
+const progressUrl = origin.replace(dashLabel, progLabel);
+const stopUrl = origin.replace(dashLabel, stopLabel);
+
 stopBtn.addEventListener('click', async () => {
   if (stopRequested) return;
   stopRequested = true;
   stopBtn.textContent = 'Stopping...';
   stopBtn.disabled = true;
   try {
-    await fetch('__STOP_URL__', {method: 'POST'});
+    await fetch(stopUrl, {method: 'POST'});
   } catch (e) {}
 });
 
 async function poll() {
   if (!polling) return;
   try {
-    const r = await fetch('__PROGRESS_URL__');
+    const r = await fetch(progressUrl);
     const data = await r.json();
     renderPhases(data.phases || []);
     renderSampling(data.sampling);

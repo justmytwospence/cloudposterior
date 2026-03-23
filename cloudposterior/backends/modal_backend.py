@@ -319,21 +319,27 @@ def _create_persistent_app(
 
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}")
+        # Dashboard constructs sibling URLs from its own URL pattern
+        _progress_label = f"{model_label}-{_uid}-progress"
+        _stop_label = f"{model_label}-{_uid}-stop"
+
         def serve_dashboard():
             from fastapi.responses import HTMLResponse
             from cloudposterior.dashboard import render_dashboard_html
-            import modal as _modal
-            import sys
-            try:
-                d = _modal.Dict.from_name(_dict_name)
-                progress_url = d.get("progress_url", "")
-                stop_url = d.get("stop_url", "")
-                print(f"[dashboard] progress_url={progress_url!r}, stop_url={stop_url!r}", file=sys.stderr)
-            except Exception as e:
-                print(f"[dashboard] Dict error: {e}", file=sys.stderr)
-                progress_url = ""
-                stop_url = ""
-            return HTMLResponse(render_dashboard_html(progress_url, stop_url))
+            from starlette.requests import Request
+            import re
+
+            # Derive sibling URLs from our own URL by replacing the label
+            # Dashboard URL: https://workspace--{dash_label}-env.modal.run
+            # Progress URL: https://workspace--{prog_label}-env.modal.run
+            dash_label = f"{model_label}-{_uid}"
+            # We can't get our own URL here, so use the labels directly
+            # The client-side JS will construct the URLs from window.location
+            return HTMLResponse(render_dashboard_html(
+                progress_label=_progress_label,
+                stop_label=_stop_label,
+                dashboard_label=dash_label,
+            ))
 
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}-progress")
@@ -500,15 +506,7 @@ class ModalEnvironment(RemoteEnvironment):
                 except Exception:
                     pass
 
-            # Store endpoint URLs in Dict so dashboard endpoint can find them
-            if self._dashboard_dict is not None:
-                urls = {}
-                if self._progress_url:
-                    urls["progress_url"] = self._progress_url
-                if self._stop_url:
-                    urls["stop_url"] = self._stop_url
-                if urls:
-                    self._dashboard_dict.update(urls)
+            # No need to store URLs in Dict -- dashboard constructs them from labels
 
     def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
         """Upload model payload to Volume if not already there. Returns True if uploaded."""
