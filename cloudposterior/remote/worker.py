@@ -246,10 +246,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
         if len(chain_traces) < 2:
             return None
         min_draws = min(len(v) for ct in chain_traces.values() for v in ct.values()) if chain_traces else 0
-        if min_draws < 50:
+        if min_draws < 20:
             return None
-        # Only compute every 100 draws
-        if _total_draws - _last_convergence_draw < 100:
+        # Only compute every 50 total draws
+        if _total_draws - _last_convergence_draw < 50:
             return None
         _last_convergence_draw = _total_draws
 
