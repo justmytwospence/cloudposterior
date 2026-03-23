@@ -58,12 +58,14 @@ class DashboardSink:
         self._write()
 
     def show_convergence(self, update):
+        import sys
         self._convergence = {
             name: {"rhat": p.rhat, "ess_bulk": p.ess_bulk, "ess_tail": p.ess_tail}
             for name, p in update.params.items()
         }
         self._convergence_draws = update.draws
         self._traces = update.traces if update.traces else {}
+        print(f"[DashboardSink] convergence: {len(self._convergence)} params, {self._convergence_draws} draws, {len(self._traces)} traces")
         self._write()
 
     def _write(self):
