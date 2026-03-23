@@ -312,6 +312,7 @@ def _create_persistent_app(
     # Add dashboard web endpoints if requested
     dashboard_fn = None
     progress_fn = None
+    stop_fn = None
     if dashboard_dict_name is not None:
         _dict_name = dashboard_dict_name
         _uid = dashboard_dict_name.replace("cp-dash-", "")[:6]
@@ -357,8 +358,9 @@ def _create_persistent_app(
 
         dashboard_fn = serve_dashboard
         progress_fn = serve_progress
+        stop_fn = serve_stop
 
-    return app, Sampler, dashboard_fn, progress_fn
+    return app, Sampler, dashboard_fn, progress_fn, stop_fn
 
 
 class PersistentModalSamplingJob(SamplingJob):
@@ -451,7 +453,7 @@ class ModalEnvironment(RemoteEnvironment):
 
     def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
                  dashboard_dict=None, dashboard_dict_name: str | None = None,
-                 dashboard_fn=None, progress_fn=None):
+                 dashboard_fn=None, progress_fn=None, stop_fn=None):
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
@@ -461,8 +463,10 @@ class ModalEnvironment(RemoteEnvironment):
         self._dashboard_dict_name = dashboard_dict_name
         self._dashboard_fn = dashboard_fn
         self._progress_fn = progress_fn
+        self._stop_fn = stop_fn
         self._dashboard_url: str | None = None
         self._progress_url: str | None = None
+        self._stop_url: str | None = None
         self._exit_stack = contextlib.ExitStack()
         self._running = False
         self._uploaded_hashes: set[str] = set()
@@ -487,20 +491,19 @@ class ModalEnvironment(RemoteEnvironment):
                 except Exception:
                     pass
 
+            if self._stop_fn is not None:
+                try:
+                    self._stop_url = self._stop_fn.get_web_url()
+                except Exception:
+                    pass
+
             # Store endpoint URLs in Dict so dashboard endpoint can find them
             if self._dashboard_dict is not None:
                 urls = {}
                 if self._progress_url:
                     urls["progress_url"] = self._progress_url
-                # Find stop URL from registered endpoints
-                for fn in self._app.registered_web_endpoints:
-                    try:
-                        url = fn.get_web_url()
-                        if url and "stop" in url:
-                            urls["stop_url"] = url
-                            break
-                    except Exception:
-                        pass
+                if self._stop_url:
+                    urls["stop_url"] = self._stop_url
                 if urls:
                     self._dashboard_dict.update(urls)
 
@@ -603,7 +606,7 @@ class ModalBackend(ComputeBackend):
             dashboard_dict_name = f"cp-dash-{uuid.uuid4().hex[:8]}"
             dashboard_dict = modal.Dict.from_name(dashboard_dict_name, create_if_missing=True)
 
-        app, sampler_cls, dashboard_fn, progress_fn = _create_persistent_app(
+        app, sampler_cls, dashboard_fn, progress_fn, stop_fn = _create_persistent_app(
             version_manifest, config, volume,
             dashboard_dict_name=dashboard_dict_name,
             model_label=m_slug.replace("_", "-"),
@@ -614,6 +617,7 @@ class ModalBackend(ComputeBackend):
             dashboard_dict_name=dashboard_dict_name,
             dashboard_fn=dashboard_fn,
             progress_fn=progress_fn,
+            stop_fn=stop_fn,
         )
 
     @staticmethod
