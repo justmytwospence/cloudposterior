@@ -158,17 +158,18 @@ class ModalSamplingJob(SamplingJob):
 
                 for chunk in gen:
                     try:
-                        decoded = msgpack.unpackb(chunk, raw=False)
+                        unpacker = msgpack.Unpacker(raw=False)
+                        unpacker.feed(chunk)
+                        for decoded in unpacker:
+                            event = _decode_progress_event(decoded)
+                            if event is not None:
+                                self._events.append(event)
+                                yield event
+                            elif decoded.get("type") == "result":
+                                pass
                     except Exception:
                         self._idata_bytes = chunk
                         continue
-
-                    event = _decode_progress_event(decoded)
-                    if event is not None:
-                        self._events.append(event)
-                        yield event
-                    elif decoded.get("type") == "result":
-                        pass
 
     def result(self):
         """Return the InferenceData. Must call stream_progress first."""
@@ -391,18 +392,21 @@ class PersistentModalSamplingJob(SamplingJob):
         )
 
         for chunk in gen:
+            # Try to decode as msgpack (may contain multiple objects)
             try:
-                decoded = msgpack.unpackb(chunk, raw=False)
+                unpacker = msgpack.Unpacker(raw=False)
+                unpacker.feed(chunk)
+                for decoded in unpacker:
+                    event = _decode_progress_event(decoded)
+                    if event is not None:
+                        self._events.append(event)
+                        yield event
+                    elif decoded.get("type") == "result":
+                        pass
             except Exception:
+                # Non-msgpack chunk = compressed InferenceData bytes
                 self._idata_bytes = chunk
                 continue
-
-            event = _decode_progress_event(decoded)
-            if event is not None:
-                self._events.append(event)
-                yield event
-            elif decoded.get("type") == "result":
-                pass
 
     def result(self):
         import arviz as az

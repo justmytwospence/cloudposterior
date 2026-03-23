@@ -58,14 +58,12 @@ class DashboardSink:
         self._write()
 
     def show_convergence(self, update):
-        import sys
         self._convergence = {
             name: {"rhat": p.rhat, "ess_bulk": p.ess_bulk, "ess_tail": p.ess_tail}
             for name, p in update.params.items()
         }
         self._convergence_draws = update.draws
         self._traces = update.traces if update.traces else {}
-        print(f"[DashboardSink] convergence: {len(self._convergence)} params, {self._convergence_draws} draws, {len(self._traces)} traces")
         self._write()
 
     def _write(self):
@@ -246,56 +244,128 @@ function renderSampling(s) {
   document.getElementById('sampling').innerHTML = html;
 }
 const traceCharts = {};
+const kdeCharts = {};
 const chainColors = ['#1764f4', '#d9534f', '#5cb85c', '#f0ad4e', '#9b59b6', '#1abc9c', '#e67e22', '#3498db'];
+
+// Gaussian KDE in JS
+function kde(values, nPoints) {
+  nPoints = nPoints || 100;
+  if (values.length < 2) return {x: [0], y: [0]};
+  const n = values.length;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const q1 = sorted[Math.floor(n * 0.25)];
+  const q3 = sorted[Math.floor(n * 0.75)];
+  const iqr = q3 - q1;
+  const std = Math.sqrt(values.reduce((s, v) => { const d = v - values.reduce((a, b) => a + b, 0) / n; return s + d * d; }, 0) / n);
+  const bw = 0.9 * Math.min(std, iqr / 1.34) * Math.pow(n, -0.2); // Silverman's rule
+  if (bw === 0 || isNaN(bw)) return {x: [0], y: [0]};
+  const pad = 3 * bw;
+  const lo = sorted[0] - pad;
+  const hi = sorted[n - 1] + pad;
+  const step = (hi - lo) / (nPoints - 1);
+  const x = Array.from({length: nPoints}, (_, i) => lo + i * step);
+  const y = x.map(xi => {
+    let sum = 0;
+    for (let j = 0; j < n; j++) {
+      const z = (xi - values[j]) / bw;
+      sum += Math.exp(-0.5 * z * z);
+    }
+    return sum / (n * bw * Math.sqrt(2 * Math.PI));
+  });
+  return {x, y};
+}
 
 function renderTraces(traces) {
   const container = document.getElementById('traces');
   const paramNames = Object.keys(traces).sort();
+  const cw = container.clientWidth || 700;
+  const halfW = Math.floor((cw - 16) / 2);  // gap between panels
 
   for (const param of paramNames) {
     const chainData = traces[param];
     if (!chainData || chainData.length === 0) continue;
+    const nChains = chainData.length;
 
+    // -- Build trace data (right panel) --
     const maxLen = Math.max(...chainData.map(c => c.length));
-    const xValues = Array.from({length: maxLen}, (_, i) => i);
-    const data = [xValues];
-    const series = [{label: 'Draw'}];
-
-    for (let c = 0; c < chainData.length; c++) {
-      data.push(chainData[c]);
-      series.push({
-        label: 'Chain ' + c,
-        stroke: chainColors[c % chainColors.length],
-        width: 1,
-      });
+    const traceX = Array.from({length: maxLen}, (_, i) => i);
+    const traceData = [traceX];
+    const traceSeries = [{label: 'Draw'}];
+    for (let c = 0; c < nChains; c++) {
+      traceData.push(chainData[c]);
+      traceSeries.push({label: 'Chain ' + c, stroke: chainColors[c % chainColors.length], width: 1});
     }
 
-    const divId = 'trace-' + param;
+    // -- Build KDE data (left panel) --
+    const kdeResults = chainData.map(vals => kde(vals, 80));
+    // Shared x-axis: union of all KDE x ranges
+    const allX = kdeResults.flatMap(k => k.x);
+    const kdeXmin = Math.min(...allX);
+    const kdeXmax = Math.max(...allX);
+    const nPts = 80;
+    const kdeStep = (kdeXmax - kdeXmin) / (nPts - 1);
+    const kdeX = Array.from({length: nPts}, (_, i) => kdeXmin + i * kdeStep);
+    const kdeData = [kdeX];
+    const kdeSeries = [{label: 'Value'}];
+    for (let c = 0; c < nChains; c++) {
+      // Interpolate each chain's KDE onto the shared x-axis
+      const k = kdeResults[c];
+      const interp = kdeX.map(xi => {
+        if (xi <= k.x[0]) return k.y[0];
+        if (xi >= k.x[k.x.length - 1]) return k.y[k.y.length - 1];
+        let idx = 0;
+        while (idx < k.x.length - 1 && k.x[idx + 1] < xi) idx++;
+        const t = (xi - k.x[idx]) / (k.x[idx + 1] - k.x[idx]);
+        return k.y[idx] + t * (k.y[idx + 1] - k.y[idx]);
+      });
+      kdeData.push(interp);
+      kdeSeries.push({label: 'Chain ' + c, stroke: chainColors[c % chainColors.length], width: 2, fill: chainColors[c % chainColors.length] + '20'});
+    }
+
+    const traceId = 'trace-' + param;
+    const kdeId = 'kde-' + param;
+
+    // Recreate charts if number of chains changed
+    if (traceCharts[param] && traceCharts[param].series.length !== nChains + 1) {
+      traceCharts[param].destroy();
+      delete traceCharts[param];
+      kdeCharts[param].destroy();
+      delete kdeCharts[param];
+      const old = document.getElementById(traceId);
+      if (old) old.parentElement.parentElement.remove();
+    }
+
     if (!traceCharts[param]) {
-      // Create new chart
-      let div = document.getElementById(divId);
-      if (!div) {
-        const wrapper = document.createElement('div');
-        wrapper.style.marginTop = '12px';
-        wrapper.innerHTML = '<div style="color:#888;font-size:12px;margin-bottom:4px;">' + param + '</div>';
-        div = document.createElement('div');
-        div.id = divId;
-        wrapper.appendChild(div);
-        container.appendChild(wrapper);
-      }
-      const width = Math.min(container.clientWidth || 400, 600);
-      const opts = {
-        width: width,
-        height: 120,
-        series: series,
-        axes: [{show: false}, {}],
-        legend: {show: false},
-        cursor: {show: false},
-      };
-      traceCharts[param] = new uPlot(opts, data, div);
+      // Create wrapper with label and two chart divs side by side
+      const wrapper = document.createElement('div');
+      wrapper.style.marginTop = '16px';
+      wrapper.innerHTML = '<div style="color:#aaa;font-size:12px;margin-bottom:4px;font-weight:bold;">' + param + '</div>';
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.gap = '8px';
+      const kdeDiv = document.createElement('div');
+      kdeDiv.id = kdeId;
+      const traceDiv = document.createElement('div');
+      traceDiv.id = traceId;
+      row.appendChild(kdeDiv);
+      row.appendChild(traceDiv);
+      wrapper.appendChild(row);
+      container.appendChild(wrapper);
+
+      const chartH = 140;
+      kdeCharts[param] = new uPlot({
+        width: halfW, height: chartH, series: kdeSeries,
+        axes: [{size: 30, stroke: '#555', ticks: {stroke: '#333'}}, {size: 40, stroke: '#555', ticks: {stroke: '#333'}}],
+        legend: {show: false}, cursor: {show: false},
+      }, kdeData, kdeDiv);
+      traceCharts[param] = new uPlot({
+        width: halfW, height: chartH, series: traceSeries,
+        axes: [{size: 30, stroke: '#555', ticks: {stroke: '#333'}}, {size: 40, stroke: '#555', ticks: {stroke: '#333'}}],
+        legend: {show: false}, cursor: {show: false},
+      }, traceData, traceDiv);
     } else {
-      // Update existing chart
-      traceCharts[param].setData(data);
+      kdeCharts[param].setData(kdeData);
+      traceCharts[param].setData(traceData);
     }
   }
 }

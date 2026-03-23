@@ -164,8 +164,8 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
         eta = remaining / dps if dps > 0 else 0.0
         mean_td = sum(chain_tree_depths[chain][-100:]) / min(len(chain_tree_depths[chain]), 100)
 
-        # Accumulate parameter values for convergence (only during sampling, not tuning)
-        if not is_tuning and hasattr(draw, 'point') and draw.point:
+        # Accumulate parameter values for convergence and trace plots
+        if hasattr(draw, 'point') and draw.point:
             if chain not in chain_traces:
                 chain_traces[chain] = {}
             for param_name, value in draw.point.items():
@@ -241,24 +241,19 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
         """Compute R-hat and ESS on accumulated traces. Returns msgpack or None."""
         nonlocal _last_convergence_draw
         import numpy as _np
-        import sys
 
         # Need at least 2 chains with draws
-        n_chains = len(chain_traces)
-        if n_chains < 2:
-            print(f"[conv] skip: only {n_chains} chains", file=sys.stderr)
+        if len(chain_traces) < 2:
             return None
 
         # Find minimum draws across all params in all chains
         all_lens = [len(v) for ct in chain_traces.values() for v in ct.values()]
         min_draws = min(all_lens) if all_lens else 0
         if min_draws < 20:
-            print(f"[conv] skip: min_draws={min_draws} < 20, chains={n_chains}, total_draws={_total_draws}", file=sys.stderr)
             return None
         # Only compute every 50 total draws
         if _total_draws - _last_convergence_draw < 50:
             return None
-        print(f"[conv] computing: chains={n_chains}, min_draws={min_draws}, total_draws={_total_draws}", file=sys.stderr)
         _last_convergence_draw = _total_draws
 
         try:
@@ -282,9 +277,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
                 if min_len < 50:
                     continue
                 arr = _np.array([cv[:min_len] for cv in chain_values])  # (chains, draws)
-                rhat = float(az.rhat({"x": arr[_np.newaxis, ...]}).x.values)
-                ess_bulk = float(az.ess({"x": arr[_np.newaxis, ...]}).x.values)
-                ess_tail = float(az.ess({"x": arr[_np.newaxis, ...]}, method="tail").x.values)
+                rhat = float(az.rhat(arr))
+                ess_bulk = float(az.ess(arr))
+                ess_tail = float(az.ess(arr, method="tail"))
                 convergence[param] = {
                     "rhat": round(rhat, 4),
                     "ess_bulk": round(ess_bulk),
@@ -292,7 +287,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
                 }
 
             if convergence:
-                # Also include subsampled trace values for live traceplots
+                # Subsampled trace values for live traceplots
                 traces = {}
                 max_trace_points = 500
                 for param in sorted(param_names):
@@ -300,7 +295,6 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
                     for chain_id in sorted(chain_traces.keys()):
                         if param in chain_traces[chain_id]:
                             vals = chain_traces[chain_id][param]
-                            # Subsample to max_trace_points
                             if len(vals) > max_trace_points:
                                 step = len(vals) // max_trace_points
                                 vals = vals[::step][:max_trace_points]
