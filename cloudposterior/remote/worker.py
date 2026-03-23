@@ -234,6 +234,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
                 "chains": dict(all_chain_states),
                 "total_divergences": total_div,
                 "elapsed": round(time.time() - sample_start, 1),
+                "total_draws": _total_draws,
             })
         return None
 
@@ -306,6 +307,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
                     "type": "convergence",
                     "params": convergence,
                     "draws": min_draws,
+                    "total_draws": _total_draws,
                     "traces": traces,
                 })
         except Exception:

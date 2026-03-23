@@ -50,6 +50,7 @@ class SamplingProgress:
     chains: dict[int, ChainProgress]
     total_divergences: int = 0
     elapsed: float = 0.0
+    total_draws: int = 0
     warnings: list[str] = field(default_factory=list)
 
 

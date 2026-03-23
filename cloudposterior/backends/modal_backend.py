@@ -236,6 +236,7 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
             chains=chains,
             total_divergences=data.get("total_divergences", 0),
             elapsed=data.get("elapsed", 0.0),
+            total_draws=data.get("total_draws", 0),
         )
 
     if msg_type == "convergence":
