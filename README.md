@@ -87,6 +87,8 @@ with cp.cloud(model, remote=True, instance="xlarge"):  # 32 cores, 64GB
     ...
 ```
 
+The container is sized on the **first** `pm.sample()` call inside `with cp.cloud(...)` and stays that size for the duration of the block. If a later call uses different `chains`/`draws` that the auto-sizer would have provisioned differently, you'll get a warning -- start a new `cp.cloud()` block to resize.
+
 ### Automatic caching
 
 Re-running a notebook cell? If the model, data, and sampling config haven't changed, cloudposterior returns the cached result instantly. No wasted compute. Caching is **on by default**.
@@ -134,10 +136,12 @@ Scan the QR code or open the URL on your phone. No app install needed.
 **Push notifications** -- get notified when sampling starts and completes via [ntfy](https://ntfy.sh):
 
 ```python
-with cp.cloud(model, notify=True):                                           # auto topic
-with cp.cloud(model, notify="my-channel"):                                   # custom topic
-with cp.cloud(model, remote=True, notify=True):                              # both dashboard + ntfy
+with cp.cloud(model, notify=True):              # auto topic
+with cp.cloud(model, notify="my-channel"):      # custom topic
+with cp.cloud(model, remote=True, notify=True): # remote (dashboard on by default) + ntfy
 ```
+
+With `remote=True`, the dashboard is on by default; `notify=True` adds ntfy push notifications on top.
 
 ### Live progress display
 
@@ -209,9 +213,9 @@ The backend is abstracted behind a `ComputeBackend` interface. Support for addit
 
 ## How it works
 
-1. **Serialize** -- Model and observed data are serialized with cloudpickle + lz4. A version manifest captures your exact package versions.
-2. **Upload once** -- The serialized payload is uploaded to a Modal Volume the first time. Subsequent calls with the same model + data skip the upload entirely.
-3. **Sample** -- `pm.sample()` runs remotely. The container loads the payload from the mounted Volume (fast local read) and streams per-chain progress back in real time via msgpack. Only sample kwargs are sent over the wire per call.
+1. **Serialize** -- The model is serialized with cloudpickle + lz4 on the first `pm.sample()` call inside `with cp.cloud(...)`. Cloudpickle bundles your observed data into the model object, so there's a single payload, not two. A version manifest captures your exact package versions.
+2. **Upload once** -- The serialized payload is uploaded to a Modal Volume the first time. Subsequent calls with the same model skip the upload entirely. Old payloads from past edits are pruned automatically.
+3. **Sample** -- `pm.sample()` runs remotely. The container loads the payload from the mounted Volume (fast local read) and streams per-chain progress back in real time via msgpack. Only sample kwargs and a path string are sent over the wire per call.
 4. **Return** -- The InferenceData trace is compressed as NetCDF, sent back, and cached.
 
 Containers stay warm for 20 minutes after the last run, so iterating on sampling settings is near-instant.
@@ -223,19 +227,30 @@ Containers stay warm for 20 minutes after the last run, so iterating on sampling
 Model payloads are stored in a project-scoped Modal Volume. Delete when you're done:
 
 ```python
-cp.cleanup_volumes()                        # delete default project volume
-cp.cleanup_volumes(project="my-research")   # delete specific project
+cp.cleanup_volumes()                        # delete the current project's volume
+cp.cleanup_volumes(project="my-research")   # delete a specific project's volume
+```
+
+For a one-shot teardown that also stops a warm container immediately, use the context manager's `destroy()`:
+
+```python
+session = cp.cloud(model, remote=True)
+with session:
+    idata = pm.sample(draws=2000)
+session.destroy()  # stop the container and delete the project volume
 ```
 
 ---
 
 ## Explicit API
 
-If you prefer not to use the context manager:
+If you prefer not to use the context manager, `cp.sample()` runs a single remote sampling job (always cloud, no persistent container reuse):
 
 ```python
-idata = cp.sample(model, draws=2000, chains=4, remote=True)
+idata = cp.sample(model, draws=2000, chains=4)
 ```
+
+For repeated sampling with the same model, the `cp.cloud()` context manager is cheaper -- it keeps the container warm and only sends kwargs after the first call.
 
 ---
 
