@@ -264,9 +264,27 @@ Clone and run locally for the full interactive progress display.
 
 ---
 
+## Tests
+
+The default suite is fast and free -- it covers serialization, caching, naming, kwarg validation, and runs `cp.cloud(model)` end-to-end against a local PyMC sampler:
+
+```bash
+uv run pytest tests/ -v
+```
+
+A separate suite of end-to-end tests hits real Modal infrastructure to verify the cloud path. These cost a small amount of Modal credit per run and are skipped by default. Opt in with `--run-modal`:
+
+```bash
+uv run pytest tests/test_modal_e2e.py -v --run-modal
+```
+
+Modal tests provision the smallest possible instance, sample 20 draws on a 2-RV model, and use isolated per-test project volumes that are cleaned up at teardown.
+
+---
+
 ## Status
 
-Early proof of concept. Works end-to-end with 43 passing tests, but expect rough edges. Contributions and feedback welcome.
+Early proof of concept. Works end-to-end with 75+ passing tests, but expect rough edges. Contributions and feedback welcome.
 
 ## License
 

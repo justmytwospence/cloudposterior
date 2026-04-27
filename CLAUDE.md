@@ -10,12 +10,15 @@ cloudposterior lets you run PyMC MCMC sampling on cloud VMs (currently Modal) wi
 
 ```bash
 uv sync                          # install all deps (including dev group)
-uv run pytest tests/ -v          # run all tests
+uv run pytest tests/ -v          # run free local tests (default)
+uv run pytest tests/ -v --run-modal   # also run paid Modal e2e tests
 uv run pytest tests/test_cache.py -v          # run one test file
 uv run pytest tests/test_cache.py::test_name -v  # run single test
 ```
 
-CI runs pytest on Python 3.11 and 3.12.
+Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`) hit real Modal infrastructure and incur cloud costs. They are skipped unless `--run-modal` is passed. See `tests/conftest.py` for the marker plumbing.
+
+CI runs pytest on Python 3.11 and 3.12 (free tests only -- Modal tests are not in CI).
 
 ## Architecture
 
