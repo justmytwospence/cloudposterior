@@ -12,3 +12,6 @@ venv/
 *.nc
 .modal/
 .cloudposterior/
+
+# Local worktrees
+worktrees/
