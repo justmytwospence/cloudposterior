@@ -24,8 +24,12 @@ pytestmark = pytest.mark.modal
 
 
 def _tiny_model():
-    """Two free RVs, five observations -- the cheapest interesting model."""
-    with pm.Model(name="tiny_e2e") as model:
+    """Two free RVs, five observations -- the cheapest interesting model.
+
+    No name= on pm.Model so RVs aren't namespaced (idata.posterior.mu just
+    works rather than idata.posterior["tiny_e2e::mu"]).
+    """
+    with pm.Model() as model:
         mu = pm.Normal("mu", 0, 1)
         sigma = pm.HalfNormal("sigma", 1)
         pm.Normal("obs", mu, sigma, observed=np.array([1.0, 2.0, 3.0, 4.0, 5.0]))
@@ -54,6 +58,7 @@ def test_cloud_remote_end_to_end(isolated_project):
         cache=False,
         instance="small",
         progress=False,
+        dashboard=False,
         project=isolated_project,
     ):
         idata = pm.sample(draws=20, tune=20, chains=2, progressbar=False)
@@ -76,6 +81,7 @@ def test_remote_cache_hit_skips_modal_call(isolated_project):
         cache=True,
         instance="small",
         progress=False,
+        dashboard=False,
         project=isolated_project,
     ):
         idata1 = pm.sample(draws=20, tune=20, chains=2, random_seed=0, progressbar=False)
@@ -102,6 +108,7 @@ def test_persistent_container_reuses_warm_vm(isolated_project):
         cache=False,
         instance="small",
         progress=False,
+        dashboard=False,
         project=isolated_project,
     ):
         t0 = time.time()
