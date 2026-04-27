@@ -3,6 +3,7 @@
 import shutil
 import numpy as np
 import pymc as pm
+import pytest
 
 from cloudposterior.cache import (
     MemoryCache,
@@ -117,3 +118,16 @@ def test_resolve_cache_custom_path(tmp_path):
     """cache=Path returns a DiskCache at that path."""
     backend = resolve_cache(tmp_path)
     assert isinstance(backend, DiskCache)
+
+
+def test_resolve_cache_custom_backend():
+    """A duck-typed backend with load/save methods passes through unchanged."""
+    backend = MemoryCache()
+    assert resolve_cache(backend) is backend
+
+
+@pytest.mark.parametrize("bad", [42, 3.14, object(), [], ()])
+def test_resolve_cache_rejects_unknown_types(bad):
+    """Unknown types raise TypeError instead of silently returning the default."""
+    with pytest.raises(TypeError, match="cache must be"):
+        resolve_cache(bad)

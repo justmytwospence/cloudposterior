@@ -116,7 +116,12 @@ def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
 
     Args:
         cache_arg: True (memory), False (disabled), "disk" (project-local),
-                   Path/str (custom disk path), or a CacheBackend instance
+                   Path/str (custom disk path), or a CacheBackend instance.
+
+    Raises:
+        TypeError: if ``cache_arg`` is none of the above. Catches typos like
+            ``cache=42`` or ``cache="memory"`` rather than silently falling
+            back to the default cache.
     """
     if cache_arg is False:
         return None
@@ -128,4 +133,7 @@ def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
         return DiskCache(base_dir=cache_arg, model=model)
     if hasattr(cache_arg, "load") and hasattr(cache_arg, "save"):
         return cache_arg
-    return get_default_cache()
+    raise TypeError(
+        f"cache must be bool | 'disk' | str | Path | CacheBackend; "
+        f"got {type(cache_arg).__name__}={cache_arg!r}"
+    )
