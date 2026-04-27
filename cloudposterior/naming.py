@@ -3,7 +3,7 @@
 Used by cache (directory names + keys), notify (topic names), and volumes.
 
 Two layers:
-- Human-readable: model_slug, data_slug (for directory browsability)
+- Human-readable: model_slug (for directory browsability)
 - Machine-correct: payload_hash, cache_key (for identity checks)
 """
 
@@ -43,13 +43,6 @@ def slugify(name: str, separator: str = "_") -> str:
 def model_slug(model) -> str:
     """Filesystem-safe slug from a PyMC model name, e.g. 'radon'."""
     return slugify(get_model_name(model))
-
-
-def data_slug(data_bytes: bytes) -> str:
-    """Deterministic human-readable slug for observed data, e.g. 'data-gentle-fox'."""
-    from cloudposterior.wordhash import wordhash
-
-    return f"data-{wordhash(data_bytes)}"
 
 
 def payload_hash(model_bytes: bytes) -> str:

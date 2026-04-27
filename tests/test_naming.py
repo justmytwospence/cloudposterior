@@ -5,7 +5,6 @@ import pymc as pm
 
 from cloudposterior.naming import (
     cache_key,
-    data_slug,
     get_model_name,
     model_slug,
     payload_hash,
@@ -48,20 +47,6 @@ def test_model_slug_unnamed():
     model = _make_model()
     slug = model_slug(model)
     assert "mu" in slug
-
-
-def test_data_slug_deterministic():
-    data = b"some observed data bytes"
-    slug1 = data_slug(data)
-    slug2 = data_slug(data)
-    assert slug1 == slug2
-    assert slug1.startswith("data-")
-
-
-def test_data_slug_changes_with_data():
-    slug1 = data_slug(b"data version 1")
-    slug2 = data_slug(b"data version 2")
-    assert slug1 != slug2
 
 
 def test_payload_hash_deterministic():

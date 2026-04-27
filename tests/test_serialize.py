@@ -6,11 +6,9 @@ import pymc as pm
 from cloudposterior.serialize import (
     create_payload,
     deserialize_model,
-    deserialize_observed_data,
     get_version_manifest,
     payload_size_mb,
     serialize_model,
-    serialize_observed_data,
 )
 
 
@@ -40,26 +38,30 @@ def test_model_serialize_roundtrip():
     assert len(serialized) > 0
 
     deserialized = deserialize_model(serialized)
-    # Check that the model has the same free RVs
     orig_names = sorted(rv.name for rv in model.free_RVs)
     deser_names = sorted(rv.name for rv in deserialized.free_RVs)
     assert orig_names == deser_names
 
 
-def test_observed_data_serialize_roundtrip():
+def test_observed_data_survives_roundtrip():
+    """Observed data is bundled inside the cloudpickled model -- verify it
+    survives the serialize/deserialize round-trip without a separate payload."""
     model = _make_eight_schools()
-    serialized = serialize_observed_data(model)
-    assert isinstance(serialized, bytes)
+    deserialized = deserialize_model(serialize_model(model))
 
-    data = deserialize_observed_data(serialized)
-    assert isinstance(data, dict)
+    orig_obs = {rv.name: rv for rv in model.observed_RVs}
+    deser_obs = {rv.name: rv for rv in deserialized.observed_RVs}
+    assert set(orig_obs) == set(deser_obs)
+    for name in orig_obs:
+        orig_data = np.asarray(orig_obs[name].tag.observations.data)
+        deser_data = np.asarray(deser_obs[name].tag.observations.data)
+        np.testing.assert_array_equal(orig_data, deser_data)
 
 
 def test_create_payload():
     model = _make_eight_schools()
     payload = create_payload(model, {"draws": 100, "tune": 50})
     assert payload.model_bytes
-    assert payload.data_bytes
     assert "pymc" in payload.version_manifest
     assert payload.sample_kwargs == {"draws": 100, "tune": 50}
 

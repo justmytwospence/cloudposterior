@@ -9,7 +9,6 @@ The image is constructed dynamically based on the version manifest.
 
 from __future__ import annotations
 
-import io
 import time
 from queue import Queue
 from threading import Thread
@@ -389,24 +388,22 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
 
 def run_sampling(
     model_bytes: bytes,
-    data_bytes: bytes,
     sample_kwargs: dict,
     nuts_sampler: str = "pymc",
     persistent: bool = False,
 ):
-    """One-shot path: deserialize model from bytes and run sampling."""
+    """One-shot path: deserialize model from bytes and run sampling.
+
+    Observed data is bundled inside the cloudpickled model, so no separate
+    data payload is needed.
+    """
     import lz4.frame
     import msgpack
-    import numpy as np
 
     phase_start = time.time()
     model_raw = lz4.frame.decompress(model_bytes)
     import pickle
     model = pickle.loads(model_raw)
-
-    data_raw = lz4.frame.decompress(data_bytes)
-    buf = io.BytesIO(data_raw)
-    observed = dict(np.load(buf))
 
     elapsed = time.time() - phase_start
     phase_name = "container_ready" if persistent else "provisioning"

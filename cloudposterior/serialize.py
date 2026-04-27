@@ -1,23 +1,24 @@
-"""Serialization of PyMC models and data for remote execution."""
+"""Serialization of PyMC models for remote execution.
+
+Cloudpickle captures observed data inside the model object, so we ship a
+single compressed model blob — no separate data payload needed.
+"""
 
 from __future__ import annotations
 
 import importlib
-import io
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cloudpickle
 import lz4.frame
-import numpy as np
 
 
 @dataclass
 class SamplingPayload:
     """Everything needed to run sampling on a remote machine."""
 
-    model_bytes: bytes  # cloudpickle'd pm.Model, lz4 compressed
-    data_bytes: bytes  # numpy .npz, lz4 compressed
+    model_bytes: bytes  # cloudpickle'd pm.Model (includes observed data), lz4 compressed
     version_manifest: dict[str, str]
     sample_kwargs: dict
 
@@ -65,39 +66,6 @@ def deserialize_model(data: bytes):
     return pickle.loads(raw)
 
 
-def serialize_observed_data(model) -> bytes:
-    """Extract and serialize observed data from a PyMC model.
-
-    Observed data is pulled out and serialized separately as compressed
-    numpy arrays for better compression than pickling inline.
-    """
-    observed = {}
-    for rv in model.observed_RVs:
-        obs_data = rv.tag.test_value if hasattr(rv.tag, "test_value") else None
-        if obs_data is None:
-            # Try getting from the observed variable's owner
-            for v in model.rvs_to_values.values():
-                if hasattr(v, "data") and hasattr(v, "name") and v.name == rv.name + "_observed":
-                    obs_data = v.data
-                    break
-        if obs_data is not None:
-            if hasattr(obs_data, "eval"):
-                obs_data = obs_data.eval()
-            observed[rv.name] = np.asarray(obs_data)
-
-    buf = io.BytesIO()
-    np.savez(buf, **observed)  # uncompressed -- lz4 handles compression in one pass
-    return lz4.frame.compress(buf.getvalue())
-
-
-def deserialize_observed_data(data: bytes) -> dict[str, np.ndarray]:
-    """Deserialize observed data from compressed numpy bytes."""
-    raw = lz4.frame.decompress(data)
-    buf = io.BytesIO(raw)
-    npz = np.load(buf)
-    return dict(npz)
-
-
 def create_payload(
     model,
     sample_kwargs: dict,
@@ -105,7 +73,6 @@ def create_payload(
     """Create a complete serialized payload for remote sampling."""
     return SamplingPayload(
         model_bytes=serialize_model(model),
-        data_bytes=serialize_observed_data(model),
         version_manifest=get_version_manifest(),
         sample_kwargs=sample_kwargs,
     )
@@ -113,4 +80,4 @@ def create_payload(
 
 def payload_size_mb(payload: SamplingPayload) -> float:
     """Total payload size in MB."""
-    return (len(payload.model_bytes) + len(payload.data_bytes)) / (1024 * 1024)
+    return len(payload.model_bytes) / (1024 * 1024)

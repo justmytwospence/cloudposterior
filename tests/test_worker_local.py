@@ -27,7 +27,6 @@ def test_worker_end_to_end():
 
     for chunk in run_sampling(
         payload.model_bytes,
-        payload.data_bytes,
         payload.sample_kwargs,
     ):
         try:
