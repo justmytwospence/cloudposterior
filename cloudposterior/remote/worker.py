@@ -90,6 +90,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="pymc", stop_dict_name
     draws = sample_kwargs.pop("draws", 1000)
     chains = sample_kwargs.pop("chains", None)
     cores = sample_kwargs.pop("cores", None)
+    # Drop kwargs the worker controls itself so users passing them through
+    # cp.cloud(...) don't double-up against our pm.sample call.
+    sample_kwargs.pop("progressbar", None)
+    sample_kwargs.pop("callback", None)
 
     progress_queue: Queue = Queue()
     sampling_error = None
