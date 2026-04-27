@@ -1,9 +1,11 @@
 """Test the cp.cloud() context manager."""
 
+import warnings
 from unittest.mock import patch, MagicMock
 
 import numpy as np
 import pymc as pm
+import pytest
 
 import cloudposterior as cp
 
@@ -73,3 +75,22 @@ def test_cloud_delegates_to_run_sample():
         assert call_kwargs["nuts_sampler"] == "nutpie"
         assert call_kwargs["draws"] == 500
         assert call_kwargs["chains"] == 2
+
+
+def test_cloud_default_does_not_warn_about_dashboard():
+    """The default cp.cloud(model) (no remote, no explicit dashboard) must not
+    spam users with a dashboard warning -- only explicit dashboard=True without
+    remote=True should warn."""
+    model = _make_model()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # promote warnings to errors
+        with cp.cloud(model):
+            pass
+
+
+def test_cloud_explicit_dashboard_without_remote_warns():
+    """Explicit dashboard=True without remote=True is a user error; warn."""
+    model = _make_model()
+    with pytest.warns(UserWarning, match="dashboard=True has no effect"):
+        with cp.cloud(model, dashboard=True):
+            pass
