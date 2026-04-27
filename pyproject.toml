@@ -51,6 +51,11 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.pytest.ini_options]
+markers = [
+    "modal: tests that hit Modal and incur cloud costs (skipped unless --run-modal)",
+]
+
 [dependency-groups]
 dev = [
     "pymc>=5.0",
