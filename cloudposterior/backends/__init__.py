@@ -73,7 +73,7 @@ class ComputeBackend(ABC):
         version_manifest: dict[str, str],
         config: RemoteConfig,
         project: str = "cloudposterior",
-        idle_timeout: int = 600,
+        idle_timeout: int = 1200,
     ) -> RemoteEnvironment:
         """Provision a reusable environment.
 

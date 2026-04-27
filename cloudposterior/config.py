@@ -13,7 +13,7 @@ class RemoteConfig:
     timeout: int = 3600  # seconds
     gpu: str | None = None
     auto_sized: bool = False  # True if config was auto-determined
-    idle_timeout: int = 600  # seconds before idle container is torn down
+    idle_timeout: int = 1200  # seconds before idle container is torn down (Modal max)
 
     @classmethod
     def from_instance(
@@ -48,32 +48,60 @@ class RemoteConfig:
 
     @classmethod
     def _auto(cls, model, sample_kwargs: dict, nuts_sampler: str = "pymc") -> RemoteConfig:
-        """Estimate optimal resources from model characteristics."""
+        """Estimate optimal resources from model characteristics.
+
+        CPU honors both ``chains`` and ``cores`` (PyMC defaults ``cores=chains``,
+        but a user passing ``cores`` explicitly should not be oversubscribed).
+        Memory scales with the observed-data footprint plus the in-memory
+        posterior trace size (chains x draws x parameter count).
+        """
         import numpy as np
 
         chains = sample_kwargs.get("chains") or 4
+        cores = sample_kwargs.get("cores") or chains
         draws = sample_kwargs.get("draws", 1000)
-        tune = sample_kwargs.get("tune", 1000)
 
-        # -- CPU: 1 core per chain, minimum 4 --
-        cpu = max(4, min(chains, 32))
+        # -- CPU: max of chains and cores so neither side is starved --
+        cpu = max(4, min(max(chains, cores), 32))
 
-        # -- Memory: base + data + parameter overhead --
+        # -- Memory: base + data footprint + posterior trace size --
+        # PyMC 5 exposes shapes via model.eval_rv_shapes() without evaluating
+        # the underlying graph. Fall back to rv.type.shape for the rare RV
+        # missing from that map.
+        try:
+            shapes = model.eval_rv_shapes()
+        except Exception:
+            shapes = {}
+
         obs_bytes = 0
         for rv in model.observed_RVs:
+            shape = shapes.get(rv.name)
+            if shape is None:
+                shape = tuple(d for d in (rv.type.shape or ()) if d is not None)
+            n = 1
+            for d in shape:
+                n *= int(d) if d is not None else 1
             try:
-                val = rv.tag.test_value if hasattr(rv.tag, "test_value") else None
-                if val is not None:
-                    obs_bytes += np.asarray(val).nbytes
-            except Exception:
-                pass
-
+                itemsize = np.dtype(rv.dtype).itemsize
+            except TypeError:
+                itemsize = 8
+            obs_bytes += n * itemsize
         obs_mb = obs_bytes / (1024 * 1024)
-        n_params = len(model.free_RVs)
 
-        # Each chain needs: observed data in memory + parameter traces + PyTensor overhead
-        per_chain_mb = max(256, obs_mb * 3 + n_params * 0.01 * draws)
-        memory_mb = 2048 + int(chains * per_chain_mb)
+        # Posterior trace: chains x draws x sum(prod(shape)) x 8 bytes (float64).
+        n_param_scalars = 0
+        for rv in model.free_RVs:
+            shape = shapes.get(rv.name)
+            if shape is None:
+                shape = tuple(d for d in (rv.type.shape or ()) if d is not None)
+            n = 1
+            for d in shape:
+                n *= int(d) if d is not None else 1
+            n_param_scalars += n
+        trace_mb = chains * draws * n_param_scalars * 8 / (1024 * 1024)
+
+        # Base headroom + data (held by every chain) + posterior trace.
+        memory_mb = 2048 + int(obs_mb * chains * 1.5) + int(trace_mb * 1.5)
 
         # Round up to nearest power-of-2 GB (Modal-friendly sizes)
         memory_gb = max(4, 2 ** math.ceil(math.log2(max(1, memory_mb / 1024))))
