@@ -23,6 +23,11 @@ from cloudposterior.progress import (
 from cloudposterior.serialize import SamplingPayload
 
 
+# Keep the N most recent payload-*.bin files per model directory in the
+# Volume. Older payloads from past model edits are pruned on upload.
+_PAYLOAD_KEEP_PER_MODEL = 5
+
+
 _MODAL_SETUP_MSG = (
     "Modal is not authenticated. To set up cloud execution:\n"
     "\n"
@@ -110,9 +115,9 @@ def _create_modal_app(manifest: dict[str, str], config: RemoteConfig):
         timeout=config.timeout,
         **({"gpu": config.gpu} if config.gpu else {}),
     )
-    def remote_sample(model_bytes: bytes, data_bytes: bytes, sample_kwargs: dict, nuts_sampler: str = "pymc"):
+    def remote_sample(model_bytes: bytes, sample_kwargs: dict, nuts_sampler: str = "pymc"):
         from cloudposterior.remote.worker import run_sampling
-        yield from run_sampling(model_bytes, data_bytes, sample_kwargs, nuts_sampler)
+        yield from run_sampling(model_bytes, sample_kwargs, nuts_sampler)
 
     return app, remote_sample
 
@@ -151,7 +156,6 @@ class ModalSamplingJob(SamplingJob):
         with run_ctx:
                 gen = remote_sample.remote_gen(
                     self._payload.model_bytes,
-                    self._payload.data_bytes,
                     self._payload.sample_kwargs,
                     self._nuts_sampler,
                 )
@@ -438,18 +442,16 @@ class PersistentModalSamplingJob(SamplingJob):
         pass
 
 
-def _compute_payload_path(m_slug: str, model_bytes: bytes, data_bytes: bytes) -> str:
+def _compute_payload_path(m_slug: str, model_bytes: bytes) -> str:
     """Compute the Volume path for a model payload.
 
-    Human-readable directory structure, machine-correct filename.
-    Args:
-        m_slug: Pre-computed model slug (stable, not stack-dependent).
+    The model_bytes hash already captures observed-data identity (cloudpickle
+    bundles the data into the model), so a separate data slug isn't needed.
     """
-    from cloudposterior.naming import data_slug, payload_hash
+    from cloudposterior.naming import payload_hash
 
-    d_slug = data_slug(data_bytes)
     p_hash = payload_hash(model_bytes)
-    return f"{m_slug}/{d_slug}/payload-{p_hash}.bin"
+    return f"{m_slug}/payload-{p_hash}.bin"
 
 
 class ModalEnvironment(RemoteEnvironment):
@@ -535,7 +537,35 @@ class ModalEnvironment(RemoteEnvironment):
             os.unlink(tmp_path)
 
         self._uploaded_hashes.add(p_hash)
+        self._prune_old_payloads(payload_path)
         return True
+
+    def _prune_old_payloads(self, payload_path: str) -> None:
+        """Best-effort LRU prune: keep the N most recent payload-*.bin files
+        in the same directory as ``payload_path``. Without this, every model
+        edit accumulates a new payload until the user runs cleanup_volumes().
+        """
+        import logging
+
+        try:
+            dir_path = "/".join(payload_path.split("/")[:-1])
+            entries = list(self._volume.listdir(f"/{dir_path}"))
+        except Exception as exc:
+            logging.getLogger(__name__).debug("listdir failed during prune: %s", exc)
+            return
+
+        payloads = [e for e in entries if e.path.startswith("payload-") and e.path.endswith(".bin")]
+        if len(payloads) <= _PAYLOAD_KEEP_PER_MODEL:
+            return
+
+        payloads.sort(key=lambda e: getattr(e, "mtime", 0), reverse=True)
+        for stale in payloads[_PAYLOAD_KEEP_PER_MODEL:]:
+            try:
+                self._volume.remove_file(f"/{dir_path}/{stale.path}")
+            except Exception as exc:
+                logging.getLogger(__name__).debug(
+                    "failed to prune %s: %s", stale.path, exc,
+                )
 
     def submit(
         self, model_bytes: bytes, sample_kwargs: dict, nuts_sampler: str,
@@ -577,7 +607,7 @@ class ModalBackend(ComputeBackend):
         version_manifest: dict[str, str],
         config: RemoteConfig,
         project: str = "cloudposterior",
-        idle_timeout: int = 600,
+        idle_timeout: int = 1200,
         dashboard: bool = False,
     ) -> ModalEnvironment:
         """Provision a persistent environment (no upload -- deferred to first cache miss)."""
