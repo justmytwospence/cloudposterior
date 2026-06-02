@@ -1,11 +1,10 @@
 """Test ntfy notification formatting."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-import numpy as np
 import pymc as pm
 
-from cloudposterior.notify import NtfyNotifier, _model_topic_name
+from cloudposterior.notify import NtfyNotifier
 from cloudposterior.progress import ChainProgress, JobPhase, PhaseUpdate, SamplingProgress
 
 

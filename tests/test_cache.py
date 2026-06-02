@@ -1,6 +1,5 @@
 """Test result caching."""
 
-import shutil
 import numpy as np
 import pymc as pm
 import pytest
@@ -72,7 +71,9 @@ def test_disk_cache_roundtrip(tmp_path):
     cache.save(key, idata, sample_kwargs=sample_kwargs)
     loaded = cache.load(key, sample_kwargs=sample_kwargs)
     assert loaded is not None
-    assert "posterior" in loaded.groups()
+    from cloudposterior._idata import group_names
+
+    assert "posterior" in group_names(loaded)
     rv_names = list(loaded.posterior.data_vars)
     assert any("mu" in name for name in rv_names)
 

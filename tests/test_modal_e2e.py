@@ -63,10 +63,12 @@ def test_cloud_remote_end_to_end(isolated_project):
     ):
         idata = pm.sample(draws=20, tune=20, chains=2, progressbar=False)
 
-    assert "posterior" in idata.groups()
-    assert "mu" in idata.posterior
+    from cloudposterior._idata import group_names
+
+    assert "posterior" in group_names(idata)
+    assert "mu" in idata.posterior.data_vars
     assert idata.posterior.mu.shape == (2, 20)
-    assert "sigma" in idata.posterior
+    assert "sigma" in idata.posterior.data_vars
     # Sampled values should be finite (not NaN, not Inf)
     assert np.isfinite(idata.posterior.mu.values).all()
 

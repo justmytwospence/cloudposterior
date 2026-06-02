@@ -7,11 +7,24 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Lint with ruff
+        run: uvx ruff check cloudposterior/ tests/
+
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # Exercise both arviz majors: PyMC 5 ships arviz 0.x, PyMC 6 requires
+        # arviz 1.x (the DataTree rewrite). Modal e2e tests are not run in CI.
+        pymc: ["5", "6"]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,5 +38,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --python ${{ matrix.python-version }}
 
-      - name: Run tests
-        run: uv run pytest tests/ -v
+      - name: Run tests (PyMC ${{ matrix.pymc }})
+        run: |
+          if [ "${{ matrix.pymc }}" = "6" ]; then
+            uv run --python ${{ matrix.python-version }} --with "pymc>=6,<7" --with "nutpie>=0.13" \
+              python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
+          else
+            uv run --python ${{ matrix.python-version }} \
+              python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
+          fi

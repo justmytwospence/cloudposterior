@@ -6,7 +6,6 @@ import msgpack
 
 from cloudposterior.serialize import create_payload
 from cloudposterior.remote.worker import run_sampling
-from cloudposterior.progress import JobPhase
 
 
 def test_worker_end_to_end():
@@ -58,6 +57,8 @@ def test_worker_end_to_end():
 
     raw = lz4.frame.decompress(idata_bytes)
     idata = az.from_netcdf(io.BytesIO(raw))
-    assert "posterior" in idata.groups()
-    assert "mu" in idata.posterior
-    print(f"  Posterior shape: {dict(idata.posterior.dims)}")
+    from cloudposterior._idata import group_names
+
+    assert "posterior" in group_names(idata)
+    assert "mu" in idata.posterior.data_vars
+    print(f"  Posterior shape: {dict(idata.posterior.sizes)}")

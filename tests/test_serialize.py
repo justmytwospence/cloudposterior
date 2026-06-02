@@ -79,7 +79,9 @@ def test_deserialized_model_can_sample():
     with deserialized:
         idata = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
 
-    assert "posterior" in idata.groups()
-    assert "mu" in idata.posterior
-    assert "tau" in idata.posterior
-    assert "theta" in idata.posterior
+    from cloudposterior._idata import group_names
+
+    assert "posterior" in group_names(idata)
+    assert "mu" in idata.posterior.data_vars
+    assert "tau" in idata.posterior.data_vars
+    assert "theta" in idata.posterior.data_vars

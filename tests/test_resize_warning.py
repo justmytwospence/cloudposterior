@@ -12,7 +12,6 @@ import numpy as np
 import pymc as pm
 import pytest
 
-import cloudposterior as cp
 from cloudposterior.api import _warn_if_resize_drift
 from cloudposterior.config import RemoteConfig
 

@@ -4,7 +4,7 @@ import numpy as np
 import pymc as pm
 
 from queue import Queue
-from cloudposterior.progress import make_sampling_callback, ProgressAggregator
+from cloudposterior.progress import make_sampling_callback
 
 
 def test_progress_callback_captures_draws():
@@ -22,10 +22,11 @@ def test_progress_callback_captures_draws():
     callback = make_sampling_callback(queue, tune=10, draws=10)
 
     with model:
-        idata = pm.sample(
+        pm.sample(
             draws=10,
             tune=10,
             chains=1,
+            nuts_sampler="pymc",
             callback=callback,
             progressbar=False,
         )
