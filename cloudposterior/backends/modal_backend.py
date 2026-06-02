@@ -413,6 +413,13 @@ def _create_persistent_app(
 
             return run_posterior_predictive(f"/data/{payload_path}", idata_bytes, sample_kwargs)
 
+        @modal.method()
+        def sample_blocking(self, payload_path: str, sample_kwargs: dict,
+                            nuts_sampler: str = "nutpie") -> bytes:
+            from cloudposterior.remote.worker import run_sampling_blocking
+
+            return run_sampling_blocking(f"/data/{payload_path}", sample_kwargs, nuts_sampler)
+
     # Add dashboard web endpoints if requested
     dashboard_fn = None
     progress_fn = None

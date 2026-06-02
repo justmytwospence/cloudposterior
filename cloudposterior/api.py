@@ -1024,3 +1024,117 @@ def cleanup_volumes(project: str | None = None) -> None:
     from cloudposterior.backends.modal_backend import ModalBackend
 
     ModalBackend.cleanup_volumes(project=project or _detect_project_name())
+
+
+def map(models, sample_kwargs=None, *, cache: bool | str = True,
+        project: str | None = None, nuts_sampler: str | None = None,
+        instance: str | None = None, progress: bool = True) -> list:
+    """Fit many models in parallel on the cloud.
+
+    ``models`` is a list of ``pm.Model`` -- vary priors, structure, or data for
+    model comparison / sensitivity. ``sample_kwargs`` is a single dict of
+    ``pm.sample`` kwargs applied to all, or a list aligned with ``models``. Each
+    model is uploaded once and the fits run concurrently on one warm container
+    (Modal ``spawn``). Returns InferenceData in input order. Progress is
+    job-level only -- spawned jobs don't stream.
+
+    Example::
+
+        import arviz as az
+        idatas = cp.map([pooled, hierarchical, per_county], {"draws": 1000})
+        az.compare({"pooled": idatas[0], "hier": idatas[1], "county": idatas[2]})
+    """
+    import pymc as pm
+
+    from cloudposterior.backends.modal_backend import (
+        ModalBackend,
+        _compute_payload_path,
+        _run_blocking,
+    )
+    from cloudposterior.cache import resolve_cache
+    from cloudposterior.naming import cache_key as compute_cache_key
+    from cloudposterior.naming import model_slug
+    from cloudposterior.serialize import (
+        deserialize_inference_data,
+        get_version_manifest,
+    )
+
+    if isinstance(models, pm.Model):
+        models = [models]
+    models = list(models)
+    n = len(models)
+    if n == 0:
+        return []
+
+    # Normalize sample_kwargs to one dict per model.
+    if sample_kwargs is None:
+        kwargs_list = [{} for _ in range(n)]
+    elif isinstance(sample_kwargs, dict):
+        kwargs_list = [dict(sample_kwargs) for _ in range(n)]
+    else:
+        kwargs_list = [dict(k) for k in sample_kwargs]
+        if len(kwargs_list) != n:
+            raise ValueError(
+                f"sample_kwargs list ({len(kwargs_list)}) must align with models ({n})"
+            )
+
+    model_bytes_list = [_ensure_model_bytes(m) for m in models]
+    samplers = [nuts_sampler or _default_sampler(m, local=False) for m in models]
+    project = project or _detect_project_name()
+
+    # Provision one env (image + Volume) sized to the first model; all variants
+    # share the warm container and the project Volume.
+    config = RemoteConfig.from_instance(
+        instance, model=models[0], sample_kwargs=kwargs_list[0], nuts_sampler=samplers[0],
+    )
+    backend = ModalBackend(config=config)
+    env = backend.provision(
+        model_bytes_list[0], models[0], get_version_manifest(), config,
+        project=project, idle_timeout=config.idle_timeout,
+    )
+    cache_backend = resolve_cache(cache, model=models[0]) if cache else None
+
+    def _log(msg):
+        if progress:
+            print(f"cp.map: {msg}")
+
+    try:
+        env._ensure_running()
+
+        results: list = [None] * n
+        run_idx: list[int] = []
+        run_meta: list = []  # aligned with run_idx: (payload_path, kwargs, sampler, key, key_kwargs)
+        for i, m in enumerate(models):
+            mb = model_bytes_list[i]
+            payload_path = _compute_payload_path(model_slug(m), mb)
+            ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
+            ckey = None
+            if cache_backend is not None:
+                ckey = compute_cache_key(mb, ck_kwargs)
+                hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
+                if hit is not None:
+                    results[i] = hit
+                    continue
+            env._upload_if_needed(mb, payload_path)
+            run_idx.append(i)
+            run_meta.append((payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs))
+
+        n_cached = n - len(run_idx)
+        _log(f"fitting {len(run_idx)} model(s) in parallel"
+             + (f" ({n_cached} cached)" if n_cached else "") + " ...")
+
+        sampler_obj = env._sampler_cls()
+        calls = [
+            sampler_obj.sample_blocking.spawn(pp, kw, sp)
+            for (pp, kw, sp, _ck, _cak) in run_meta
+        ]
+        for j, i in enumerate(run_idx):
+            idata = deserialize_inference_data(_run_blocking(calls[j].get))
+            results[i] = idata
+            _log(f"[{j + 1}/{len(run_idx)}] done")
+            _pp, _kw, _sp, ckey, ck_kwargs = run_meta[j]
+            if cache_backend is not None and ckey is not None:
+                cache_backend.save(ckey, idata, sample_kwargs=ck_kwargs)
+        return results
+    finally:
+        env.teardown()

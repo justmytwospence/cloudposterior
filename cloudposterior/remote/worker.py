@@ -679,3 +679,37 @@ def run_posterior_predictive(payload_path: str, idata_bytes: bytes, sample_kwarg
     with model:
         idata = pm.sample_posterior_predictive(trace, **sample_kwargs)
     return serialize_inference_data(idata)
+
+
+def run_sampling_blocking(payload_path: str, sample_kwargs: dict,
+                          nuts_sampler: str = "nutpie") -> bytes:
+    """Run sampling to completion and return lz4 NetCDF bytes (no streaming).
+
+    Used by cp.map via Modal spawn_map -- spawn can't stream, so we drive the
+    streaming generator here and keep only the final result chunk.
+    """
+    import msgpack
+
+    model = _load_model_from_volume(payload_path)
+    idata_bytes = None
+    expecting_result = False
+    for chunk in _sample_and_stream(model, sample_kwargs, nuts_sampler):
+        if expecting_result:
+            idata_bytes = chunk
+            expecting_result = False
+            continue
+        try:
+            unpacker = msgpack.Unpacker(raw=False)
+            unpacker.feed(chunk)
+            decoded_any = False
+            for decoded in unpacker:
+                decoded_any = True
+                if isinstance(decoded, dict) and decoded.get("type") == "result":
+                    expecting_result = True
+            if not decoded_any:
+                idata_bytes = chunk
+        except Exception:
+            idata_bytes = chunk
+    if idata_bytes is None:
+        raise RuntimeError("cp.map worker produced no result")
+    return idata_bytes
