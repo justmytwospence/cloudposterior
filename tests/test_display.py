@@ -51,6 +51,10 @@ def test_is_notebook_returns_bool():
     assert isinstance(display._is_notebook(), bool)
 
 
+def test_is_marimo_returns_bool():
+    assert isinstance(display._is_marimo(), bool)
+
+
 # -- display backends -------------------------------------------------------
 
 def test_terminal_display_updates_without_error():
@@ -60,10 +64,33 @@ def test_terminal_display_updates_without_error():
     d.show_sampling(_sampling(divergences=2))  # exercises table build + red coloring
 
 
-def test_notebook_display_updates_without_error():
-    pytest.importorskip("ipywidgets")
+def test_notebook_display_updates_widget_html(monkeypatch):
+    pytest.importorskip("anywidget")
+    # No notebook kernel in tests -- skip the mount, just drive the sink.
+    monkeypatch.setattr(display.NotebookDisplay, "_mount", lambda self: None)
     d = display.NotebookDisplay("test")
     d.show_phase(_phase("in_progress"))
     d.show_phase(_phase("done"))
     d.show_sampling(_sampling())
-    assert "<table" in d._sampling_widget.value
+    html = d._compose_html()
+    assert "<table" in html and "Chain 0" in html and "50/100" in html
+    assert "&#10003;" in html  # done-phase check icon
+    assert "<table" in d._widget.html  # trait was set
+
+
+def test_notebook_display_render_degrades_when_trait_set_raises(monkeypatch):
+    pytest.importorskip("anywidget")
+    monkeypatch.setattr(display.NotebookDisplay, "_mount", lambda self: None)
+    d = display.NotebookDisplay("test")
+
+    class _Boom:
+        @property
+        def html(self):
+            return ""
+
+        @html.setter
+        def html(self, value):
+            raise RuntimeError("no runtime context")
+
+    d._widget = _Boom()
+    d.show_sampling(_sampling())  # must not raise

@@ -355,17 +355,20 @@ def _run_sample(
         cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             if progress:
-                from cloudposterior.display import _is_notebook
-                if _is_notebook():
-                    from IPython.display import display, HTML
-                    display(HTML(
+                from cloudposterior.display import _emit_oneshot_html
+
+                def _cached_terminal():
+                    from rich.console import Console
+                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
+
+                _emit_oneshot_html(
+                    [
                         '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
                         '<span style="color:#5cb85c;">&#10003;</span> cached result'
                         '</div>'
-                    ))
-                else:
-                    from rich.console import Console
-                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
+                    ],
+                    terminal_fallback=_cached_terminal,
+                )
             return cached
 
     # -- Build sinks (only needed for cache miss) --
@@ -463,9 +466,14 @@ def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
     sinks = []
 
     if progress:
-        from cloudposterior.display import _is_notebook, NotebookDisplay, TerminalDisplay
+        from cloudposterior.display import (
+            NotebookDisplay,
+            TerminalDisplay,
+            _is_marimo,
+            _is_notebook,
+        )
 
-        if _is_notebook():
+        if _is_marimo() or _is_notebook():
             display = NotebookDisplay(instance_desc)
         else:
             display = TerminalDisplay(instance_desc)
@@ -499,35 +507,34 @@ def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
 
 def _show_link(url: str, label: str = "Link", show_qr: bool = False):
     """Display a URL with optional QR code."""
-    from cloudposterior.display import _is_notebook
+    from cloudposterior.display import _emit_oneshot_html
 
-    if _is_notebook():
-        from IPython.display import display as ipy_display, HTML
+    # HTML fragments for browser frontends (Jupyter + marimo). The SVG QR
+    # renders in both; the terminal fallback prints an ASCII QR instead.
+    parts = [
+        '<div style="font-family:monospace;font-size:12px;padding:4px 0;">',
+        f'{label}: <a href="{url}" target="_blank">{url}</a>',
+    ]
+    if show_qr:
+        try:
+            import io
 
-        parts = [
-            '<div style="font-family:monospace;font-size:12px;padding:4px 0;">',
-            f'{label}: <a href="{url}" target="_blank">{url}</a>',
-        ]
-        if show_qr:
-            try:
-                import qrcode
-                import qrcode.image.svg
-                import io
+            import qrcode
+            import qrcode.image.svg
 
-                qr = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, box_size=6)
-                buf = io.BytesIO()
-                qr.save(buf)
-                svg = buf.getvalue().decode("utf-8")
-                parts.append(f'<div style="padding:4px 0;">{svg}</div>')
-            except Exception:
-                pass
-        parts.append("</div>")
-        ipy_display(HTML("".join(parts)))
-    else:
+            qr = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, box_size=6)
+            buf = io.BytesIO()
+            qr.save(buf)
+            svg = buf.getvalue().decode("utf-8")
+            parts.append(f'<div style="padding:4px 0;">{svg}</div>')
+        except Exception:
+            pass
+    parts.append("</div>")
+
+    def _terminal():
         from rich.console import Console
 
-        console = Console()
-        console.print(f"[dim]{label}: {url}[/dim]")
+        Console().print(f"[dim]{label}: {url}[/dim]")
         if show_qr:
             try:
                 import qrcode
@@ -538,6 +545,8 @@ def _show_link(url: str, label: str = "Link", show_qr: bool = False):
                 qr.print_ascii(out=None)  # prints to stdout
             except Exception:
                 pass
+
+    _emit_oneshot_html(parts, terminal_fallback=_terminal)
 
 
 def _stop_sinks(sinks: list):
@@ -633,17 +642,20 @@ def _run_sample_persistent(
         cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             if progress:
-                from cloudposterior.display import _is_notebook
-                if _is_notebook():
-                    from IPython.display import display, HTML
-                    display(HTML(
+                from cloudposterior.display import _emit_oneshot_html
+
+                def _cached_terminal():
+                    from rich.console import Console
+                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
+
+                _emit_oneshot_html(
+                    [
                         '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
                         '<span style="color:#5cb85c;">&#10003;</span> cached result'
                         '</div>'
-                    ))
-                else:
-                    from rich.console import Console
-                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
+                    ],
+                    terminal_fallback=_cached_terminal,
+                )
             return cached
 
     # Cache miss -- read the actually-provisioned config from the env so the
@@ -797,6 +809,10 @@ def _run_local(
             for snapshot in aggregator.snapshots():
                 emit(snapshot)
 
+        # NOTE: in marimo, this background thread has no runtime context, so the
+        # notebook widget's trait writes no-op and local progress shows only the
+        # final frame (remote sampling emits on the main thread and animates
+        # live). Swap to marimo.Thread here if local-marimo liveness is wanted.
         progress_thread = Thread(target=stream_progress, daemon=True)
         progress_thread.start()
 

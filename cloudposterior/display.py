@@ -1,4 +1,8 @@
-"""Progress display backends for terminal (Rich TUI) and Jupyter (ipywidgets)."""
+"""Progress display backends for terminal (Rich TUI) and notebooks (anywidget).
+
+The notebook backend uses anywidget, which renders live in both Jupyter
+(ipywidgets under the hood) and marimo via the shared Jupyter Comm protocol.
+"""
 
 from __future__ import annotations
 
@@ -20,8 +24,39 @@ def _is_notebook() -> bool:
         return False
 
 
+def _is_marimo() -> bool:
+    try:
+        import marimo
+        return marimo.running_in_notebook()
+    except Exception:
+        return False
+
+
+def _emit_oneshot_html(parts: list[str], *, terminal_fallback) -> None:
+    """Emit one-shot HTML to whichever notebook frontend is active.
+
+    ``parts`` are HTML fragments for browser frontends (Jupyter and marimo);
+    ``terminal_fallback`` is a zero-arg callable that renders the terminal
+    equivalent (e.g. a Rich print, or an ASCII QR code). Used for non-streaming
+    output like cache-hit indicators and notification links/QR codes.
+    """
+    html = "".join(parts)
+    try:
+        if _is_marimo():
+            import marimo as mo
+            mo.output.append(mo.Html(html))
+            return
+        if _is_notebook():
+            from IPython.display import HTML, display
+            display(HTML(html))
+            return
+    except Exception:
+        pass
+    terminal_fallback()
+
+
 # ---------------------------------------------------------------------------
-# Notebook display (ipywidgets)
+# Notebook display (anywidget -- works in Jupyter and marimo)
 # ---------------------------------------------------------------------------
 
 def _format_time(seconds: float) -> str:
@@ -124,36 +159,68 @@ def _phase_html(phases: list[tuple[str, str, str]]) -> str:
     return "".join(lines)
 
 
+# anywidget ES module: mirror the Python-composed HTML into the cell. State
+# flows over the Jupyter Comm protocol, which both Jupyter and marimo flush to
+# the frontend immediately (mid-cell), so the table animates live during a
+# blocking pm.sample() call.
+_PROGRESS_ESM = """
+function render({ model, el }) {
+  const update = () => { el.innerHTML = model.get("html"); };
+  update();
+  model.on("change:html", update);
+}
+export default { render };
+"""
+
+_progress_widget_cls = None
+
+
+def _progress_widget_class():
+    """Lazily define and cache the anywidget subclass (keeps the import off the
+    terminal/CLI path)."""
+    global _progress_widget_cls
+    if _progress_widget_cls is None:
+        import anywidget
+        import traitlets
+
+        class _CPProgressWidget(anywidget.AnyWidget):
+            _esm = _PROGRESS_ESM
+            html = traitlets.Unicode("").tag(sync=True)
+
+        _progress_widget_cls = _CPProgressWidget
+    return _progress_widget_cls
+
+
 class NotebookDisplay:
-    """ipywidgets-based display for Jupyter notebooks."""
+    """anywidget-based progress display for Jupyter and marimo notebooks.
+
+    Composes the same HTML the terminal/Jupyter views always used and pushes it
+    through a single synced ``html`` trait; the frontend re-renders on each
+    change. Works identically in Jupyter and marimo.
+    """
 
     def __init__(self, instance_desc: str = ""):
-        from IPython.display import display, HTML
-        import ipywidgets as widgets
-
-        self._display = display
-        self._HTML = HTML
-
         self._instance_desc = instance_desc
         self._phases: list[tuple[str, str, str]] = []
+        self._active_phase: str | None = None
+        self._sampling: SamplingProgress | None = None
 
-        # Widgets
-        self._header = widgets.HTML(
-            value=f'<div style="font-family:monospace;font-size:14px;font-weight:bold;'
-            f'padding:8px 0 4px 0;">cloudposterior'
-            f'{" -- " + instance_desc if instance_desc else ""}</div>'
-        )
-        self._phase_widget = widgets.HTML(value="")
-        self._status_widget = widgets.HTML(value="")
-        self._sampling_widget = widgets.HTML(value="")
+        self._widget = _progress_widget_class()()
+        self._mount()
+        self._render()
 
-        self._container = widgets.VBox([
-            self._header,
-            self._phase_widget,
-            self._status_widget,
-            self._sampling_widget,
-        ])
-        self._handle = self._display(self._container, display_id=True)
+    def _mount(self) -> None:
+        """Display the widget once. marimo mounts via mo.output.append; Jupyter
+        (and other IPython frontends) via IPython.display."""
+        try:
+            if _is_marimo():
+                import marimo as mo
+                mo.output.append(self._widget)
+            else:
+                from IPython.display import display
+                display(self._widget)
+        except Exception:
+            pass
 
     def show_phase(self, update: PhaseUpdate):
         detail = update.message
@@ -162,17 +229,10 @@ class NotebookDisplay:
 
         if update.status == "in_progress":
             # Show only the spinner, not a checklist entry
-            self._status_widget.value = (
-                f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
-                f'  {_CSS_SPINNER}'
-                f'<span style="color:#888;">{update.message}...</span>'
-                f'</div>'
-            )
+            self._active_phase = update.message
         else:
             # Clear spinner and add completed/error entry to checklist
-            self._status_widget.value = ""
-
-            # Update existing or add new
+            self._active_phase = None
             found = False
             for i, (s, label, d) in enumerate(self._phases):
                 if label == update.phase.value:
@@ -182,10 +242,40 @@ class NotebookDisplay:
             if not found:
                 self._phases.append((update.status, update.phase.value, detail))
 
-            self._phase_widget.value = _phase_html(self._phases)
+        self._render()
 
     def show_sampling(self, progress: SamplingProgress):
-        self._sampling_widget.value = _sampling_table_html(progress)
+        self._sampling = progress
+        self._render()
+
+    def _compose_html(self) -> str:
+        """Build the full view as one HTML string from the pure builders."""
+        parts = [
+            f'<div style="font-family:monospace;font-size:14px;font-weight:bold;'
+            f'padding:8px 0 4px 0;">cloudposterior'
+            f'{" -- " + self._instance_desc if self._instance_desc else ""}</div>'
+        ]
+        if self._phases:
+            parts.append(_phase_html(self._phases))
+        if self._active_phase:
+            parts.append(
+                f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
+                f'  {_CSS_SPINNER}'
+                f'<span style="color:#888;">{self._active_phase}...</span>'
+                f'</div>'
+            )
+        if self._sampling and self._sampling.chains:
+            parts.append(_sampling_table_html(self._sampling))
+        return f'<div>{"".join(parts)}</div>'
+
+    def _render(self) -> None:
+        # Defensive: setting the trait off the main thread / outside a marimo
+        # runtime context (the local-sampling background thread) no-ops rather
+        # than crashing the sample call.
+        try:
+            self._widget.html = self._compose_html()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +433,7 @@ def display_progress_stream(
 
     Automatically selects notebook or terminal backend.
     """
-    if _is_notebook():
+    if _is_marimo() or _is_notebook():
         display = NotebookDisplay(instance_desc)
         for event in events:
             if isinstance(event, PhaseUpdate):
