@@ -21,6 +21,7 @@ class SamplingPayload:
     model_bytes: bytes  # cloudpickle'd pm.Model (includes observed data), lz4 compressed
     version_manifest: dict[str, str]
     sample_kwargs: dict
+    idata_bytes: bytes | None = None  # lz4 NetCDF trace, for posterior predictive
 
 
 def get_version_manifest() -> dict[str, str]:
@@ -65,6 +66,43 @@ def deserialize_model(data: bytes):
 
     raw = lz4.frame.decompress(data)
     return pickle.loads(raw)
+
+
+def serialize_inference_data(idata) -> bytes:
+    """Serialize an arviz InferenceData to lz4-compressed NetCDF bytes.
+
+    Mirrors the worker's result encoding; used client-side to ship a trace to a
+    remote posterior-predictive call and to return cp.map results.
+    """
+    import os
+    import tempfile
+
+    sanitize_inference_data(idata)
+    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        idata.to_netcdf(tmp_path)
+        with open(tmp_path, "rb") as f:
+            return lz4.frame.compress(f.read())
+    finally:
+        os.unlink(tmp_path)
+
+
+def deserialize_inference_data(data: bytes):
+    """Load an arviz InferenceData from lz4-compressed NetCDF bytes."""
+    import os
+    import tempfile
+
+    import arviz as az
+
+    raw = lz4.frame.decompress(data)
+    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+    try:
+        return az.from_netcdf(tmp_path)
+    finally:
+        os.unlink(tmp_path)
 
 
 def create_payload(
