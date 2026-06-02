@@ -26,6 +26,27 @@ from cloudposterior.serialize import SamplingPayload
 _PAYLOAD_KEEP_PER_MODEL = 5
 
 
+def _run_blocking(fn, *args, **kwargs):
+    """Run a blocking Modal call, off the event loop if one is active.
+
+    Inside a running asyncio loop (marimo's kernel, an async web app) a blocking
+    Modal interface raises noisy AsyncUsageWarnings and stalls the loop. Running
+    it in a worker thread (which has no event loop) avoids both. Outside a loop,
+    call directly. Use for one-shot client calls (provision, upload, web URLs).
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn(*args, **kwargs)
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(fn, *args, **kwargs).result()
+
+
 _MODAL_SETUP_MSG = (
     "Modal is not authenticated. To set up cloud execution:\n"
     "\n"
@@ -257,10 +278,38 @@ def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
     the sentinel as the primary signal for the result chunk (so a genuine decode
     error is not silently mistaken for the result), with a non-msgpack chunk as a
     defensive fallback. A sampling failure in the worker re-raises here.
+
+    The blocking Modal generator is drained in a background thread -- which has
+    no event loop, so it doesn't emit AsyncUsageWarnings in async hosts (marimo,
+    async web apps). Decoding and ``yield`` stay on the calling thread, so the
+    progress-display sinks update in the right runtime context (the marimo
+    widget's trait writes need the main thread).
     """
+    import queue
+    import threading
+
+    chunk_q: queue.Queue = queue.Queue()
+    _SENTINEL = object()
+    err: dict = {}
+
+    def _drain():
+        try:
+            for chunk in gen:
+                chunk_q.put(chunk)
+        except Exception as exc:  # surface worker/Modal errors on the main thread
+            err["exc"] = exc
+        finally:
+            chunk_q.put(_SENTINEL)
+
+    consumer = threading.Thread(target=_drain, daemon=True)
+    consumer.start()
+
     idata_bytes = None
     expecting_result = False
-    for chunk in gen:
+    while True:
+        chunk = chunk_q.get()
+        if chunk is _SENTINEL:
+            break
         if expecting_result:
             idata_bytes = chunk
             expecting_result = False
@@ -283,6 +332,10 @@ def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
         except Exception:
             # Non-msgpack chunk: the compressed InferenceData bytes.
             idata_bytes = chunk
+
+    consumer.join()
+    if "exc" in err:
+        raise err["exc"]
     return idata_bytes
 
 
@@ -306,6 +359,7 @@ def _create_persistent_app(
     config: RemoteConfig,
     volume,
     dashboard_dict_name: str | None = None,
+    dashboard: bool = False,
     model_label: str = "model",
     stop_token: str | None = None,
 ):
@@ -313,7 +367,9 @@ def _create_persistent_app(
 
     The Volume contains model payloads at human-readable paths. The sampler
     loads a payload by path on each call (fast local read from mounted volume).
-    If dashboard_dict is provided, a web endpoint is added for live progress.
+    When ``dashboard_dict_name`` is set a token-gated ``/stop`` endpoint is added
+    (used by both the in-notebook stop button and the dashboard); the dashboard
+    and progress endpoints are added only when ``dashboard`` is True.
     """
     import modal
 
@@ -356,49 +412,57 @@ def _create_persistent_app(
         _dash_label = f"{model_label}-{_uid}"
         _stop_token = stop_token or ""
 
+        # Stop endpoint backs both the dashboard's stop button and the
+        # in-notebook stop button, so it exists whenever control infra does.
         @app.function(serialized=True, image=image)
-        @modal.fastapi_endpoint(method="GET", label=_dash_label)
-        def serve_dashboard():
-            from fastapi.responses import HTMLResponse
-            from cloudposterior.dashboard import render_dashboard_html
-            return HTMLResponse(render_dashboard_html(
-                progress_label=_progress_label,
-                stop_label=_stop_label,
-                dashboard_label=_dash_label,
-                stop_token=_stop_token,
-            ))
-
-        @app.function(serialized=True, image=image)
-        @modal.fastapi_endpoint(method="GET", label=f"{model_label}-{_uid}-progress")
-        def serve_progress():
+        @modal.fastapi_endpoint(method="POST", label=_stop_label)
+        async def serve_stop(token: str = ""):
             from fastapi.responses import JSONResponse
             import modal as _modal
-            try:
-                d = _modal.Dict.from_name(_dict_name)
-                data = d["progress"]
-            except (KeyError, Exception):
-                data = {"phases": [], "sampling": None, "complete": False}
-            return JSONResponse(data)
-
-        @app.function(serialized=True, image=image)
-        @modal.fastapi_endpoint(method="POST", label=f"{model_label}-{_uid}-stop")
-        def serve_stop(token: str = ""):
-            from fastapi.responses import JSONResponse
-            import modal as _modal
-            # Require the token baked into the dashboard page so a random caller
-            # who guesses the (short) stop URL can't kill someone's sampling run.
+            # Require the token baked into the page so a random caller who
+            # guesses the (short) stop URL can't kill someone's sampling run.
             if _stop_token and token != _stop_token:
                 return JSONResponse({"stopped": False, "error": "invalid token"}, status_code=403)
             try:
-                d = _modal.Dict.from_name(_dict_name)
-                d["stop"] = True
+                d = await _modal.Dict.from_name.aio(_dict_name)
+                await d.put.aio("stop", True)
             except Exception:
                 pass
             return JSONResponse({"stopped": True})
 
-        dashboard_fn = serve_dashboard
-        progress_fn = serve_progress
         stop_fn = serve_stop
+
+        # Dashboard + progress endpoints only when the live dashboard is on.
+        if dashboard:
+            @app.function(serialized=True, image=image)
+            @modal.fastapi_endpoint(method="GET", label=_dash_label)
+            def serve_dashboard():
+                from fastapi.responses import HTMLResponse
+                from cloudposterior.dashboard import render_dashboard_html
+                return HTMLResponse(render_dashboard_html(
+                    progress_label=_progress_label,
+                    stop_label=_stop_label,
+                    dashboard_label=_dash_label,
+                    stop_token=_stop_token,
+                ))
+
+            @app.function(serialized=True, image=image)
+            @modal.fastapi_endpoint(method="GET", label=_progress_label)
+            async def serve_progress():
+                # Async handler + .aio() Modal calls: FastAPI runs this on an
+                # event loop, so blocking calls here would warn and stall it.
+                from fastapi.responses import JSONResponse
+                import modal as _modal
+                default = {"phases": [], "sampling": None, "complete": False}
+                try:
+                    d = await _modal.Dict.from_name.aio(_dict_name)
+                    data = await d.get.aio("progress", default)
+                except Exception:
+                    data = default
+                return JSONResponse(data)
+
+            dashboard_fn = serve_dashboard
+            progress_fn = serve_progress
 
     return app, Sampler, dashboard_fn, progress_fn, stop_fn
 
@@ -477,7 +541,8 @@ class ModalEnvironment(RemoteEnvironment):
 
     def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
                  dashboard_dict=None, dashboard_dict_name: str | None = None,
-                 dashboard_fn=None, progress_fn=None, stop_fn=None):
+                 dashboard_fn=None, progress_fn=None, stop_fn=None,
+                 stop_token: str | None = None):
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
@@ -488,6 +553,7 @@ class ModalEnvironment(RemoteEnvironment):
         self._dashboard_fn = dashboard_fn
         self._progress_fn = progress_fn
         self._stop_fn = stop_fn
+        self._stop_token = stop_token
         self._dashboard_url: str | None = None
         self._progress_url: str | None = None
         self._stop_url: str | None = None
@@ -503,21 +569,21 @@ class ModalEnvironment(RemoteEnvironment):
                 raise _handle_modal_error(exc)
             self._running = True
 
-            # Capture dashboard URLs after app starts
+            # Capture dashboard URLs after app starts (off-loop: avoids async warnings)
             if self._dashboard_fn is not None:
                 try:
-                    self._dashboard_url = self._dashboard_fn.get_web_url()
+                    self._dashboard_url = _run_blocking(self._dashboard_fn.get_web_url)
                 except Exception:
                     pass
             if self._progress_fn is not None:
                 try:
-                    self._progress_url = self._progress_fn.get_web_url()
+                    self._progress_url = _run_blocking(self._progress_fn.get_web_url)
                 except Exception:
                     pass
 
             if self._stop_fn is not None:
                 try:
-                    self._stop_url = self._stop_fn.get_web_url()
+                    self._stop_url = _run_blocking(self._stop_fn.get_web_url)
                 except Exception:
                     pass
 
@@ -531,10 +597,10 @@ class ModalEnvironment(RemoteEnvironment):
         if p_hash in self._uploaded_hashes:
             return False
 
-        # Check Volume
+        # Check Volume (off-loop: avoids async warnings in marimo/async hosts)
         try:
             dir_path = "/".join(payload_path.split("/")[:-1])
-            entries = self._volume.listdir(f"/{dir_path}")
+            entries = _run_blocking(self._volume.listdir, f"/{dir_path}")
             filename = payload_path.split("/")[-1]
             if any(e.path == filename for e in entries):
                 self._uploaded_hashes.add(p_hash)
@@ -548,9 +614,13 @@ class ModalEnvironment(RemoteEnvironment):
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(model_bytes)
             tmp_path = tmp.name
-        try:
+
+        def _do_upload():
             with self._volume.batch_upload(force=True) as upload:
                 upload.put_file(tmp_path, f"/{payload_path}")
+
+        try:
+            _run_blocking(_do_upload)
         finally:
             os.unlink(tmp_path)
 
@@ -567,7 +637,7 @@ class ModalEnvironment(RemoteEnvironment):
 
         try:
             dir_path = "/".join(payload_path.split("/")[:-1])
-            entries = list(self._volume.listdir(f"/{dir_path}"))
+            entries = list(_run_blocking(self._volume.listdir, f"/{dir_path}"))
         except Exception as exc:
             logging.getLogger(__name__).debug("listdir failed during prune: %s", exc)
             return
@@ -579,7 +649,7 @@ class ModalEnvironment(RemoteEnvironment):
         payloads.sort(key=lambda e: getattr(e, "mtime", 0), reverse=True)
         for stale in payloads[_PAYLOAD_KEEP_PER_MODEL:]:
             try:
-                self._volume.remove_file(f"/{dir_path}/{stale.path}")
+                _run_blocking(self._volume.remove_file, f"/{dir_path}/{stale.path}")
             except Exception as exc:
                 logging.getLogger(__name__).debug(
                     "failed to prune %s: %s", stale.path, exc,
@@ -627,8 +697,14 @@ class ModalBackend(ComputeBackend):
         project: str = "cloudposterior",
         idle_timeout: int = 1200,
         dashboard: bool = False,
+        stop_enabled: bool = False,
     ) -> ModalEnvironment:
-        """Provision a persistent environment (no upload -- deferred to first cache miss)."""
+        """Provision a persistent environment (no upload -- deferred to first cache miss).
+
+        ``stop_enabled`` provisions the control Dict + token-gated ``/stop``
+        endpoint for the in-notebook stop button even when the full ``dashboard``
+        is off.
+        """
         import modal
         import uuid
 
@@ -637,24 +713,28 @@ class ModalBackend(ComputeBackend):
         config.idle_timeout = idle_timeout
         volume_name = f"cp-{project}"
         try:
-            volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+            volume = _run_blocking(modal.Volume.from_name, volume_name, create_if_missing=True)
         except Exception as exc:
             raise _handle_modal_error(exc)
 
         m_slug = compute_model_slug(model)
 
-        # Create dashboard Dict if requested
+        # Control infra (a Modal Dict + secret token) backs both the live
+        # dashboard and the in-notebook stop button; create it for either.
         dashboard_dict = None
         dashboard_dict_name = None
         stop_token = None
-        if dashboard:
+        if dashboard or stop_enabled:
             dashboard_dict_name = f"cp-dash-{uuid.uuid4().hex[:8]}"
-            dashboard_dict = modal.Dict.from_name(dashboard_dict_name, create_if_missing=True)
-            stop_token = uuid.uuid4().hex  # secret, baked into the dashboard page only
+            dashboard_dict = _run_blocking(
+                modal.Dict.from_name, dashboard_dict_name, create_if_missing=True
+            )
+            stop_token = uuid.uuid4().hex  # secret, baked into the page only
 
         app, sampler_cls, dashboard_fn, progress_fn, stop_fn = _create_persistent_app(
             version_manifest, config, volume,
             dashboard_dict_name=dashboard_dict_name,
+            dashboard=dashboard,
             model_label=m_slug.replace("_", "-"),
             stop_token=stop_token,
         )
@@ -665,6 +745,7 @@ class ModalBackend(ComputeBackend):
             dashboard_fn=dashboard_fn,
             progress_fn=progress_fn,
             stop_fn=stop_fn,
+            stop_token=stop_token,
         )
 
     @staticmethod

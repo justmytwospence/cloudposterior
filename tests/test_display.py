@@ -78,6 +78,18 @@ def test_notebook_display_updates_widget_html(monkeypatch):
     assert "<table" in d._widget.html  # trait was set
 
 
+def test_notebook_display_stop_button(monkeypatch):
+    pytest.importorskip("anywidget")
+    monkeypatch.setattr(display.NotebookDisplay, "_mount", lambda self: None)
+    d = display.NotebookDisplay("test", stop_url="https://x.modal.run", stop_token="tok")
+    assert d._widget.stop_url == "https://x.modal.run"
+    assert d._widget.stop_token == "tok"
+    assert "Stop sampling" in display._PROGRESS_ESM  # button rendered by the ESM
+    # No stop URL -> traits empty (button stays hidden in the frontend).
+    d2 = display.NotebookDisplay("test")
+    assert d2._widget.stop_url == ""
+
+
 def test_notebook_display_render_degrades_when_trait_set_raises(monkeypatch):
     pytest.importorskip("anywidget")
     monkeypatch.setattr(display.NotebookDisplay, "_mount", lambda self: None)

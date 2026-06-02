@@ -162,12 +162,36 @@ def _phase_html(phases: list[tuple[str, str, str]]) -> str:
 # anywidget ES module: mirror the Python-composed HTML into the cell. State
 # flows over the Jupyter Comm protocol, which both Jupyter and marimo flush to
 # the frontend immediately (mid-cell), so the table animates live during a
-# blocking pm.sample() call.
+# blocking pm.sample() call. A persistent Stop button (shown only when a
+# stop_url is set) POSTs to the worker's /stop endpoint from the browser -- no
+# Python round-trip, so it works even though the kernel is blocked streaming.
 _PROGRESS_ESM = """
 function render({ model, el }) {
-  const update = () => { el.innerHTML = model.get("html"); };
-  update();
-  model.on("change:html", update);
+  const content = document.createElement("div");
+  const btn = document.createElement("button");
+  btn.textContent = "Stop sampling";
+  btn.style.cssText = "margin:4px 0;padding:4px 12px;font:13px monospace;cursor:pointer;" +
+    "background:#d9534f;color:#fff;border:none;border-radius:3px;";
+  let stopped = false;
+  btn.addEventListener("click", async () => {
+    if (stopped) return;
+    stopped = true;
+    btn.textContent = "Stopping...";
+    btn.disabled = true;
+    btn.style.opacity = "0.6";
+    const url = model.get("stop_url");
+    const token = model.get("stop_token");
+    try {
+      await fetch(url + (token ? ("?token=" + encodeURIComponent(token)) : ""), {method: "POST"});
+    } catch (e) {}
+  });
+  const syncHtml = () => { content.innerHTML = model.get("html"); };
+  const syncBtn = () => { btn.style.display = model.get("stop_url") ? "inline-block" : "none"; };
+  syncHtml(); syncBtn();
+  model.on("change:html", syncHtml);
+  model.on("change:stop_url", syncBtn);
+  el.appendChild(content);
+  el.appendChild(btn);
 }
 export default { render };
 """
@@ -186,6 +210,8 @@ def _progress_widget_class():
         class _CPProgressWidget(anywidget.AnyWidget):
             _esm = _PROGRESS_ESM
             html = traitlets.Unicode("").tag(sync=True)
+            stop_url = traitlets.Unicode("").tag(sync=True)
+            stop_token = traitlets.Unicode("").tag(sync=True)
 
         _progress_widget_cls = _CPProgressWidget
     return _progress_widget_cls
@@ -199,13 +225,18 @@ class NotebookDisplay:
     change. Works identically in Jupyter and marimo.
     """
 
-    def __init__(self, instance_desc: str = ""):
+    def __init__(self, instance_desc: str = "", *,
+                 stop_url: str | None = None, stop_token: str | None = None):
         self._instance_desc = instance_desc
         self._phases: list[tuple[str, str, str]] = []
         self._active_phase: str | None = None
         self._sampling: SamplingProgress | None = None
 
         self._widget = _progress_widget_class()()
+        # Setting stop_url before mount makes the Stop button appear in the
+        # initial render (remote runs only; empty string => button hidden).
+        self._widget.stop_url = stop_url or ""
+        self._widget.stop_token = stop_token or ""
         self._mount()
         self._render()
 

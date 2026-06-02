@@ -116,6 +116,9 @@ class cloud:
             self._model_bytes, self.model, manifest, config,
             project=self.project, idle_timeout=config.idle_timeout,
             dashboard=self.dashboard,
+            # Provision the /stop endpoint for the in-notebook stop button even
+            # when the full dashboard is off (any remote run with a progress UI).
+            stop_enabled=self.progress,
         )
         # Stash the resolved config so the displayed instance_desc matches
         # what was actually provisioned (no recomputation drift).
@@ -461,7 +464,8 @@ def _parse_notify(notify) -> tuple[str | None, str | None]:
 
 
 def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
-                 instance_desc: str, model=None, dashboard_dict=None) -> list:
+                 instance_desc: str, model=None, dashboard_dict=None,
+                 stop_url: str | None = None, stop_token: str | None = None) -> list:
     """Create display, dashboard, and notification sinks."""
     sinks = []
 
@@ -474,7 +478,7 @@ def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
         )
 
         if _is_marimo() or _is_notebook():
-            display = NotebookDisplay(instance_desc)
+            display = NotebookDisplay(instance_desc, stop_url=stop_url, stop_token=stop_token)
         else:
             display = TerminalDisplay(instance_desc)
             display.start()
@@ -663,6 +667,11 @@ def _run_sample_persistent(
     config = env.config
     instance_desc = f"Modal ({config.describe()})"
 
+    # Start the app early when control infra (dashboard or stop button) exists,
+    # so the stop/dashboard URLs are captured before we build the display.
+    if env._stop_fn is not None or (dashboard and env._dashboard_fn is not None):
+        env._ensure_running()
+
     sinks = _build_sinks(
         progress=progress,
         dashboard=dashboard,
@@ -670,11 +679,12 @@ def _run_sample_persistent(
         instance_desc=instance_desc,
         model=model,
         dashboard_dict=getattr(env, "_dashboard_dict", None),
+        stop_url=getattr(env, "_stop_url", None),
+        stop_token=getattr(env, "_stop_token", None),
     )
 
-    # Start the app early if dashboard is requested, so we can show the URL
+    # Show the dashboard URL if requested
     if dashboard and env._dashboard_fn is not None:
-        env._ensure_running()
         dashboard_url = env._dashboard_url
         if dashboard_url:
             # Ensure URL ends with / so the ASGI app serves from root
@@ -809,11 +819,20 @@ def _run_local(
             for snapshot in aggregator.snapshots():
                 emit(snapshot)
 
-        # NOTE: in marimo, this background thread has no runtime context, so the
-        # notebook widget's trait writes no-op and local progress shows only the
-        # final frame (remote sampling emits on the main thread and animates
-        # live). Swap to marimo.Thread here if local-marimo liveness is wanted.
-        progress_thread = Thread(target=stream_progress, daemon=True)
+        # A plain threading.Thread has no marimo runtime context, so the
+        # widget's trait writes would no-op there; marimo.Thread propagates the
+        # context so local progress animates live. (Remote sampling emits on the
+        # main thread, so it's unaffected.) Fall back to threading.Thread
+        # elsewhere (Jupyter/terminal).
+        from cloudposterior.display import _is_marimo
+
+        if _is_marimo():
+            import marimo
+
+            thread_cls = marimo.Thread
+        else:
+            thread_cls = Thread
+        progress_thread = thread_cls(target=stream_progress, daemon=True)
         progress_thread.start()
 
         with model:

@@ -81,7 +81,12 @@ class DashboardSink:
                 }
             if hasattr(self, "_traces") and self._traces:
                 data["traces"] = self._traces
-            self._dict["progress"] = data
+            # Off the event loop: this per-event blocking Dict write would warn
+            # and stall the loop in async hosts (marimo). _run_blocking runs it
+            # in a worker thread when a loop is active.
+            from cloudposterior.backends.modal_backend import _run_blocking
+
+            _run_blocking(self._dict.__setitem__, "progress", data)
         except Exception:
             pass  # best-effort
 
