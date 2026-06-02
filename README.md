@@ -153,7 +153,7 @@ Both Jupyter notebooks and terminals show real-time, in-place progress for every
 4. MCMC sampling -- per-chain progress bars, divergences, step size, grad evals, speed, ETA
 5. Result download
 
-Notebooks get a live anywidget display that animates in-cell in both Jupyter and marimo. Terminals get a Rich TUI. Progress bars turn red when chains diverge, just like PyMC's native display.
+Notebooks get a live anywidget display that animates in-cell in both Jupyter and marimo. Terminals get a Rich TUI. Progress bars turn red when chains diverge, just like PyMC's native display. During a remote run a **Stop** button appears in the cell -- click it to abort early and keep the partial trace.
 
 ### Samplers
 
@@ -170,6 +170,34 @@ Live per-chain progress, convergence diagnostics (rank-normalized R-hat and ESS)
 
 Works with both **PyMC 5 and PyMC 6** (PyMC 6 ships arviz 1.x's DataTree); the versions installed in the remote container are matched to your local environment.
 
+### Adaptive sampling
+
+Stop as soon as the chains converge instead of guessing a draw count -- `draws` becomes the cap:
+
+```python
+with cp.cloud(model, remote=True, until={"r_hat": 1.01, "ess": 400}):
+    idata = pm.sample(draws=20000)   # stops early once every parameter clears the target
+```
+
+`until=True` uses the Vehtari (2021) defaults shown above. Works with **nutpie** and **pymc** (the samplers with a per-draw hook).
+
+### Parallel fitting
+
+Fit many models at once on a single warm container -- ideal for model comparison and prior sensitivity:
+
+```python
+import arviz as az
+
+idatas = cp.map([pooled, hierarchical, per_county], {"draws": 1000})
+az.compare(dict(zip(["pooled", "hier", "county"], idatas)))
+```
+
+`sample_kwargs` is a shared dict or a list aligned with the models. Results return in input order. See [examples/parallelism.ipynb](examples/parallelism.ipynb).
+
+### Predictive checks
+
+`pm.sample_prior_predictive()` and `pm.sample_posterior_predictive()` are intercepted too, so prior/posterior predictive checks run on the same cloud container.
+
 ---
 
 ## Composable features
@@ -180,6 +208,7 @@ Works with both **PyMC 5 and PyMC 6** (PyMC 6 ships arviz 1.x's DataTree); the v
 | Cloud execution | off | `remote=True` / `False` |
 | Live dashboard | **on** (when remote) | `dashboard=True` / `False` |
 | Push notifications | off | `notify=True` / `"topic"` / `{"server": ..., "topic": ...}` |
+| Adaptive early-stop | off | `until=True` / `{"r_hat": ..., "ess": ...}` (remote) |
 
 Mix and match:
 
@@ -276,6 +305,7 @@ Clone and run locally (Jupyter or marimo) for the full live progress display.
 - [examples/basics.ipynb](examples/basics.ipynb) -- cloud execution and GPU acceleration with the Minnesota Radon dataset
 - [examples/caching.ipynb](examples/caching.ipynb) -- local and disk caching, model iteration
 - [examples/monitoring.ipynb](examples/monitoring.ipynb) -- live dashboard and push notifications
+- [examples/parallelism.ipynb](examples/parallelism.ipynb) -- fit many models in parallel with `cp.map` and compare them with LOO
 
 ---
 
