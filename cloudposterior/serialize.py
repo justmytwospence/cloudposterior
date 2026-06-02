@@ -32,6 +32,7 @@ def get_version_manifest() -> dict[str, str]:
         "scipy",
         "cloudpickle",
         "arviz",
+        "numba",
     ]
     manifest = {"python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"}
     for pkg in packages:
@@ -81,3 +82,8 @@ def create_payload(
 def payload_size_mb(payload: SamplingPayload) -> float:
     """Total payload size in MB."""
     return len(payload.model_bytes) / (1024 * 1024)
+
+
+# The attr sanitizer lives in cloudposterior._idata alongside the other
+# arviz 0.x / 1.x compatibility shims; re-exported here for existing callers.
+from cloudposterior._idata import sanitize_inference_data  # noqa: E402,F401

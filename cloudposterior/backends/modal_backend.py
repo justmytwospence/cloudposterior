@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import contextlib
-import io
 import tempfile
-import time
-from contextlib import nullcontext as _nullcontext
 from typing import Iterator
 
 import msgpack
 
+from cloudposterior._idata import load_all
 from cloudposterior.backends import ComputeBackend, RemoteEnvironment, SamplingJob
 from cloudposterior.config import DEFAULT_PACKAGES, OPTIONAL_PACKAGES, RemoteConfig
 from cloudposterior.progress import (
@@ -66,6 +64,14 @@ def _build_pip_specs(
     for key, pip_name in OPTIONAL_PACKAGES.items():
         if key in manifest:
             specs.append(f"{pip_name}=={manifest[key]}")
+
+    # nutpie is the default sampler -- install it on every CPU image so the
+    # default works even if the user doesn't have nutpie locally. It is NOT
+    # pinned to the local version: nutpie recompiles the model remotely, so only
+    # the model pickle (pymc/pytensor/numpy) must version-match. The >=0.13 floor
+    # guarantees the progress_callback API used for live monitoring.
+    if not gpu:
+        specs.append("nutpie>=0.13")
 
     # GPU containers: always install numpyro + jax[cuda12] since GPU
     # is only useful for JAX-based samplers. This ensures the container
@@ -139,7 +145,6 @@ class ModalSamplingJob(SamplingJob):
 
     def stream_progress(self, output_widget=None) -> Iterator[ProgressEvent]:
         """Submit to Modal and yield progress events."""
-        import modal
 
         app, remote_sample = _create_modal_app(
             self._payload.version_manifest,
@@ -154,26 +159,12 @@ class ModalSamplingJob(SamplingJob):
         except Exception as exc:
             raise _handle_modal_error(exc)
         with run_ctx:
-                gen = remote_sample.remote_gen(
-                    self._payload.model_bytes,
-                    self._payload.sample_kwargs,
-                    self._nuts_sampler,
-                )
-
-                for chunk in gen:
-                    try:
-                        unpacker = msgpack.Unpacker(raw=False)
-                        unpacker.feed(chunk)
-                        for decoded in unpacker:
-                            event = _decode_progress_event(decoded)
-                            if event is not None:
-                                self._events.append(event)
-                                yield event
-                            elif decoded.get("type") == "result":
-                                pass
-                    except Exception:
-                        self._idata_bytes = chunk
-                        continue
+            gen = remote_sample.remote_gen(
+                self._payload.model_bytes,
+                self._payload.sample_kwargs,
+                self._nuts_sampler,
+            )
+            self._idata_bytes = yield from _stream_events(gen, self._events)
 
     def result(self):
         """Return the InferenceData. Must call stream_progress first."""
@@ -198,8 +189,7 @@ class ModalSamplingJob(SamplingJob):
         try:
             # Load every group eagerly into memory so the temp file can be deleted
             idata = az.from_netcdf(tmp_path)
-            for group in idata.groups():
-                getattr(idata, group).load()
+            load_all(idata)
             return idata
         finally:
             os.unlink(tmp_path)
@@ -258,6 +248,44 @@ def _decode_progress_event(data: dict) -> ProgressEvent | None:
     return None
 
 
+def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
+    """Decode a worker generator into ProgressEvents and return the compressed
+    InferenceData bytes.
+
+    The worker yields msgpack progress events, then a ``{"type": "result"}``
+    sentinel, then one raw (non-msgpack) chunk of lz4-compressed NetCDF. We use
+    the sentinel as the primary signal for the result chunk (so a genuine decode
+    error is not silently mistaken for the result), with a non-msgpack chunk as a
+    defensive fallback. A sampling failure in the worker re-raises here.
+    """
+    idata_bytes = None
+    expecting_result = False
+    for chunk in gen:
+        if expecting_result:
+            idata_bytes = chunk
+            expecting_result = False
+            continue
+        try:
+            unpacker = msgpack.Unpacker(raw=False)
+            unpacker.feed(chunk)
+            decoded_any = False
+            for decoded in unpacker:
+                decoded_any = True
+                if isinstance(decoded, dict) and decoded.get("type") == "result":
+                    expecting_result = True
+                    continue
+                event = _decode_progress_event(decoded)
+                if event is not None:
+                    events_list.append(event)
+                    yield event
+            if not decoded_any:
+                idata_bytes = chunk
+        except Exception:
+            # Non-msgpack chunk: the compressed InferenceData bytes.
+            idata_bytes = chunk
+    return idata_bytes
+
+
 def _build_image(manifest: dict[str, str], gpu: str | None = None):
     """Build a Modal image with packages matching the version manifest."""
     import modal
@@ -279,6 +307,7 @@ def _create_persistent_app(
     volume,
     dashboard_dict_name: str | None = None,
     model_label: str = "model",
+    stop_token: str | None = None,
 ):
     """Create a Modal app with a class-based sampler and mounted Volume.
 
@@ -325,6 +354,7 @@ def _create_persistent_app(
         _progress_label = f"{model_label}-{_uid}-progress"
         _stop_label = f"{model_label}-{_uid}-stop"
         _dash_label = f"{model_label}-{_uid}"
+        _stop_token = stop_token or ""
 
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="GET", label=_dash_label)
@@ -335,6 +365,7 @@ def _create_persistent_app(
                 progress_label=_progress_label,
                 stop_label=_stop_label,
                 dashboard_label=_dash_label,
+                stop_token=_stop_token,
             ))
 
         @app.function(serialized=True, image=image)
@@ -351,9 +382,13 @@ def _create_persistent_app(
 
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="POST", label=f"{model_label}-{_uid}-stop")
-        def serve_stop():
+        def serve_stop(token: str = ""):
             from fastapi.responses import JSONResponse
             import modal as _modal
+            # Require the token baked into the dashboard page so a random caller
+            # who guesses the (short) stop URL can't kill someone's sampling run.
+            if _stop_token and token != _stop_token:
+                return JSONResponse({"stopped": False, "error": "invalid token"}, status_code=403)
             try:
                 d = _modal.Dict.from_name(_dict_name)
                 d["stop"] = True
@@ -395,23 +430,7 @@ class PersistentModalSamplingJob(SamplingJob):
             self._nuts_sampler,
             stop_dict_name=self._stop_dict_name,
         )
-
-        for chunk in gen:
-            # Try to decode as msgpack (may contain multiple objects)
-            try:
-                unpacker = msgpack.Unpacker(raw=False)
-                unpacker.feed(chunk)
-                for decoded in unpacker:
-                    event = _decode_progress_event(decoded)
-                    if event is not None:
-                        self._events.append(event)
-                        yield event
-                    elif decoded.get("type") == "result":
-                        pass
-            except Exception:
-                # Non-msgpack chunk = compressed InferenceData bytes
-                self._idata_bytes = chunk
-                continue
+        self._idata_bytes = yield from _stream_events(gen, self._events)
 
     def result(self):
         import arviz as az
@@ -432,8 +451,7 @@ class PersistentModalSamplingJob(SamplingJob):
             tmp_path = tmp.name
         try:
             idata = az.from_netcdf(tmp_path)
-            for group in idata.groups():
-                getattr(idata, group).load()
+            load_all(idata)
             return idata
         finally:
             os.unlink(tmp_path)
@@ -628,14 +646,17 @@ class ModalBackend(ComputeBackend):
         # Create dashboard Dict if requested
         dashboard_dict = None
         dashboard_dict_name = None
+        stop_token = None
         if dashboard:
             dashboard_dict_name = f"cp-dash-{uuid.uuid4().hex[:8]}"
             dashboard_dict = modal.Dict.from_name(dashboard_dict_name, create_if_missing=True)
+            stop_token = uuid.uuid4().hex  # secret, baked into the dashboard page only
 
         app, sampler_cls, dashboard_fn, progress_fn, stop_fn = _create_persistent_app(
             version_manifest, config, volume,
             dashboard_dict_name=dashboard_dict_name,
             model_label=m_slug.replace("_", "-"),
+            stop_token=stop_token,
         )
         return ModalEnvironment(
             app, sampler_cls, volume, project, m_slug,

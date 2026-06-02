@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from queue import Queue
-from threading import Thread
 from typing import Iterator
 
 

@@ -87,16 +87,19 @@ class DashboardSink:
 
 
 def render_dashboard_html(progress_label: str = "", stop_label: str = "",
-                          dashboard_label: str = "") -> str:
+                          dashboard_label: str = "", stop_token: str = "") -> str:
     """Render dashboard HTML with endpoint labels baked in.
 
     The JS constructs full URLs from the labels by deriving the Modal
-    workspace URL pattern from window.location.
+    workspace URL pattern from window.location. ``stop_token`` is a secret sent
+    with the stop request so a random caller who guesses the stop URL can't kill
+    the run.
     """
     return (DASHBOARD_HTML
         .replace("__PROGRESS_LABEL__", progress_label)
         .replace("__STOP_LABEL__", stop_label)
         .replace("__DASHBOARD_LABEL__", dashboard_label)
+        .replace("__STOP_TOKEN__", stop_token)
     )
 
 
@@ -216,6 +219,7 @@ const stopBtn = document.getElementById('stopBtn');
 const dashLabel = '__DASHBOARD_LABEL__';
 const progLabel = '__PROGRESS_LABEL__';
 const stopLabel = '__STOP_LABEL__';
+const stopToken = '__STOP_TOKEN__';
 const origin = window.location.origin; // https://workspace--dash-label-env.modal.run
 const progressUrl = origin.replace(dashLabel, progLabel);
 const stopUrl = origin.replace(dashLabel, stopLabel);
@@ -227,7 +231,7 @@ document.getElementById('confirmYes').addEventListener('click', async () => {
   stopRequested = true;
   stopBtn.textContent = 'Stopping...';
   stopBtn.disabled = true;
-  try { await fetch(stopUrl, {method: 'POST'}); } catch (e) {}
+  try { await fetch(stopUrl + (stopToken ? ('?token=' + encodeURIComponent(stopToken)) : ''), {method: 'POST'}); } catch (e) {}
 });
 stopBtn.addEventListener('click', (e) => {
   e.preventDefault();

@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Any
 
 import requests
 
 from cloudposterior.progress import (
-    ChainProgress,
     JobPhase,
     PhaseUpdate,
     SamplingProgress,

@@ -20,6 +20,19 @@ Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`) hit real Modal inf
 
 CI runs pytest on Python 3.11 and 3.12 (free tests only -- Modal tests are not in CI).
 
+## Example notebooks
+
+Each example in `examples/` exists in two formats that must be kept in sync:
+
+- `*.ipynb` -- the Jupyter version. This is the artifact GitHub renders (with embedded outputs), so it is what users see in the repo.
+- `*.py` -- the marimo version (`uv run marimo edit examples/<name>.py`). This is the source you edit and pair on.
+
+**Sync rule: whenever you change one format, update the other in the same change.** They are equivalent notebooks, not independent files -- an edit to a marimo `.py` cell must be mirrored into the matching `.ipynb`, and vice versa.
+
+- marimo `.py` -> `.ipynb`: `uv run marimo export ipynb examples/<name>.py -o examples/<name>.ipynb`. Add `--include-outputs` to refresh the rendered outputs, but note it re-executes the notebook (real Modal sampling, so cost + time -- only do this deliberately).
+- `.ipynb` -> marimo `.py`: `uvx marimo convert examples/<name>.ipynb -o examples/<name>.py`, then re-apply the marimo cleanups (drop trailing `;` output-suppression, make each cell's final expression the value to render). Do NOT add a PEP 723 script-metadata block -- `cloudposterior` is a local editable install and would fail to resolve from PyPI; these run in the project venv.
+- After editing either format, run `uv run marimo check examples/<name>.py` before committing.
+
 ## Architecture
 
 ### Request flow
@@ -70,7 +83,17 @@ When `notify=True` and `remote=True`, defaults to dashboard. When local, default
 
 ### Remote worker
 
-`remote/worker.py` runs inside Modal containers. It is never imported locally -- Modal serializes and executes it. It deserializes the model, runs sampling with a progress callback that streams per-chain stats via a queue, and returns lz4-compressed NetCDF.
+`remote/worker.py` runs inside Modal containers. It is never imported locally -- Modal serializes and executes it. It deserializes the model, runs sampling while streaming per-chain stats via a queue, and returns lz4-compressed NetCDF. `_sample_and_stream` branches three ways by sampler:
+
+- **`pymc`**: `pm.sample(nuts_sampler="pymc", callback=...)` -- the per-draw callback fills the progress queue. The `nuts_sampler="pymc"` is explicit so PyMC 6 doesn't auto-select nutpie (which would reject the callback).
+- **`nutpie`** (the default): runs nutpie's background sampler (`blocking=False`) with its native `progress_callback`; the generator loop polls the stop Dict and calls `handle.abort()` to stop early (keeping the partial trace), then `handle.wait()` for the final result.
+- **`numpyro`/`blackjax`**: `pm.sample(nuts_sampler=..., progressbar=False)` with **no callback** -- PyMC's external NUTS samplers run inside JAX with no per-draw hook (and PyMC 6 raises if a callback is passed). These report phase-level progress only.
+
+### Samplers and arviz compatibility
+
+- **Default sampler**: `api._default_sampler()` picks nutpie for fully continuous models (PyMC's own default, ~2x faster) and the pymc sampler when there are discrete free RVs; locally it falls back to pymc when nutpie isn't installed. nutpie is always installed in CPU remote images (`_build_pip_specs`).
+- **Callback constraint**: PyMC's per-draw `callback` only fires for `nuts_sampler="pymc"`; PyMC 6 *raises* if a callback is passed to an external sampler. Only attach a callback on the pymc path (worker + `_run_local`).
+- **`_idata.py`**: thin shims so the codebase works on **both arviz 0.x (PyMC 5) and arviz 1.x (PyMC 6, DataTree)** -- `.groups()` vs `.groups`, removed `convert_to_inference_data`, changed `ess(method="tail")`, and the dict-valued `sample_stats` attr nutpie writes (`sanitize_inference_data`). Always go through these helpers instead of calling arviz idata methods directly.
 
 ### Auto-sizing
 

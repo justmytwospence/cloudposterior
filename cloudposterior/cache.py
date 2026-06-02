@@ -89,17 +89,21 @@ class DiskCache:
     def load(self, key: str, sample_kwargs: dict | None = None):
         import arviz as az
 
+        from cloudposterior._idata import load_all
+
         path = self._path(key, sample_kwargs=sample_kwargs)
         if path.exists():
             idata = az.from_netcdf(str(path))
-            for group in idata.groups():
-                getattr(idata, group).load()
+            load_all(idata)
             return idata
         return None
 
     def save(self, key: str, idata, sample_kwargs: dict | None = None) -> None:
+        from cloudposterior.serialize import sanitize_inference_data
+
         path = self._path(key, sample_kwargs=sample_kwargs)
         path.parent.mkdir(parents=True, exist_ok=True)
+        sanitize_inference_data(idata)
         idata.to_netcdf(str(path))
 
 

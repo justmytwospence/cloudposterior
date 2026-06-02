@@ -142,13 +142,18 @@ class cloud:
         ctx = self
 
         def intercepted_sample(**kwargs):
-            nuts_sampler = kwargs.pop("nuts_sampler", "pymc")
+            _validate_sample_kwargs(kwargs)
+            nuts_sampler = kwargs.pop("nuts_sampler", None)
+            if nuts_sampler is None:
+                nuts_sampler = _default_sampler(ctx.model, local=not ctx.remote)
 
             # Lazy first-touch serialization: pay the cloudpickle cost only
             # when we actually need it. Memoize on the model so repeat calls
             # in the same session don't re-serialize.
             if ctx._model_bytes is None:
                 ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            else:
+                _warn_if_model_data_changed(ctx)
 
             if ctx.remote and ctx._env is None:
                 # First sample call -- provision sized to these kwargs.
@@ -197,7 +202,96 @@ def _ensure_model_bytes(model) -> bytes:
 
     if not hasattr(model, "_cp_model_bytes"):
         model._cp_model_bytes = serialize_model(model)
+        model._cp_data_fp = _observed_data_fingerprint(model)
     return model._cp_model_bytes
+
+
+def _has_discrete_free_rvs(model) -> bool:
+    """True if any free RV is discrete (int/bool), which nutpie/JAX NUTS can't handle."""
+    try:
+        for rv in model.free_RVs:
+            if str(getattr(rv, "dtype", "") or "").startswith(("int", "uint", "bool")):
+                return True
+    except Exception:
+        return True  # be conservative -- the pymc sampler handles anything
+    return False
+
+
+def _nutpie_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("nutpie") is not None
+
+
+def _default_sampler(model, *, local: bool) -> str:
+    """Resolve the default NUTS sampler.
+
+    nutpie is PyMC 6's own default and ~2x faster on CPU, so prefer it for
+    fully-continuous models. Fall back to the pymc sampler for models with
+    discrete variables, and -- for local runs only -- when nutpie isn't
+    installed (remote images always ship nutpie).
+    """
+    if _has_discrete_free_rvs(model):
+        return "pymc"
+    if local and not _nutpie_available():
+        return "pymc"
+    return "nutpie"
+
+
+_CORE_INT_KWARGS = ("draws", "tune", "chains", "cores")
+
+
+def _validate_sample_kwargs(kwargs: dict) -> None:
+    """Catch the common typo class early: the core sampling counts must be
+    positive ints. Everything else passes through to pm.sample unchanged.
+    """
+    for key in _CORE_INT_KWARGS:
+        if key in kwargs and kwargs[key] is not None:
+            val = kwargs[key]
+            if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+                raise TypeError(f"{key} must be a positive int, got {val!r}")
+
+
+def _observed_data_fingerprint(model):
+    """Best-effort fingerprint of the model's mutable (``pm.Data``) arrays.
+
+    The model is cloudpickled once on the first ``pm.sample`` call; if the user
+    mutates observed data (e.g. ``pm.set_data``) mid-block, the stale bytes are
+    reused. This lets us warn instead of silently returning the wrong cache hit.
+    """
+    try:
+        import numpy as np
+        from pytensor.compile.sharedvalue import SharedVariable
+
+        fp = 0
+        for var in model.named_vars.values():
+            if isinstance(var, SharedVariable):
+                try:
+                    arr = np.asarray(var.get_value(borrow=True))
+                    fp ^= hash((var.name, arr.shape, str(arr.dtype), float(np.asarray(arr, dtype="float64").sum())))
+                except Exception:
+                    continue
+        return fp
+    except Exception:
+        return None
+
+
+def _warn_if_model_data_changed(ctx) -> None:
+    """Warn if the model's mutable data changed after the model was serialized."""
+    stored = getattr(ctx.model, "_cp_data_fp", None)
+    if stored is None:
+        return
+    current = _observed_data_fingerprint(ctx.model)
+    if current is not None and current != stored:
+        import warnings
+
+        warnings.warn(
+            "The model's observed/mutable data changed after the first pm.sample() "
+            "call in this cp.cloud(...) block. The model is serialized once per block, "
+            "so this change is ignored remotely and the cache key is unchanged. Start a "
+            "new cp.cloud(...) block to sample the updated data.",
+            stacklevel=3,
+        )
 
 
 def _warn_if_resize_drift(ctx, nuts_sampler: str, sample_kwargs: dict) -> None:
@@ -324,6 +418,7 @@ def _run_sample(
             original_sample=original_sample,
             sinks=sinks,
             emit=emit,
+            nuts_sampler=nuts_sampler,
             **sample_kwargs,
         )
 
@@ -410,7 +505,7 @@ def _show_link(url: str, label: str = "Link", show_qr: bool = False):
         from IPython.display import display as ipy_display, HTML
 
         parts = [
-            f'<div style="font-family:monospace;font-size:12px;padding:4px 0;">',
+            '<div style="font-family:monospace;font-size:12px;padding:4px 0;">',
             f'{label}: <a href="{url}" target="_blank">{url}</a>',
         ]
         if show_qr:
@@ -668,6 +763,7 @@ def _run_local(
     original_sample,
     sinks: list,
     emit,
+    nuts_sampler: str = "pymc",
     **sample_kwargs,
 ) -> az.InferenceData:
     """Run sampling locally using the original pm.sample."""
@@ -685,8 +781,12 @@ def _run_local(
 
     sample_start = time.time()
 
-    # If we have sinks (notifications), inject a progress callback
-    if sinks:
+    sampler_kwargs = {"nuts_sampler": nuts_sampler} if nuts_sampler else {}
+
+    # PyMC's per-draw callback only fires for the pymc sampler; external samplers
+    # (nutpie/numpyro/blackjax) raise if a callback is passed (PyMC 6), so only
+    # attach it when the resolved sampler is "pymc".
+    if sinks and nuts_sampler == "pymc":
         tune = sample_kwargs.get("tune", 1000)
         draws = sample_kwargs.get("draws", 1000)
         progress_queue: Queue = Queue()
@@ -703,6 +803,7 @@ def _run_local(
         with model:
             idata = original_sample(
                 callback=callback,
+                **sampler_kwargs,
                 **sample_kwargs,
             )
 
@@ -710,7 +811,7 @@ def _run_local(
         progress_thread.join(timeout=2)
     else:
         with model:
-            idata = original_sample(**sample_kwargs)
+            idata = original_sample(**sampler_kwargs, **sample_kwargs)
 
     emit(PhaseUpdate(
         phase=JobPhase.SAMPLING,
@@ -719,7 +820,9 @@ def _run_local(
         elapsed=time.time() - sample_start,
     ))
 
-    return idata
+    from cloudposterior.serialize import sanitize_inference_data
+
+    return sanitize_inference_data(idata)
 
 
 # -- Explicit API (backwards-compatible) --
@@ -731,7 +834,7 @@ def sample(
     tune: int = 1000,
     chains: int | None = None,
     cores: int | None = None,
-    nuts_sampler: str = "pymc",
+    nuts_sampler: str | None = None,
     instance: str | None = None,
     progress: bool = True,
     cache: bool = True,
@@ -745,6 +848,9 @@ def sample(
     kwargs after the first call.
     """
     import pymc as pm
+
+    if nuts_sampler is None:
+        nuts_sampler = _default_sampler(model, local=False)
 
     return _run_sample(
         model=model,

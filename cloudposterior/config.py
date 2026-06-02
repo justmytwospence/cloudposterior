@@ -38,7 +38,10 @@ class RemoteConfig:
             }
             if instance in presets:
                 return presets[instance]
-            return cls()
+            raise ValueError(
+                f"unknown instance preset {instance!r}; choose one of "
+                f"{sorted(presets)}, or omit instance to auto-size from the model"
+            )
 
         # Auto-size from model + sampling config
         if model is not None and sample_kwargs is not None:
@@ -134,7 +137,10 @@ DEFAULT_PACKAGES = [
     "fastapi[standard]",
 ]
 
+# numpyro is installed on demand (GPU images, or nuts_sampler="numpyro"/"blackjax").
+# nutpie is installed unconditionally for CPU images (see _build_pip_specs) since it
+# is the default sampler -- it is not pinned to the local version because the model is
+# recompiled remotely, so only the model pickle (pymc/pytensor/numpy) must version-match.
 OPTIONAL_PACKAGES = {
-    "nutpie": "nutpie",
     "numpyro": "numpyro",
 }

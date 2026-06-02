@@ -54,6 +54,33 @@ def payload_hash(model_bytes: bytes) -> str:
     return hashlib.sha256(model_bytes).hexdigest()[:16]
 
 
+def _kwarg_token(v) -> str:
+    """Deterministic string for a sample kwarg value.
+
+    ``str(v)`` is unstable for numpy arrays (whitespace/truncation) and random
+    Generators (object id in the repr), which would scramble the cache key.
+    Arrays hash by their bytes; rng objects collapse to a constant (pass an int
+    ``random_seed`` if you need different seeds to cache separately).
+    """
+    try:
+        import numpy as np
+
+        if isinstance(v, np.ndarray):
+            digest = hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest()[:16]
+            return f"ndarray:{v.shape}:{v.dtype}:{digest}"
+        if isinstance(v, (np.random.Generator, np.random.RandomState)):
+            return "rng"
+        if isinstance(v, np.generic):
+            return repr(v.item())
+    except Exception:
+        pass
+    if isinstance(v, (list, tuple)):
+        return "[" + ",".join(_kwarg_token(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ",".join(f"{k}:{_kwarg_token(val)}" for k, val in sorted(v.items())) + "}"
+    return repr(v)
+
+
 def cache_key(model_bytes: bytes, sample_kwargs: dict) -> str:
     """Full SHA-256 of model + sampling config.
 
@@ -63,5 +90,6 @@ def cache_key(model_bytes: bytes, sample_kwargs: dict) -> str:
     h = hashlib.sha256()
     h.update(model_bytes)
     for k, v in sorted(sample_kwargs.items()):
-        h.update(f"{k}={v}".encode())
+        h.update(f"{k}=".encode())
+        h.update(_kwarg_token(v).encode())
     return h.hexdigest()

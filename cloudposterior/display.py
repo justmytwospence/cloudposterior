@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import time
 from typing import Iterator
 
 from cloudposterior.progress import (
-    ChainProgress,
-    JobPhase,
     PhaseUpdate,
     ProgressEvent,
     SamplingProgress,
@@ -199,12 +196,8 @@ class TerminalDisplay:
     """Rich-based TUI display for terminal."""
 
     def __init__(self, instance_desc: str = ""):
-        from rich.console import Console, Group
+        from rich.console import Console
         from rich.live import Live
-        from rich.panel import Panel
-        from rich.style import Style
-        from rich.table import Table
-        from rich.text import Text
 
         self._console = Console()
         self._instance_desc = instance_desc

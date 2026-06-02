@@ -155,6 +155,21 @@ Both Jupyter notebooks and terminals show real-time, in-place progress for every
 
 Notebooks get an ipywidgets GUI. Terminals get a Rich TUI. Progress bars turn red when chains diverge, just like PyMC's native display.
 
+### Samplers
+
+cloudposterior defaults to **nutpie** -- PyMC's recommended NUTS sampler, roughly 2x faster on CPU -- for fully continuous models, and falls back to PyMC's built-in sampler for models with discrete variables. Override per call:
+
+```python
+with cp.cloud(model, remote=True):
+    idata = pm.sample()                         # nutpie (default for continuous models)
+    idata = pm.sample(nuts_sampler="pymc")      # PyMC's sampler (handles discrete vars)
+    idata = pm.sample(nuts_sampler="numpyro")   # JAX sampler (GPU auto-provisioned)
+```
+
+Live per-chain progress, convergence diagnostics (rank-normalized R-hat and ESS), and the stop button work with **nutpie** and **pymc**. JAX samplers (`numpyro`, `blackjax`) run entirely inside a compiled graph with no per-draw hook, so they report phase-level progress only.
+
+Works with both **PyMC 5 and PyMC 6** (PyMC 6 ships arviz 1.x's DataTree); the versions installed in the remote container are matched to your local environment.
+
 ---
 
 ## Composable features
