@@ -778,6 +778,16 @@ def _run_sample_persistent(
     if env._stop_fn is not None or (dashboard and env._dashboard_fn is not None):
         env._ensure_running()
 
+    # Show the dashboard URL *above* the live display, so it stays put as the
+    # progress widget grows (phase steps + chain rows get added below it).
+    if dashboard and env._dashboard_fn is not None:
+        dashboard_url = env._dashboard_url
+        if dashboard_url:
+            # Ensure URL ends with / so the ASGI app serves from root
+            if not dashboard_url.endswith("/"):
+                dashboard_url += "/"
+            _show_link(dashboard_url, label="Dashboard", show_qr=True)
+
     sinks = _build_sinks(
         progress=progress,
         dashboard=dashboard,
@@ -788,15 +798,6 @@ def _run_sample_persistent(
         stop_url=getattr(env, "_stop_url", None),
         stop_token=getattr(env, "_stop_token", None),
     )
-
-    # Show the dashboard URL if requested
-    if dashboard and env._dashboard_fn is not None:
-        dashboard_url = env._dashboard_url
-        if dashboard_url:
-            # Ensure URL ends with / so the ASGI app serves from root
-            if not dashboard_url.endswith("/"):
-                dashboard_url += "/"
-            _show_link(dashboard_url, label="Dashboard", show_qr=True)
 
     def emit(event):
         from cloudposterior.progress import ConvergenceUpdate
