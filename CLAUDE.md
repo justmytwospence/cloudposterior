@@ -42,7 +42,7 @@ Each example in `examples/` exists in two formats that must be kept in sync:
 3. Cache key is computed from the serialized bytes + sample kwargs (`cache.py`)
 4. If remote: `ModalBackend` (`backends/modal_backend.py`) submits a `SamplingPayload` to Modal, which runs `remote/worker.py` in a container with version-matched dependencies
 5. If local: the original `pm.sample` is called directly
-6. Progress events stream back via msgpack and are rendered by display sinks (ipywidgets for notebooks, Rich for terminals) in `display.py`
+6. Progress events stream back via msgpack and are rendered by display sinks (an anywidget that animates live in both Jupyter and marimo notebooks, Rich for terminals) in `display.py`
 7. Results are cached and returned as `az.InferenceData`
 
 ### Key abstractions

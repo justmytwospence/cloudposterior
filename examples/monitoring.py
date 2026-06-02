@@ -21,7 +21,7 @@ def _(mo):
     - **`dashboard=True`** (default for remote) -- live web dashboard with convergence diagnostics, trace plots, and a stop button. Open on your phone or any browser via QR code.
     - **`notify=True`** -- push notifications via [ntfy](https://ntfy.sh) when sampling starts and completes.
 
-    > Run this notebook locally to see the QR codes and links.
+    > Run this notebook locally (Jupyter or marimo) to see the dashboard links and QR codes, plus the in-cell live progress.
     """)
     return
 

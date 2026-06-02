@@ -18,7 +18,7 @@ def _(mo):
 
     Run PyMC MCMC sampling on cloud VMs with one line of code. This notebook demonstrates remote execution using the classic Radon dataset from Gelman & Hill (2006).
 
-    > Run this notebook locally to see the interactive progress display. Some outputs don't render in GitHub's notebook viewer.
+    > Run this notebook locally (Jupyter or marimo) to watch the live progress display animate in-cell. Some outputs don't render in GitHub's notebook viewer.
     """)
     return
 

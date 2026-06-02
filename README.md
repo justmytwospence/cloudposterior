@@ -153,7 +153,7 @@ Both Jupyter notebooks and terminals show real-time, in-place progress for every
 4. MCMC sampling -- per-chain progress bars, divergences, step size, grad evals, speed, ETA
 5. Result download
 
-Notebooks get an ipywidgets GUI. Terminals get a Rich TUI. Progress bars turn red when chains diverge, just like PyMC's native display.
+Notebooks get a live anywidget display that animates in-cell in both Jupyter and marimo. Terminals get a Rich TUI. Progress bars turn red when chains diverge, just like PyMC's native display.
 
 ### Samplers
 
@@ -271,7 +271,7 @@ For repeated sampling with the same model, the `cp.cloud()` context manager is c
 
 ## Example
 
-Clone and run locally for the full interactive progress display.
+Clone and run locally (Jupyter or marimo) for the full live progress display.
 
 - [examples/basics.ipynb](examples/basics.ipynb) -- cloud execution and GPU acceleration with the Minnesota Radon dataset
 - [examples/caching.ipynb](examples/caching.ipynb) -- local and disk caching, model iteration
