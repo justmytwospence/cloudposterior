@@ -444,7 +444,8 @@ def _create_persistent_app(
             if _stop_token and token != _stop_token:
                 return JSONResponse({"stopped": False, "error": "invalid token"}, status_code=403)
             try:
-                d = await _modal.Dict.from_name.aio(_dict_name)
+                # from_name is a lazy reference (no I/O); only get/put have .aio.
+                d = _modal.Dict.from_name(_dict_name)
                 await d.put.aio("stop", True)
             except Exception:
                 pass
@@ -475,7 +476,8 @@ def _create_persistent_app(
                 import modal as _modal
                 default = {"phases": [], "sampling": None, "complete": False}
                 try:
-                    d = await _modal.Dict.from_name.aio(_dict_name)
+                    # from_name is a lazy reference (no I/O); only get/put have .aio.
+                    d = _modal.Dict.from_name(_dict_name)
                     data = await d.get.aio("progress", default)
                 except Exception:
                     data = default
