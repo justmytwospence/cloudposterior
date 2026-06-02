@@ -97,6 +97,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     random_seed = sample_kwargs.get("random_seed", None)
     sample_kwargs.pop("progressbar", None)
     sample_kwargs.pop("callback", None)
+    # Adaptive: early-stop once every scalar param hits this convergence target.
+    # cp-only kwarg (never passed to the sampler); applies to nutpie + pymc.
+    until = sample_kwargs.pop("until", None)
 
     # -- nutpie compile phase, with fallback to the pymc sampler --
     compiled = None
@@ -139,6 +142,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     sampling_error = None
     idata = None
     stopped_early = False
+    converged = False
 
     def _drain_and_yield():
         """Collapse queued per-chain updates into a single 'sampling' event."""
@@ -274,8 +278,14 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                         conv = _convergence_from_idata(_to_inference_data(handle.inspect()))
                         if conv:
                             yield conv
+                            if until and _conv_meets_target(conv, until):
+                                idata = _to_inference_data(handle.abort())
+                                stopped_early = True
+                                converged = True
                     except Exception:
                         pass
+                    if converged:
+                        break
                 if _stop_requested(stop_dict):
                     try:
                         idata = _to_inference_data(handle.abort())  # returns partial trace
@@ -415,6 +425,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             conv = _pymc_convergence(chain_traces, counters, msgpack)
             if conv:
                 yield conv
+                if until and _conv_meets_target(conv, until):
+                    converged = True
+                    should_stop["v"] = True  # callback raises -> keeps partial trace
             if not should_stop["v"] and _stop_requested(stop_dict):
                 should_stop["v"] = True  # callback raises KeyboardInterrupt on its next draw
         sample_thread.join()
@@ -437,7 +450,13 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     if not stopped_early and stop_dict is not None:
         stopped_early = _stop_requested(stop_dict)
 
-    if stopped_early:
+    if converged:
+        yield msgpack.packb({
+            "type": "phase", "phase": "sampling", "status": "done",
+            "message": f"converged ({counters['total_draws']} draws, target met)",
+            "elapsed": round(time.time() - sample_start, 1),
+        })
+    elif stopped_early:
         yield msgpack.packb({
             "type": "phase", "phase": "sampling", "status": "done",
             "message": f"stopped early ({counters['total_draws']} draws)",
@@ -474,6 +493,28 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     })
 
     yield idata_compressed
+
+
+def _conv_meets_target(conv_bytes, until) -> bool:
+    """Whether a packed convergence event clears the adaptive target for EVERY
+    scalar param: rhat <= until['r_hat'] and bulk/tail ESS >= until['ess']."""
+    import msgpack
+
+    try:
+        d = msgpack.unpackb(conv_bytes, raw=False)
+    except Exception:
+        return False
+    params = d.get("params") or {}
+    if not params:
+        return False
+    rhat_max = float(until.get("r_hat", 1.01))
+    ess_min = float(until.get("ess", 400))
+    for p in params.values():
+        if float(p.get("rhat", 1e9)) > rhat_max:
+            return False
+        if float(p.get("ess_bulk", 0)) < ess_min or float(p.get("ess_tail", 0)) < ess_min:
+            return False
+    return True
 
 
 def _pymc_convergence(chain_traces, counters, msgpack):
@@ -601,3 +642,40 @@ def run_sampling_from_volume(
     })
 
     yield from _sample_and_stream(model, sample_kwargs, nuts_sampler, stop_dict_name=stop_dict_name)
+
+
+def _load_model_from_volume(payload_path: str):
+    import pickle
+
+    import lz4.frame
+
+    with open(payload_path, "rb") as f:
+        return pickle.loads(lz4.frame.decompress(f.read()))
+
+
+def run_prior_predictive(payload_path: str, sample_kwargs: dict) -> bytes:
+    """Load model from Volume, run prior predictive, return lz4 NetCDF bytes.
+
+    A deterministic forward pass -- no MCMC, no per-chain streaming.
+    """
+    import pymc as pm
+
+    from cloudposterior.serialize import serialize_inference_data
+
+    model = _load_model_from_volume(payload_path)
+    with model:
+        idata = pm.sample_prior_predictive(**sample_kwargs)
+    return serialize_inference_data(idata)
+
+
+def run_posterior_predictive(payload_path: str, idata_bytes: bytes, sample_kwargs: dict) -> bytes:
+    """Load model + posterior trace from Volume/args, run posterior predictive."""
+    import pymc as pm
+
+    from cloudposterior.serialize import deserialize_inference_data, serialize_inference_data
+
+    model = _load_model_from_volume(payload_path)
+    trace = deserialize_inference_data(idata_bytes)
+    with model:
+        idata = pm.sample_posterior_predictive(trace, **sample_kwargs)
+    return serialize_inference_data(idata)

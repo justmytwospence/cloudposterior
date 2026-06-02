@@ -400,6 +400,19 @@ def _create_persistent_app(
                 stop_dict_name=stop_dict_name,
             )
 
+        @modal.method()
+        def prior_predictive(self, payload_path: str, sample_kwargs: dict) -> bytes:
+            from cloudposterior.remote.worker import run_prior_predictive
+
+            return run_prior_predictive(f"/data/{payload_path}", sample_kwargs)
+
+        @modal.method()
+        def posterior_predictive(self, payload_path: str, idata_bytes: bytes,
+                                 sample_kwargs: dict) -> bytes:
+            from cloudposterior.remote.worker import run_posterior_predictive
+
+            return run_posterior_predictive(f"/data/{payload_path}", idata_bytes, sample_kwargs)
+
     # Add dashboard web endpoints if requested
     dashboard_fn = None
     progress_fn = None

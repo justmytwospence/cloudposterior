@@ -59,6 +59,7 @@ class cloud:
         instance: str | None = None,
         progress: bool = True,
         project: str | None = None,
+        until: dict | bool | None = None,
     ):
         # dashboard=None means "default": on for remote, off for local with no
         # warning. dashboard=True with remote=False is a user mistake -- warn.
@@ -81,6 +82,16 @@ class cloud:
         self.instance = instance
         self.progress = progress
         self.project = project or _detect_project_name()
+        # Adaptive convergence target (remote only). True -> Vehtari defaults;
+        # a dict overrides r_hat / ess. The worker early-stops once every scalar
+        # param clears it (draws= is the cap).
+        if until is True:
+            until = {"r_hat": 1.01, "ess": 400}
+        elif isinstance(until, dict):
+            until = {"r_hat": 1.01, "ess": 400, **until}
+        else:
+            until = None
+        self.until = until
         self._originals: dict[str, object] = {}
         self._env = None
         self._model_bytes: bytes | None = None
@@ -89,7 +100,11 @@ class cloud:
         import pymc as pm
 
         self._originals["sample"] = pm.sample
+        self._originals["sample_prior_predictive"] = pm.sample_prior_predictive
+        self._originals["sample_posterior_predictive"] = pm.sample_posterior_predictive
         pm.sample = self._make_intercepted_sample()
+        pm.sample_prior_predictive = self._make_intercepted_predictive("prior")
+        pm.sample_posterior_predictive = self._make_intercepted_predictive("posterior")
         self.model.__enter__()
         return self.model
 
@@ -97,6 +112,8 @@ class cloud:
         import pymc as pm
 
         pm.sample = self._originals["sample"]
+        pm.sample_prior_predictive = self._originals["sample_prior_predictive"]
+        pm.sample_posterior_predictive = self._originals["sample_posterior_predictive"]
         if self._env is not None:
             self._env.teardown()
             self._env = None
@@ -150,6 +167,23 @@ class cloud:
             if nuts_sampler is None:
                 nuts_sampler = _default_sampler(ctx.model, local=not ctx.remote)
 
+            # Adaptive early-stop: worker-side, so remote + nutpie/pymc only.
+            if ctx.until is not None:
+                import warnings
+
+                if not ctx.remote:
+                    warnings.warn(
+                        "until= is remote-only (worker-side early-stop); "
+                        "ignored for local sampling.", stacklevel=2,
+                    )
+                elif nuts_sampler in ("numpyro", "blackjax"):
+                    warnings.warn(
+                        f"until= requires the nutpie or pymc sampler; ignored "
+                        f"for nuts_sampler={nuts_sampler!r}.", stacklevel=2,
+                    )
+                else:
+                    kwargs["until"] = ctx.until
+
             # Lazy first-touch serialization: pay the cloudpickle cost only
             # when we actually need it. Memoize on the model so repeat calls
             # in the same session don't re-serialize.
@@ -192,6 +226,42 @@ class cloud:
             )
 
         return intercepted_sample
+
+    def _make_intercepted_predictive(self, kind: str):
+        """Intercept pm.sample_prior_predictive / pm.sample_posterior_predictive.
+
+        ``kind`` is "prior" or "posterior". Forward passes (no MCMC) -- routed to
+        a non-streaming worker entry that loads the model (and, for posterior, the
+        trace) and returns the result. Local runs defer to the original.
+        """
+        ctx = self
+        orig_key = (
+            "sample_prior_predictive" if kind == "prior" else "sample_posterior_predictive"
+        )
+
+        def intercepted_predictive(*args, **kwargs):
+            if not ctx.remote:
+                return ctx._originals[orig_key](*args, **kwargs)
+
+            if ctx._model_bytes is None:
+                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            if ctx._env is None:
+                ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
+
+            trace = None
+            if kind == "posterior":
+                if args:
+                    trace = args[0]
+                elif "trace" in kwargs:
+                    trace = kwargs.pop("trace")
+                else:
+                    raise TypeError("sample_posterior_predictive requires a trace")
+            elif args:  # prior predictive: first positional is draws
+                kwargs["draws"] = args[0]
+
+            return _run_predictive(ctx, kind, trace, kwargs)
+
+        return intercepted_predictive
 
 
 def _ensure_model_bytes(model) -> bytes:
@@ -557,6 +627,42 @@ def _stop_sinks(sinks: list):
     for sink in sinks:
         if hasattr(sink, "stop"):
             sink.stop()
+
+
+def _run_predictive(ctx, kind: str, trace, sample_kwargs: dict):
+    """Run prior/posterior predictive on the remote persistent environment.
+
+    A blocking (non-streaming) call: uploads the model if needed, invokes the
+    worker's predictive method, and returns the decoded InferenceData.
+    """
+    from cloudposterior.backends.modal_backend import (
+        _compute_payload_path,
+        _run_blocking,
+    )
+    from cloudposterior.serialize import (
+        deserialize_inference_data,
+        serialize_inference_data,
+    )
+
+    env = ctx._env
+    env._ensure_running()
+    payload_path = _compute_payload_path(env._model_slug, ctx._model_bytes)
+    env._upload_if_needed(ctx._model_bytes, payload_path)
+
+    # The worker loads the model from the Volume -- never ship one in kwargs.
+    sample_kwargs.pop("model", None)
+
+    sampler = env._sampler_cls()
+    if kind == "prior":
+        idata_bytes = _run_blocking(
+            sampler.prior_predictive.remote, payload_path, sample_kwargs
+        )
+    else:
+        trace_bytes = serialize_inference_data(trace)
+        idata_bytes = _run_blocking(
+            sampler.posterior_predictive.remote, payload_path, trace_bytes, sample_kwargs
+        )
+    return deserialize_inference_data(idata_bytes)
 
 
 def _run_remote(
