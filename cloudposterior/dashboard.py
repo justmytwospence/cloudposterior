@@ -250,11 +250,13 @@ function cleanName(name) {
   return idx >= 0 ? name.substring(idx + 2) : name;
 }
 
+let failCount = 0;
 async function poll() {
   if (!polling) return;
   try {
     const r = await fetch(progressUrl);
     const data = await r.json();
+    failCount = 0;
     renderPhases(data.phases || []);
     renderSampling(data.sampling);
     if (data.convergence) renderConvergence(data.convergence);
@@ -275,8 +277,18 @@ async function poll() {
     }
 
   } catch (e) {
-    document.getElementById('banner').innerHTML =
-      '<div style="color:#d9534f;padding:8px;font-size:12px;">fetch error: ' + e.message + '</div>';
+    // The /progress endpoint becomes unreachable when the run ends and the
+    // Modal app shuts down with the notebook cell. Tolerate a couple of
+    // transient misses, then stop with a calm message (not a red error loop).
+    failCount++;
+    if (failCount >= 3) {
+      stopBtn.disabled = true;
+      document.getElementById('banner').innerHTML =
+        '<div style="background:#eee;color:#555;padding:8px 12px;border-radius:6px;' +
+        'font-size:13px;">Dashboard offline &mdash; the run has ended. ' +
+        'Check your notebook for results.</div>';
+      polling = false;
+    }
   }
   if (polling) setTimeout(poll, 1000);
 }
