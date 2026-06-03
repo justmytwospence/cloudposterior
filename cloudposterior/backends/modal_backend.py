@@ -586,7 +586,13 @@ class ModalEnvironment(RemoteEnvironment):
     def _ensure_running(self):
         if not self._running:
             try:
-                self._exit_stack.enter_context(self._app.run())
+                # Enter app.run() off the event loop: its __enter__ is a blocking
+                # Modal call that otherwise warns/stalls inside an async host
+                # (marimo). Enter manually in a worker thread, then register the
+                # context's __exit__ on the stack for teardown.
+                cm = self._app.run()
+                _run_blocking(cm.__enter__)
+                self._exit_stack.push(cm)
             except Exception as exc:
                 raise _handle_modal_error(exc)
             self._running = True
@@ -696,7 +702,11 @@ class ModalEnvironment(RemoteEnvironment):
         )
 
     def teardown(self) -> None:
-        self._exit_stack.close()
+        # Off the event loop: app.run().__exit__ is a blocking Modal call.
+        try:
+            _run_blocking(self._exit_stack.close)
+        except Exception:
+            pass
         self._running = False
 
 
