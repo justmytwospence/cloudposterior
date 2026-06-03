@@ -69,3 +69,30 @@ def test_render_dashboard_html_bakes_stop_token():
     )
     assert "secret-tok-123" in html
     assert "__STOP_TOKEN__" not in html
+
+
+def test_dashboard_sink_writes_under_custom_key():
+    """cp.map gives each model its own Dict key so concurrent workers don't clash."""
+    store = {}
+    sink = DashboardSink(store, key="pooled-0")
+    sink.show_phase(PhaseUpdate(JobPhase.SAMPLING, "in_progress", "go", 0.0))
+    assert "pooled-0" in store and "progress" not in store
+    sink.show_sampling(SamplingProgress(
+        chains={0: ChainProgress(draw=10, total=20, phase="sampling")},
+        total_divergences=0, elapsed=1.0, total_draws=10,
+    ))
+    assert store["pooled-0"]["sampling"]["chains"]["0"]["draw"] == 10
+
+
+def test_render_dashboard_html_has_unified_multimodel_scaffold():
+    """The page carries the single render path: a per-model template, the
+    overview/detail outlets, client-side normalization, and one stop fn."""
+    html = render_dashboard_html(
+        progress_label="m-abc-progress", stop_label="m-abc-stop",
+        dashboard_label="m-abc", stop_token="tok",
+    )
+    for needle in [
+        'id="modelTpl"', 'id="overview"', 'id="detail"',
+        "function normalize", "function requestStop", "function renderTraces(container, traces, prefix)",
+    ]:
+        assert needle in html, f"missing scaffold: {needle}"

@@ -18,10 +18,10 @@ def _(mo):
 
     `cp.map` fits **many models at once** on the cloud -- the canonical parallel
     Bayesian workflow. Here we fit three increasingly-pooled radon models
-    concurrently on one warm container and compare them with LOO cross-validation.
+    concurrently and compare them with LOO cross-validation.
 
-    > Run this notebook locally (Jupyter or marimo). `cp.map` reports job-level
-    > progress (no per-chain widget) -- the variants run in parallel.
+    > Run this notebook locally (Jupyter or marimo). `cp.map` prints job-level
+    > progress inline and serves a live dashboard for the per-model detail.
     """)
     return
 
@@ -104,8 +104,13 @@ def _(mo):
     mo.md(r"""
     ## Fit all three in parallel
 
-    `cp.map` uploads each model once and runs the fits concurrently on a single
-    warm Modal container. Results come back in input order.
+    `cp.map` uploads each model once and runs the fits concurrently on the cloud.
+    Results come back in input order.
+
+    It also serves a **live dashboard** by default (printed as a link below): an
+    overview of all three models that you can drill into for any single model's
+    chains, convergence, and live traces -- with a global *Stop all* and a
+    per-model *Stop*. Pass `dashboard=False` to opt out.
     """)
     return
 

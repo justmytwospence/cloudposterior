@@ -62,3 +62,69 @@ def test_worker_end_to_end():
     assert "posterior" in group_names(idata)
     assert "mu" in idata.posterior.data_vars
     print(f"  Posterior shape: {dict(idata.posterior.sizes)}")
+
+
+def test_run_sampling_blocking_writes_dashboard_progress(monkeypatch):
+    """cp.map's blocking worker writes per-model progress into the dashboard Dict
+    (under its model label) and still returns the result bytes."""
+    from cloudposterior.remote import worker
+
+    store = {}
+    events = [
+        msgpack.packb({"type": "phase", "phase": "sampling", "status": "in_progress",
+                       "message": "MCMC sampling started", "elapsed": 0.0}),
+        msgpack.packb({"type": "sampling",
+                       "chains": {"0": {"draw": 5, "total": 10, "phase": "sampling",
+                                        "divergences": 0, "step_size": 0.1,
+                                        "draws_per_sec": 1.0, "eta_seconds": 5.0,
+                                        "tree_size": 7}},
+                       "total_divergences": 0, "elapsed": 1.0, "total_draws": 5}),
+        msgpack.packb({"type": "result", "size_mb": 0.01}),
+        b"RESULT-BYTES",
+    ]
+
+    def fake_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_name=None, stop_key=None):
+        assert stop_key == "pooled-0"  # per-model stop key threaded through
+        for e in events:
+            yield e
+
+    monkeypatch.setattr(worker, "_load_model_from_volume", lambda p: object())
+    monkeypatch.setattr(worker, "_open_dict", lambda name: store if name else None)
+    monkeypatch.setattr(worker, "_sample_and_stream", fake_stream)
+    monkeypatch.setattr(
+        "cloudposterior.backends.modal_backend._run_blocking",
+        lambda fn, *a, **k: fn(*a, **k),
+    )
+
+    out = worker.run_sampling_blocking(
+        "/data/p.bin", {"draws": 10}, "nutpie",
+        progress_dict_name="cp-dash-x", progress_key="pooled-0",
+        stop_dict_name="cp-dash-x",
+    )
+    assert out == b"RESULT-BYTES"
+    state = store["pooled-0"]                     # written under the model label
+    assert state["sampling"]["chains"]["0"]["draw"] == 5
+    assert any(p["label"] == "sampling" for p in state["phases"])
+
+
+def test_run_sampling_blocking_no_dashboard_returns_bytes(monkeypatch):
+    """Without progress args the worker behaves as before (just returns bytes)."""
+    from cloudposterior.remote import worker
+
+    events = [msgpack.packb({"type": "result", "size_mb": 0.01}), b"ONLY-BYTES"]
+    monkeypatch.setattr(worker, "_load_model_from_volume", lambda p: object())
+    monkeypatch.setattr(worker, "_sample_and_stream", lambda *a, **k: (e for e in events))
+    out = worker.run_sampling_blocking("/data/p.bin", {"draws": 10}, "nutpie")
+    assert out == b"ONLY-BYTES"
+
+
+def test_stop_requested_honors_global_and_per_model():
+    from cloudposterior.remote.worker import _open_dict, _stop_requested
+
+    assert _open_dict(None) is None
+    assert _stop_requested(None) is False
+    assert _stop_requested({"stop": False}) is False
+    assert _stop_requested({"stop": True}) is True                       # global stop
+    assert _stop_requested({"stop:pooled-0": True}, "pooled-0") is True   # per-model
+    assert _stop_requested({"stop:pooled-0": True}, "other") is False     # not mine
+    assert _stop_requested({"stop": False}, "pooled-0") is False

@@ -12,11 +12,8 @@ from cloudposterior._idata import load_all
 from cloudposterior.backends import ComputeBackend, RemoteEnvironment, SamplingJob
 from cloudposterior.config import DEFAULT_PACKAGES, OPTIONAL_PACKAGES, RemoteConfig
 from cloudposterior.progress import (
-    ChainProgress,
-    JobPhase,
-    PhaseUpdate,
     ProgressEvent,
-    SamplingProgress,
+    decode_progress_event,
 )
 from cloudposterior.serialize import SamplingPayload
 
@@ -232,53 +229,9 @@ class ModalSamplingJob(SamplingJob):
         pass
 
 
-def _decode_progress_event(data: dict) -> ProgressEvent | None:
-    """Convert a decoded msgpack dict into a typed ProgressEvent."""
-    msg_type = data.get("type")
-
-    if msg_type == "phase":
-        return PhaseUpdate(
-            phase=JobPhase(data["phase"]),
-            status=data["status"],
-            message=data["message"],
-            elapsed=data["elapsed"],
-        )
-
-    if msg_type == "sampling":
-        chains = {}
-        for chain_id_str, cdata in data.get("chains", {}).items():
-            chain_id = int(chain_id_str) if isinstance(chain_id_str, str) else chain_id_str
-            chains[chain_id] = ChainProgress(
-                draw=cdata["draw"],
-                total=cdata["total"],
-                phase=cdata["phase"],
-                draws_per_sec=cdata.get("draws_per_sec", 0.0),
-                eta_seconds=cdata.get("eta_seconds", 0.0),
-                divergences=cdata.get("divergences", 0),
-                mean_tree_depth=cdata.get("mean_tree_depth", 0.0),
-                step_size=cdata.get("step_size", 0.0),
-                tree_size=cdata.get("tree_size", 0),
-            )
-        return SamplingProgress(
-            chains=chains,
-            total_divergences=data.get("total_divergences", 0),
-            elapsed=data.get("elapsed", 0.0),
-            total_draws=data.get("total_draws", 0),
-        )
-
-    if msg_type == "convergence":
-        from cloudposterior.progress import ConvergenceUpdate, ParamConvergence
-        params = {}
-        for name, pdata in data.get("params", {}).items():
-            params[name] = ParamConvergence(
-                rhat=pdata["rhat"],
-                ess_bulk=pdata["ess_bulk"],
-                ess_tail=pdata["ess_tail"],
-            )
-        traces = data.get("traces", {})
-        return ConvergenceUpdate(params=params, draws=data.get("draws", 0), traces=traces)
-
-    return None
+# Decoding moved to cloudposterior.progress (shared with the cp.map worker).
+# Back-compat alias for any external importer of the old private name.
+_decode_progress_event = decode_progress_event
 
 
 def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
@@ -427,10 +380,17 @@ def _create_persistent_app(
 
         @modal.method()
         def sample_blocking(self, payload_path: str, sample_kwargs: dict,
-                            nuts_sampler: str = "nutpie") -> bytes:
+                            nuts_sampler: str = "nutpie",
+                            progress_dict_name: str | None = None,
+                            progress_key: str | None = None,
+                            stop_dict_name: str | None = None) -> bytes:
             from cloudposterior.remote.worker import run_sampling_blocking
 
-            return run_sampling_blocking(f"/data/{payload_path}", sample_kwargs, nuts_sampler)
+            return run_sampling_blocking(
+                f"/data/{payload_path}", sample_kwargs, nuts_sampler,
+                progress_dict_name=progress_dict_name, progress_key=progress_key,
+                stop_dict_name=stop_dict_name,
+            )
 
         @modal.method()
         def sample_smc(self, payload_path: str, sample_kwargs: dict) -> bytes:
@@ -463,7 +423,7 @@ def _create_persistent_app(
         # in-notebook stop button, so it exists whenever control infra does.
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="POST", label=_stop_label)
-        async def serve_stop(token: str = ""):
+        async def serve_stop(token: str = "", model: str = ""):
             from fastapi.responses import JSONResponse
             import modal as _modal
             # Require the token baked into the page so a random caller who
@@ -473,7 +433,9 @@ def _create_persistent_app(
             try:
                 # from_name is a lazy reference (no I/O); only get/put have .aio.
                 d = _modal.Dict.from_name(_dict_name)
-                await d.put.aio("stop", True)
+                # cp.map's per-model Stop targets "stop:<label>"; the global
+                # "Stop all" (and single-model runs) use the bare "stop" key.
+                await d.put.aio(f"stop:{model}" if model else "stop", True)
             except Exception:
                 pass
             return JSONResponse({"stopped": True})
@@ -505,7 +467,18 @@ def _create_persistent_app(
                 try:
                     # from_name is a lazy reference (no I/O); only get/put have .aio.
                     d = _modal.Dict.from_name(_dict_name)
-                    data = await d.get.aio("progress", default)
+                    # cp.map writes a "models" manifest plus one state key per
+                    # model; single-model runs write the flat "progress" state.
+                    # Return {models, runs} for the former (the page normalizes
+                    # the latter to N=1), so the dashboard has one data shape.
+                    manifest = await d.get.aio("models", None)
+                    if manifest:
+                        runs = {}
+                        for m in manifest:
+                            runs[m["label"]] = await d.get.aio(m["label"], {})
+                        data = {"models": manifest, "runs": runs}
+                    else:
+                        data = await d.get.aio("progress", default)
                 except Exception:
                     data = default
                 return JSONResponse(data)

@@ -10,10 +10,16 @@ from cloudposterior.progress import (
 
 
 class DashboardSink:
-    """Sink that writes progress state to a Modal Dict for the dashboard endpoint."""
+    """Sink that writes progress state to a Modal Dict for the dashboard endpoint.
 
-    def __init__(self, progress_dict):
+    ``key`` is the Dict key the run-state is written under. Single-model runs use
+    the default ``"progress"``; ``cp.map`` gives each model its own key (its label)
+    so N concurrent workers write independent keys without clobbering each other.
+    """
+
+    def __init__(self, progress_dict, key: str = "progress"):
         self._dict = progress_dict
+        self._key = key
         self._phases: list[dict] = []
         self._sampling: dict | None = None
         self._complete = False
@@ -86,7 +92,7 @@ class DashboardSink:
             # in a worker thread when a loop is active.
             from cloudposterior.backends.modal_backend import _run_blocking
 
-            _run_blocking(self._dict.__setitem__, "progress", data)
+            _run_blocking(self._dict.__setitem__, self._key, data)
         except Exception:
             pass  # best-effort
 
@@ -187,36 +193,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                            font-size: 13px; font-weight: 600; cursor: pointer; border: none; margin: 0 var(--sp-2); }
   .confirm-yes { background: var(--red); color: #fff; }
   .confirm-no { background: var(--bg-hover); color: var(--text); border: 1px solid var(--border) !important; }
+  /* -- multi-model (cp.map) overview + detail -- */
+  .header-actions { display: flex; align-items: center; gap: var(--sp-3); }
+  .back-link { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .back-link:hover { text-decoration: underline; }
+  .stop-sm { padding: var(--sp-1) var(--sp-3); font-size: 12px; border-width: 1px; }
+  .mv-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--sp-3); gap: var(--sp-3); }
+  .mv-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  /* compact overview card: one clickable summary per model */
+  .model-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+                padding: var(--sp-4); margin-bottom: var(--sp-3); cursor: pointer; transition: border-color 0.15s; }
+  .model-card:hover { border-color: var(--accent); }
+  .model-card .mv-name::after { content: ' \\2192'; color: var(--text-dim); }
+  /* compact mode flattens the shared template into a lean summary card */
+  .model-card.compact .section { border: none; background: transparent; padding: 0; margin-bottom: var(--sp-2); }
+  .model-card.compact .section-title { display: none; }
+  .model-card.compact .traces, .model-card.compact .banner { display: none; }
+  .model-card.compact .sampling { margin-top: var(--sp-2); }
   @media (max-width: 600px) { body { padding: var(--sp-3); } .section { padding: var(--sp-3); } }
 </style>
 </head>
 <body>
 <div class="header">
   <h1>cloudposterior</h1>
-  <button id="stopBtn" class="stop-btn" disabled>Waiting...</button>
+  <div class="header-actions">
+    <a id="backLink" class="back-link" style="display:none">&#8592; All models</a>
+    <button id="stopBtn" class="stop-btn" disabled>Waiting...</button>
+  </div>
 </div>
-<div class="section">
-  <div class="section-title">Status</div>
-  <div id="phases"><div class="phase"><span class="spinner"></span> <span class="detail">waiting for sampling to start...</span></div></div>
-</div>
-<div class="section">
-  <div class="section-title">Chains</div>
-  <div id="sampling"></div>
-</div>
-<div id="convergence"></div>
-<div id="traces"></div>
-<div id="banner"></div>
+<div id="overview"></div>
+<div id="detail"></div>
 <div id="confirmOverlay" class="confirm-overlay" style="display:none">
   <div class="confirm-dialog">
-    <p>Stop sampling early? You'll keep all draws collected so far.</p>
+    <p id="confirmText">Stop sampling early? You'll keep all draws collected so far.</p>
     <button class="confirm-yes" id="confirmYes">Stop</button>
     <button class="confirm-no" id="confirmNo">Cancel</button>
   </div>
 </div>
+<!-- One per-model view, cloned for the full detail page and (compact) for each
+     overview card. A single-model cp.cloud run is just N=1 of this. -->
+<template id="modelTpl">
+  <div class="mv-header"><span class="mv-name"></span><button class="mv-stop stop-btn stop-sm" disabled>Waiting...</button></div>
+  <div class="section"><div class="section-title">Status</div><div class="phases"><div class="phase"><span class="spinner"></span> <span class="detail">waiting for sampling to start...</span></div></div></div>
+  <div class="section"><div class="section-title">Chains</div><div class="sampling"></div></div>
+  <div class="convergence"></div>
+  <div class="traces"></div>
+  <div class="banner"></div>
+</template>
 <script>
 let polling = true;
-let stopRequested = false;
-const stopBtn = document.getElementById('stopBtn');
 
 // Construct sibling endpoint URLs from our own URL
 // Dashboard: https://workspace--{dash-label}-env.modal.run
@@ -229,20 +254,42 @@ const origin = window.location.origin; // https://workspace--dash-label-env.moda
 const progressUrl = origin.replace(dashLabel, progLabel);
 const stopUrl = origin.replace(dashLabel, stopLabel);
 
+const headerStop = document.getElementById('stopBtn');
+const backLink = document.getElementById('backLink');
+const overviewEl = document.getElementById('overview');
+const detailEl = document.getElementById('detail');
 const overlay = document.getElementById('confirmOverlay');
+const confirmText = document.getElementById('confirmText');
+const tpl = document.getElementById('modelTpl');
+
+// One stop path for both the global "Stop all" and every per-model Stop.
+// null label => global stop ("stop" key); a label => per-model ("stop:<label>").
+const stopReq = {};      // label -> true once a per-model stop is requested
+let stopAllReq = false;
+let pendingStop;          // remembered while the confirm dialog is open
+function requestStop(label) {
+  pendingStop = label;
+  confirmText.textContent = label
+    ? "Stop this model early? You'll keep all draws collected so far."
+    : "Stop all models early? You'll keep all draws collected so far.";
+  overlay.style.display = 'flex';
+}
 document.getElementById('confirmNo').addEventListener('click', () => { overlay.style.display = 'none'; });
 document.getElementById('confirmYes').addEventListener('click', async () => {
   overlay.style.display = 'none';
-  stopRequested = true;
-  stopBtn.textContent = 'Stopping...';
-  stopBtn.disabled = true;
-  try { await fetch(stopUrl + (stopToken ? ('?token=' + encodeURIComponent(stopToken)) : ''), {method: 'POST'}); } catch (e) {}
+  const label = pendingStop;
+  if (label) stopReq[label] = true; else stopAllReq = true;
+  const params = [];
+  if (label) params.push('model=' + encodeURIComponent(label));
+  if (stopToken) params.push('token=' + encodeURIComponent(stopToken));
+  const url = stopUrl + (params.length ? ('?' + params.join('&')) : '');
+  try { await fetch(url, {method: 'POST'}); } catch (e) {}
 });
-stopBtn.addEventListener('click', (e) => {
+headerStop.addEventListener('click', (e) => {
   e.preventDefault();
-  if (stopRequested || stopBtn.disabled) return;
-  overlay.style.display = 'flex';
+  if (!headerStop.disabled) requestStop(null);  // header button always stops all
 });
+backLink.addEventListener('click', (e) => { e.preventDefault(); location.hash = '#/'; });
 
 // Clean param names: strip "modelname::" prefix
 function cleanName(name) {
@@ -250,63 +297,183 @@ function cleanName(name) {
   return idx >= 0 ? name.substring(idx + 2) : name;
 }
 
+// A single-model cp.cloud run is just N=1 of the map shape -- normalize so the
+// rest of the UI has exactly one code path.
+function normalize(data) {
+  if (data && data.models) return data;
+  return {models: [{label: 'progress', name: 'cloudposterior'}], runs: {progress: data || {}}};
+}
+
+// One per-model view, cloned from the shared template; cached per (mode,label)
+// so polls update content in place rather than rebuilding DOM (and charts).
+const views = {};
+function makeView(label, name, compact) {
+  const root = document.createElement('div');
+  root.className = compact ? 'model-card compact' : 'model-view';
+  root.appendChild(tpl.content.cloneNode(true));
+  const refs = {
+    root,
+    name: root.querySelector('.mv-name'),
+    stop: root.querySelector('.mv-stop'),
+    phases: root.querySelector('.phases'),
+    sampling: root.querySelector('.sampling'),
+    convergence: root.querySelector('.convergence'),
+    traces: root.querySelector('.traces'),
+    banner: root.querySelector('.banner'),
+  };
+  refs.name.textContent = cleanName(name);
+  refs.stop.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!refs.stop.disabled) requestStop(label);
+  });
+  if (compact) root.addEventListener('click', () => { location.hash = '#/' + label; });
+  return refs;
+}
+function getView(label, name, compact) {
+  const key = (compact ? 'c:' : 'd:') + label;
+  if (!views[key]) views[key] = makeView(label, name, compact);
+  return views[key];
+}
+
+function setStopButton(btn, state, requested) {
+  if (!btn) return;
+  const isSampling = state.sampling && state.sampling.chains &&
+    Object.values(state.sampling.chains).some(c => c.phase === 'sampling');
+  if (state.complete) { btn.textContent = 'Done'; btn.disabled = true; }
+  else if (requested) { btn.textContent = 'Stopping...'; btn.disabled = true; }
+  else if (isSampling) { btn.textContent = 'Stop'; btn.disabled = false; }
+  else { btn.textContent = 'Waiting...'; btn.disabled = true; }
+}
+
+// Update one cached view from its run-state, reusing the shared renderers.
+function updateView(refs, state, compact, label, showName) {
+  state = state || {};
+  refs.name.style.display = showName ? '' : 'none';
+  renderPhases(refs.phases, state.phases || [], compact);
+  renderSampling(refs.sampling, state.sampling, compact);
+  renderConvergence(refs.convergence, state.convergence, compact);
+  if (!compact && state.traces && Object.keys(state.traces).length) {
+    renderTraces(refs.traces, state.traces, label);
+  }
+  refs.banner.innerHTML = state.complete ? '<div class="complete-banner">Sampling complete</div>' : '';
+  setStopButton(refs.stop, state, stopReq[label] || stopAllReq);
+}
+
+function selectedLabel(view) {
+  const r = location.hash.replace(/^#\\/?/, '');
+  return (r && view.runs && view.runs[r] !== undefined) ? r : null;
+}
+
+// One router: overview (N>1, no selection) vs a single model's detail page.
+let lastView = null;
+function render(view) {
+  lastView = view;
+  const models = view.models || [];
+  const multi = models.length > 1;
+  const sel = selectedLabel(view);
+  backLink.style.display = (multi && sel) ? '' : 'none';
+
+  if (sel || !multi) {
+    const label = sel || (models[0] || {}).label;
+    overviewEl.style.display = 'none';
+    detailEl.style.display = '';
+    headerStop.style.display = multi ? 'none' : '';  // per-model Stop lives in the view when multi
+    const name = (models.find(m => m.label === label) || {}).name || label;
+    const refs = getView(label, name, false);
+    if (detailEl.firstChild !== refs.root) { detailEl.innerHTML = ''; detailEl.appendChild(refs.root); }
+    updateView(refs, view.runs[label], false, label, multi);
+    refs.stop.style.display = multi ? '' : 'none';   // N=1: header Stop covers it
+    if (!multi) setStopButton(headerStop, view.runs[label] || {}, stopAllReq);
+    return;
+  }
+
+  // Overview: one compact card per model, in manifest order.
+  detailEl.style.display = 'none';
+  overviewEl.style.display = '';
+  headerStop.style.display = '';
+  for (const m of models) {
+    const refs = getView(m.label, m.name, true);
+    if (refs.root.parentElement !== overviewEl) overviewEl.appendChild(refs.root);
+    updateView(refs, view.runs[m.label], true, m.label, true);
+  }
+  const anySampling = models.some(m => {
+    const st = view.runs[m.label] || {};
+    return st.sampling && st.sampling.chains &&
+      Object.values(st.sampling.chains).some(c => c.phase === 'sampling');
+  });
+  const allComplete = models.every(m => (view.runs[m.label] || {}).complete);
+  if (allComplete) { headerStop.textContent = 'Done'; headerStop.disabled = true; }
+  else if (stopAllReq) { headerStop.textContent = 'Stopping...'; headerStop.disabled = true; }
+  else if (anySampling) { headerStop.textContent = 'Stop all'; headerStop.disabled = false; }
+  else { headerStop.textContent = 'Waiting...'; headerStop.disabled = true; }
+}
+window.addEventListener('hashchange', () => { if (lastView) render(lastView); });
+
 let failCount = 0;
+function showOffline() {
+  const note = '<div style="background:#eee;color:#555;padding:8px 12px;border-radius:6px;' +
+    'font-size:13px;margin-bottom:12px;">Dashboard offline &mdash; the run has ended. ' +
+    'Check your notebook for results.</div>';
+  (overviewEl.style.display !== 'none' ? overviewEl : detailEl).insertAdjacentHTML('afterbegin', note);
+  headerStop.disabled = true;
+}
 async function poll() {
   if (!polling) return;
   try {
     const r = await fetch(progressUrl);
     const data = await r.json();
     failCount = 0;
-    renderPhases(data.phases || []);
-    renderSampling(data.sampling);
-    if (data.convergence) renderConvergence(data.convergence);
-    if (data.traces) renderTraces(data.traces);
-
-    // Enable stop button during sampling (not tuning)
-    const isSampling = (data.sampling && data.sampling.chains &&
-      Object.values(data.sampling.chains).some(c => c.phase === 'sampling'));
-    if (isSampling && !stopRequested && !data.complete) {
-      stopBtn.textContent = 'Stop';
-      stopBtn.disabled = false;
-    } else if (data.complete) {
-      stopBtn.textContent = 'Done';
-      stopBtn.disabled = true;
-      document.getElementById('banner').innerHTML =
-        '<div class="complete-banner">Sampling complete</div>';
+    const view = normalize(data);
+    render(view);
+    if (view.models.length && view.models.every(m => (view.runs[m.label] || {}).complete)) {
       polling = false;
     }
-
   } catch (e) {
     // The /progress endpoint becomes unreachable when the run ends and the
     // Modal app shuts down with the notebook cell. Tolerate a couple of
     // transient misses, then stop with a calm message (not a red error loop).
     failCount++;
-    if (failCount >= 3) {
-      stopBtn.disabled = true;
-      document.getElementById('banner').innerHTML =
-        '<div style="background:#eee;color:#555;padding:8px 12px;border-radius:6px;' +
-        'font-size:13px;">Dashboard offline &mdash; the run has ended. ' +
-        'Check your notebook for results.</div>';
-      polling = false;
-    }
+    if (failCount >= 3) { showOffline(); polling = false; }
   }
   if (polling) setTimeout(poll, 1000);
 }
-function renderPhases(phases) {
+function phaseIcon(status) {
+  if (status === 'done') return '<span class="done">&#10003;</span>';
+  if (status === 'in_progress') return '<span class="spinner"></span>';
+  return '<span class="error">&#10007;</span>';
+}
+function renderPhases(el, phases, compact) {
+  phases = phases || [];
+  if (compact) {
+    // Overview: collapse to the single most-relevant phase line.
+    const active = [...phases].reverse().find(p => p.status === 'in_progress') || phases[phases.length - 1];
+    el.innerHTML = active
+      ? '<div class="phase">' + phaseIcon(active.status) + ' <span class="detail">' + active.detail + '</span></div>'
+      : '<div class="phase"><span class="spinner"></span> <span class="detail">waiting...</span></div>';
+    return;
+  }
   let html = '';
   for (const p of phases) {
-    let icon;
-    if (p.status === 'done') icon = '<span class="done">&#10003;</span>';
-    else if (p.status === 'in_progress') icon = '<span class="spinner"></span>';
-    else icon = '<span class="error">&#10007;</span>';
-    html += '<div class="phase">' + icon + ' <span class="detail">' + p.detail + '</span></div>';
+    html += '<div class="phase">' + phaseIcon(p.status) + ' <span class="detail">' + p.detail + '</span></div>';
   }
-  document.getElementById('phases').innerHTML = html;
+  el.innerHTML = html;
 }
-function renderSampling(s) {
-  if (!s || !s.chains) { document.getElementById('sampling').innerHTML = ''; return; }
-  let html = '<table><tr><th>Chain</th><th>Progress</th><th>Draws</th><th>Div</th><th>Step</th><th>Speed</th><th>ETA</th></tr>';
+function renderSampling(el, s, compact) {
+  if (!s || !s.chains) { el.innerHTML = ''; return; }
   const ids = Object.keys(s.chains).sort((a,b) => +a - +b);
+  if (compact) {
+    // Overview: one overall bar driven by the slowest chain + a summary line.
+    let minDraw = Infinity, total = 0;
+    for (const id of ids) { const c = s.chains[id]; minDraw = Math.min(minDraw, c.draw); total = Math.max(total, c.total); }
+    if (minDraw === Infinity) minDraw = 0;
+    const pct = total > 0 ? (minDraw / total * 100) : 0;
+    const barClass = s.total_divergences > 0 ? 'bar-div' : 'bar-ok';
+    el.innerHTML = '<div class="bar-bg"><div class="bar-fill ' + barClass + '" style="width:' + pct + '%"></div></div>'
+      + '<div class="footer">' + ids.length + ' chains | ' + minDraw + '/' + total + ' draws | Div: '
+      + s.total_divergences + ' | ' + s.elapsed.toFixed(1) + 's</div>';
+    return;
+  }
+  let html = '<table><tr><th>Chain</th><th>Progress</th><th>Draws</th><th>Div</th><th>Step</th><th>Speed</th><th>ETA</th></tr>';
   for (const id of ids) {
     const c = s.chains[id];
     const pct = c.total > 0 ? (c.draw / c.total * 100) : 0;
@@ -325,7 +492,7 @@ function renderSampling(s) {
   }
   html += '</table>';
   html += '<div class="footer">Divergences: ' + s.total_divergences + ' | Elapsed: ' + s.elapsed.toFixed(1) + 's</div>';
-  document.getElementById('sampling').innerHTML = html;
+  el.innerHTML = html;
 }
 const traceCharts = {};
 const kdeCharts = {};
@@ -359,8 +526,7 @@ function kde(values, nPoints) {
   return {x, y};
 }
 
-function renderTraces(traces) {
-  const container = document.getElementById('traces');
+function renderTraces(container, traces, prefix) {
   if (!container.classList.contains('section')) {
     container.classList.add('section');
     container.innerHTML = '<div class="section-title">Traces</div>';
@@ -371,6 +537,9 @@ function renderTraces(traces) {
   const chartW = narrow ? cw - 40 : Math.floor((cw - 40) / 2);
 
   for (const param of paramNames) {
+    // Namespace chart state + element ids by model so per-model charts (which
+    // may share param names) never collide.
+    const ckey = prefix + '::' + param;
     const chainData = traces[param];
     if (!chainData || chainData.length === 0) continue;
     const nChains = chainData.length;
@@ -419,20 +588,20 @@ function renderTraces(traces) {
       kdeSeries.push({label: 'Chain ' + c, stroke: chainColors[c % chainColors.length], width: 2, fill: chainColors[c % chainColors.length] + '20', points: {show: false}});
     }
 
-    const traceId = 'trace-' + param;
-    const kdeId = 'kde-' + param;
+    const traceId = 'trace-' + ckey;
+    const kdeId = 'kde-' + ckey;
 
     // Recreate charts if number of chains changed
-    if (traceCharts[param] && traceCharts[param].series.length !== nChains + 1) {
-      traceCharts[param].destroy();
-      delete traceCharts[param];
-      kdeCharts[param].destroy();
-      delete kdeCharts[param];
+    if (traceCharts[ckey] && traceCharts[ckey].series.length !== nChains + 1) {
+      traceCharts[ckey].destroy();
+      delete traceCharts[ckey];
+      kdeCharts[ckey].destroy();
+      delete kdeCharts[ckey];
       const old = document.getElementById(traceId);
       if (old) old.parentElement.parentElement.remove();
     }
 
-    if (!traceCharts[param]) {
+    if (!traceCharts[ckey]) {
       // Create wrapper with label and two chart divs side by side
       const wrapper = document.createElement('div');
       wrapper.style.marginTop = '16px';
@@ -451,13 +620,13 @@ function renderTraces(traces) {
       container.appendChild(wrapper);
 
       const chartH = 140;
-      kdeCharts[param] = new uPlot({
+      kdeCharts[ckey] = new uPlot({
         width: chartW, height: chartH, series: kdeSeries,
         scales: {x: {range: (u, dMin, dMax) => [yMin, yMax]}},
         axes: [{size: 30, stroke: '#555', ticks: {stroke: '#333'}}, {size: 40, stroke: '#555', ticks: {stroke: '#333'}}],
         legend: {show: false}, cursor: {show: false},
       }, kdeData, kdeDiv);
-      traceCharts[param] = new uPlot({
+      traceCharts[ckey] = new uPlot({
         width: chartW, height: chartH, series: traceSeries,
         scales: {y: {range: (u, dMin, dMax) => [yMin, yMax]}},
         axes: [{size: 30, stroke: '#555', ticks: {stroke: '#333'}}, {size: 40, stroke: '#555', ticks: {stroke: '#333'}}],
@@ -468,36 +637,41 @@ function renderTraces(traces) {
       const newCw = container.clientWidth || 700;
       const newNarrow = newCw < 600;
       const newChartW = newNarrow ? newCw - 40 : Math.floor((newCw - 40) / 2);
-      kdeCharts[param].setSize({width: newChartW, height: 140});
-      traceCharts[param].setSize({width: newChartW, height: 140});
+      kdeCharts[ckey].setSize({width: newChartW, height: 140});
+      traceCharts[ckey].setSize({width: newChartW, height: 140});
       // Update scale ranges for new data
-      kdeCharts[param].scales.x.range = (u, dMin, dMax) => [yMin, yMax];
-      traceCharts[param].scales.y.range = (u, dMin, dMax) => [yMin, yMax];
-      kdeCharts[param].setData(kdeData);
-      traceCharts[param].setData(traceData);
+      kdeCharts[ckey].scales.x.range = (u, dMin, dMax) => [yMin, yMax];
+      traceCharts[ckey].scales.y.range = (u, dMin, dMax) => [yMin, yMax];
+      kdeCharts[ckey].setData(kdeData);
+      traceCharts[ckey].setData(traceData);
     }
   }
 }
 
-let lastConvTotalDraws = 0;
-function renderConvergence(conv) {
-  if (!conv || !conv.params) { document.getElementById('convergence').innerHTML = ''; return; }
+function renderConvergence(el, conv, compact) {
+  if (!conv || !conv.params) { el.innerHTML = ''; return; }
   const params = conv.params;
   const names = Object.keys(params).sort();
-  if (names.length === 0) return;
-  lastConvTotalDraws = conv.total_draws || 0;
-
-  function rhatClass(v) { return v < 1.01 ? 'conv-good' : v < 1.05 ? 'conv-warn' : 'conv-bad'; }
-  function essClass(v) { return v >= 400 ? 'conv-good' : v >= 100 ? 'conv-warn' : 'conv-bad'; }
+  if (names.length === 0) { el.innerHTML = ''; return; }
 
   let allGood = true;
-  let html = '<div class="section"><div class="section-title">Convergence</div>';
-
-  const verdictClass = allGood ? 'verdict-good' : 'verdict-warn';
-  let tableHtml = '<table><tr><th>Parameter</th><th>R-hat</th><th>Bulk ESS</th><th>Tail ESS</th></tr>';
   for (const name of names) {
     const p = params[name];
     if (p.rhat >= 1.01 || p.ess_bulk < 400 || p.ess_tail < 400) allGood = false;
+  }
+  const vClass = allGood ? 'verdict-good' : 'verdict-warn';
+  const vText = allGood ? 'Converged (' + conv.draws + ' draws)' : 'Not yet converged (' + conv.draws + ' draws)';
+  if (compact) {
+    // Overview: verdict badge only.
+    el.innerHTML = '<div class="verdict ' + vClass + '">' + vText + '</div>';
+    return;
+  }
+
+  function rhatClass(v) { return v < 1.01 ? 'conv-good' : v < 1.05 ? 'conv-warn' : 'conv-bad'; }
+  function essClass(v) { return v >= 400 ? 'conv-good' : v >= 100 ? 'conv-warn' : 'conv-bad'; }
+  let tableHtml = '<table><tr><th>Parameter</th><th>R-hat</th><th>Bulk ESS</th><th>Tail ESS</th></tr>';
+  for (const name of names) {
+    const p = params[name];
     tableHtml += '<tr>'
       + '<td style="font-family:monospace;font-size:12px;">' + cleanName(name) + '</td>'
       + '<td class="' + rhatClass(p.rhat) + '">' + p.rhat.toFixed(3) + '</td>'
@@ -506,13 +680,8 @@ function renderConvergence(conv) {
       + '</tr>';
   }
   tableHtml += '</table>';
-
-  const vClass = allGood ? 'verdict-good' : 'verdict-warn';
-  const vText = allGood ? 'Converged (' + conv.draws + ' draws)' : 'Not yet converged (' + conv.draws + ' draws)';
-  html += '<div class="verdict ' + vClass + '">' + vText + '</div>' + tableHtml;
-  html += '</div>';
-
-  document.getElementById('convergence').innerHTML = html;
+  el.innerHTML = '<div class="section"><div class="section-title">Convergence</div>'
+    + '<div class="verdict ' + vClass + '">' + vText + '</div>' + tableHtml + '</div>';
 }
 poll();
 </script>

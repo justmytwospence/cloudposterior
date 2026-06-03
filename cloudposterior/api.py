@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import arviz as az
 
 from cloudposterior.config import RemoteConfig
-from cloudposterior.progress import JobPhase, PhaseUpdate, SamplingProgress
+from cloudposterior.progress import JobPhase, PhaseUpdate, dispatch_event
 
 if TYPE_CHECKING:
     import pymc as pm
@@ -633,14 +633,7 @@ def _run_sample(
         )
 
     def emit(event):
-        from cloudposterior.progress import ConvergenceUpdate
-        for sink in sinks:
-            if isinstance(event, PhaseUpdate):
-                sink.show_phase(event)
-            elif isinstance(event, SamplingProgress):
-                sink.show_sampling(event)
-            elif isinstance(event, ConvergenceUpdate) and hasattr(sink, "show_convergence"):
-                sink.show_convergence(event)
+        dispatch_event(event, sinks)
 
     # -- Run sampling --
     if remote:
@@ -1037,14 +1030,7 @@ def _run_sample_persistent(
     )
 
     def emit(event):
-        from cloudposterior.progress import ConvergenceUpdate
-        for sink in sinks:
-            if isinstance(event, PhaseUpdate):
-                sink.show_phase(event)
-            elif isinstance(event, SamplingProgress):
-                sink.show_sampling(event)
-            elif isinstance(event, ConvergenceUpdate) and hasattr(sink, "show_convergence"):
-                sink.show_convergence(event)
+        dispatch_event(event, sinks)
 
     # Upload payload to Volume if needed
     payload_path = _compute_payload_path(env._model_slug, model_bytes)
@@ -1270,15 +1256,22 @@ def cleanup_volumes(project: str | None = None) -> None:
 
 def map(models, sample_kwargs=None, *, cache: bool | str = True,
         project: str | None = None, nuts_sampler: str | None = None,
-        instance: str | None = None, progress: bool = True) -> list:
+        instance: str | None = None, progress: bool = True,
+        dashboard: bool | None = None) -> list:
     """Fit many models in parallel on the cloud.
 
     ``models`` is a list of ``pm.Model`` -- vary priors, structure, or data for
     model comparison / sensitivity. ``sample_kwargs`` is a single dict of
     ``pm.sample`` kwargs applied to all, or a list aligned with ``models``. Each
-    model is uploaded once and the fits run concurrently on one warm container
-    (Modal ``spawn``). Returns InferenceData in input order. Progress is
-    job-level only -- spawned jobs don't stream.
+    model is uploaded once and the fits run concurrently (Modal ``spawn``).
+    Returns InferenceData in input order.
+
+    A live dashboard (on by default; pass ``dashboard=False`` to opt out) serves
+    an overview of all models with drill-in per-model pages (chains, convergence,
+    traces) and global / per-model Stop. Each worker writes its own progress into
+    a shared Modal Dict keyed by its model, so the spawned fits surface live
+    without streaming back to the client. The printed line-level progress is
+    job-level only.
 
     Example::
 
@@ -1323,9 +1316,16 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     model_bytes_list = [_ensure_model_bytes(m) for m in models]
     samplers = [nuts_sampler or _default_sampler(m, local=False) for m in models]
     project = project or _detect_project_name()
+    dashboard_on = True if dashboard is None else bool(dashboard)
+
+    # Unique per-model dashboard key (slugs collide for identical/unnamed models)
+    # doubling as the per-model stop key; human name for display.
+    labels = [f"{model_slug(m)}-{i}" for i, m in enumerate(models)]
+    names = [getattr(m, "name", "") or model_slug(m) for m in models]
 
     # Provision one env (image + Volume) sized to the first model; all variants
-    # share the warm container and the project Volume.
+    # share the warm container and the project Volume. The dashboard/stop infra
+    # (Modal Dict + web endpoints) is created here when dashboard is on.
     config = RemoteConfig.from_instance(
         instance, model=models[0], sample_kwargs=kwargs_list[0], nuts_sampler=samplers[0],
     )
@@ -1333,6 +1333,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     env = backend.provision(
         model_bytes_list[0], models[0], get_version_manifest(), config,
         project=project, idle_timeout=config.idle_timeout,
+        dashboard=dashboard_on, stop_enabled=dashboard_on,
     )
     cache_backend = resolve_cache(cache, model=models[0]) if cache else None
 
@@ -1340,12 +1341,36 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         if progress:
             print(f"cp.map: {msg}")
 
+    def _dash_write(key, value):
+        d = getattr(env, "_dashboard_dict", None)
+        if d is None:
+            return
+        try:
+            _run_blocking(d.__setitem__, key, value)
+        except Exception:
+            pass
+
+    teardown = True
     try:
         env._ensure_running()
 
+        if dashboard_on:
+            # Clear stale stop flags left by a prior run on a kept-warm env.
+            _dash_write("stop", False)
+            for lbl in labels:
+                _dash_write(f"stop:{lbl}", False)
+            # Publish the manifest so the dashboard renders one panel per model.
+            _dash_write("models", [{"label": labels[i], "name": names[i]} for i in range(n)])
+            if env._dashboard_fn is not None and env._dashboard_url:
+                url = env._dashboard_url
+                if not url.endswith("/"):
+                    url += "/"
+                _show_link(url, label="Dashboard", show_qr=True)
+
         results: list = [None] * n
         run_idx: list[int] = []
-        run_meta: list = []  # aligned with run_idx: (payload_path, kwargs, sampler, key, key_kwargs)
+        # aligned with run_idx: (payload_path, kwargs, sampler, key, key_kwargs, label)
+        run_meta: list = []
         for i, m in enumerate(models):
             mb = model_bytes_list[i]
             payload_path = _compute_payload_path(model_slug(m), mb)
@@ -1356,30 +1381,54 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
                 hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
                 if hit is not None:
                     results[i] = hit
+                    if dashboard_on:
+                        # Show cached models on the overview as already complete.
+                        _dash_write(labels[i], {
+                            "phases": [{"label": "cache_hit", "status": "done",
+                                        "detail": "loaded from cache"}],
+                            "sampling": None, "complete": True,
+                        })
                     continue
             env._upload_if_needed(mb, payload_path)
             run_idx.append(i)
-            run_meta.append((payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs))
+            run_meta.append((payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i]))
 
         n_cached = n - len(run_idx)
         _log(f"fitting {len(run_idx)} model(s) in parallel"
              + (f" ({n_cached} cached)" if n_cached else "") + " ...")
+        if dashboard_on and env._dashboard_url:
+            _log(f"dashboard: {env._dashboard_url}")
 
         sampler_obj = env._sampler_cls()
+        dash_name = env._dashboard_dict_name if dashboard_on else None
         # spawn() is a blocking Modal call -- run it off the event loop so it
         # doesn't warn/stall inside an async host (marimo), mirroring how the
-        # .get() result fetch below is already wrapped.
+        # .get() result fetch below is already wrapped. Each worker writes its
+        # own progress under its label and honors global / per-model stop.
         calls = [
-            _run_blocking(sampler_obj.sample_blocking.spawn, pp, kw, sp)
-            for (pp, kw, sp, _ck, _cak) in run_meta
+            _run_blocking(
+                sampler_obj.sample_blocking.spawn, pp, kw, sp,
+                progress_dict_name=dash_name,
+                progress_key=(lbl if dashboard_on else None),
+                stop_dict_name=dash_name,
+            )
+            for (pp, kw, sp, _ck, _cak, lbl) in run_meta
         ]
         for j, i in enumerate(run_idx):
             idata = deserialize_inference_data(_run_blocking(calls[j].get))
             results[i] = idata
             _log(f"[{j + 1}/{len(run_idx)}] done")
-            _pp, _kw, _sp, ckey, ck_kwargs = run_meta[j]
+            _pp, _kw, _sp, ckey, ck_kwargs, _lbl = run_meta[j]
             if cache_backend is not None and ckey is not None:
                 cache_backend.save(ckey, idata, sample_kwargs=ck_kwargs)
+
+        if dashboard_on:
+            # Keep the env warm (reusing the cp.cloud registry) so the dashboard
+            # stays browsable after the run; Modal idles it out via
+            # scaledown_window / the atexit hook.
+            _LIVE_ENVS[_env_key(project, models[0])] = env
+            teardown = False
         return results
     finally:
-        env.teardown()
+        if teardown:
+            env.teardown()

@@ -29,31 +29,37 @@ from cloudposterior._idata import (
 )
 
 
-def _open_stop_dict(stop_dict_name):
-    """Resolve the Modal Dict used to signal an early stop, if any."""
-    if not stop_dict_name:
+def _open_dict(name):
+    """Resolve a Modal Dict by name (stop control or dashboard progress), if any."""
+    if not name:
         return None
     try:
         import modal
 
-        return modal.Dict.from_name(stop_dict_name)
+        return modal.Dict.from_name(name)
     except Exception:
         return None
 
 
-def _stop_requested(stop_dict) -> bool:
+def _stop_requested(stop_dict, stop_key=None) -> bool:
     """Best-effort read of the stop flag. Called from the generator loop only
     (never the per-draw sampling hot loop) so the network round-trip can't slow
-    sampling."""
+    sampling. Honors the global ``stop`` flag and, for cp.map, a per-model
+    ``stop:<stop_key>`` flag set by the dashboard's per-model Stop button."""
     if stop_dict is None:
         return False
     try:
-        return bool(stop_dict.get("stop", False))
+        if bool(stop_dict.get("stop", False)):
+            return True
+        if stop_key and bool(stop_dict.get(f"stop:{stop_key}", False)):
+            return True
+        return False
     except Exception:
         return False
 
 
-def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_name=None):
+def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_name=None,
+                       stop_key=None):
     """Run MCMC sampling and yield msgpack-encoded progress + results.
 
     Shared core logic used by both one-shot and persistent paths. The caller
@@ -137,7 +143,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     all_chain_states: dict[str, dict] = {}
     counters = {"total_draws": 0, "last_conv_draws": 0}
     sample_start = time.time()
-    stop_dict = _open_stop_dict(stop_dict_name)
+    stop_dict = _open_dict(stop_dict_name)
 
     sampling_error = None
     idata = None
@@ -286,7 +292,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                         pass
                     if converged:
                         break
-                if _stop_requested(stop_dict):
+                if _stop_requested(stop_dict, stop_key):
                     try:
                         idata = _to_inference_data(handle.abort())  # returns partial trace
                         stopped_early = True
@@ -428,7 +434,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                 if until and _conv_meets_target(conv, until):
                     converged = True
                     should_stop["v"] = True  # callback raises -> keeps partial trace
-            if not should_stop["v"] and _stop_requested(stop_dict):
+            if not should_stop["v"] and _stop_requested(stop_dict, stop_key):
                 should_stop["v"] = True  # callback raises KeyboardInterrupt on its next draw
         sample_thread.join()
         snap = _drain_and_yield()
@@ -448,7 +454,7 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
         raise sampling_error
 
     if not stopped_early and stop_dict is not None:
-        stopped_early = _stop_requested(stop_dict)
+        stopped_early = _stop_requested(stop_dict, stop_key)
 
     if converged:
         yield msgpack.packb({
@@ -751,18 +757,40 @@ def run_compute_log_likelihood(
 
 
 def run_sampling_blocking(payload_path: str, sample_kwargs: dict,
-                          nuts_sampler: str = "nutpie") -> bytes:
+                          nuts_sampler: str = "nutpie",
+                          progress_dict_name: str | None = None,
+                          progress_key: str | None = None,
+                          stop_dict_name: str | None = None) -> bytes:
     """Run sampling to completion and return lz4 NetCDF bytes (no streaming).
 
-    Used by cp.map via Modal spawn_map -- spawn can't stream, so we drive the
-    streaming generator here and keep only the final result chunk.
+    Used by cp.map via Modal spawn -- spawn can't stream, so we drive the
+    streaming generator here and keep only the final result chunk. When a
+    dashboard Dict is provided, the decoded progress events are written into it
+    server-side under ``progress_key`` (this model's label), reusing the very
+    same DashboardSink the client uses for single-model runs. ``stop_dict_name``
+    + ``progress_key`` also wire up the dashboard's global / per-model Stop.
     """
     import msgpack
+
+    from cloudposterior.progress import decode_progress_event, dispatch_event
+
+    # Server-side dashboard sink: write this model's progress under its own key
+    # so N concurrent map workers never clobber each other.
+    sink = None
+    if progress_dict_name and progress_key:
+        from cloudposterior.dashboard import DashboardSink
+
+        progress_dict = _open_dict(progress_dict_name)
+        if progress_dict is not None:
+            sink = DashboardSink(progress_dict, key=progress_key)
 
     model = _load_model_from_volume(payload_path)
     idata_bytes = None
     expecting_result = False
-    for chunk in _sample_and_stream(model, sample_kwargs, nuts_sampler):
+    for chunk in _sample_and_stream(
+        model, sample_kwargs, nuts_sampler,
+        stop_dict_name=stop_dict_name, stop_key=progress_key,
+    ):
         if expecting_result:
             idata_bytes = chunk
             expecting_result = False
@@ -775,6 +803,13 @@ def run_sampling_blocking(payload_path: str, sample_kwargs: dict,
                 decoded_any = True
                 if isinstance(decoded, dict) and decoded.get("type") == "result":
                     expecting_result = True
+                    continue
+                if sink is not None and isinstance(decoded, dict):
+                    # Best-effort: a sink hiccup must not corrupt result detection.
+                    try:
+                        dispatch_event(decode_progress_event(decoded), [sink])
+                    except Exception:
+                        pass
             if not decoded_any:
                 idata_bytes = chunk
         except Exception:
