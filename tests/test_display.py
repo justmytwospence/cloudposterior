@@ -90,6 +90,16 @@ def test_notebook_display_stop_button(monkeypatch):
     assert d2._widget.stop_url == ""
 
 
+def test_notebook_display_stop_button_hides_when_sampling_done(monkeypatch):
+    pytest.importorskip("anywidget")
+    monkeypatch.setattr(display.NotebookDisplay, "_mount", lambda self: None)
+    d = display.NotebookDisplay("test", stop_url="https://x.modal.run", stop_token="tok")
+    d.show_phase(_phase("in_progress"))
+    assert d._widget.stop_url == "https://x.modal.run"  # still stoppable
+    d.show_phase(_phase("done"))
+    assert d._widget.stop_url == ""  # cleared -> ESM hides the button
+
+
 def test_notebook_display_render_degrades_when_trait_set_raises(monkeypatch):
     pytest.importorskip("anywidget")
     monkeypatch.setattr(display.NotebookDisplay, "_mount", lambda self: None)

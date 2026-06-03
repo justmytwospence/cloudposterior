@@ -273,6 +273,14 @@ class NotebookDisplay:
             if not found:
                 self._phases.append((update.status, update.phase.value, detail))
 
+        # Hide the Stop button once sampling reaches a terminal state -- there's
+        # nothing left to stop. Clearing stop_url drives the ESM to hide it.
+        if update.phase.value == "sampling" and update.status != "in_progress":
+            try:
+                self._widget.stop_url = ""
+            except Exception:
+                pass
+
         self._render()
 
     def show_sampling(self, progress: SamplingProgress):
