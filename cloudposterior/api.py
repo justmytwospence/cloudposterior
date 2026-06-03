@@ -33,6 +33,38 @@ def _detect_project_name() -> str:
     return Path.cwd().name
 
 
+# Remote environments kept warm AFTER the `with cp.cloud(...)` block exits, so
+# the dashboard stays browsable and repeat runs of the same model reuse the warm
+# container (Modal's scaledown_window idles it out, ~20 min). Keyed by
+# (project, model_slug). Torn down by cp.cleanup_volumes(), cloud.destroy(), or
+# atexit on interpreter/kernel shutdown.
+_LIVE_ENVS: dict = {}
+
+
+def _env_key(project: str, model) -> tuple:
+    from cloudposterior.naming import model_slug
+
+    return (project, model_slug(model))
+
+
+def _teardown_live_envs(project: str | None = None) -> None:
+    """Tear down kept-warm environments (all, or just one project)."""
+    for key in list(_LIVE_ENVS):
+        if project is not None and key[0] != project:
+            continue
+        env = _LIVE_ENVS.pop(key, None)
+        if env is not None:
+            try:
+                env.teardown()
+            except Exception:
+                pass
+
+
+import atexit as _atexit  # noqa: E402
+
+_atexit.register(_teardown_live_envs)
+
+
 class cloud:
     """Context manager that intercepts PyMC operations with remote execution,
     caching, live dashboard, and push notifications.
@@ -114,14 +146,28 @@ class cloud:
         pm.sample = self._originals["sample"]
         pm.sample_prior_predictive = self._originals["sample_prior_predictive"]
         pm.sample_posterior_predictive = self._originals["sample_posterior_predictive"]
-        if self._env is not None:
-            self._env.teardown()
-            self._env = None
+        # Leave the remote env warm (kept in _LIVE_ENVS) so the dashboard stays
+        # browsable and a repeat run reuses the container. Stopped by
+        # cp.cleanup_volumes(), session.destroy(), or atexit on shutdown.
         return self.model.__exit__(*exc)
 
     def _provision_environment(self, nuts_sampler: str, sample_kwargs: dict):
         from cloudposterior.backends.modal_backend import ModalBackend
         from cloudposterior.serialize import get_version_manifest
+
+        # Reuse a kept-warm env for this model if one is still up -- unless this
+        # run needs a dashboard the warm env wasn't provisioned with.
+        key = _env_key(self.project, self.model)
+        existing = _LIVE_ENVS.get(key)
+        if existing is not None and not (self.dashboard and existing._dashboard_fn is None):
+            self._env = existing
+            return
+        if existing is not None:  # insufficient for this run -- replace it
+            try:
+                existing.teardown()
+            except Exception:
+                pass
+            _LIVE_ENVS.pop(key, None)
 
         config = RemoteConfig.from_instance(
             self.instance, model=self.model, sample_kwargs=sample_kwargs,
@@ -140,6 +186,7 @@ class cloud:
         # Stash the resolved config so the displayed instance_desc matches
         # what was actually provisioned (no recomputation drift).
         self._env.config = config
+        _LIVE_ENVS[key] = self._env  # keep warm past the `with` block
 
     def destroy(self):
         """Tear down the environment and clean up the project volume.
@@ -152,10 +199,10 @@ class cloud:
                 idata = pm.sample(draws=2000)
             session.destroy()
         """
-        if self._env is not None:
-            self._env.teardown()
-            self._env = None
         from cloudposterior.backends.modal_backend import ModalBackend
+
+        _teardown_live_envs(self.project)  # stop the kept-warm session(s)
+        self._env = None
         ModalBackend.cleanup_volumes(project=self.project)
 
     def _make_intercepted_sample(self):
@@ -778,6 +825,17 @@ def _run_sample_persistent(
     if env._stop_fn is not None or (dashboard and env._dashboard_fn is not None):
         env._ensure_running()
 
+    # Clear a stale stop flag left in the control Dict by a prior run on this
+    # kept-warm env -- otherwise the worker would abort immediately.
+    control_dict = getattr(env, "_dashboard_dict", None)
+    if control_dict is not None:
+        try:
+            from cloudposterior.backends.modal_backend import _run_blocking
+
+            _run_blocking(control_dict.__setitem__, "stop", False)
+        except Exception:
+            pass
+
     # Show the dashboard URL *above* the live display, so it stays put as the
     # progress widget grows (phase steps + chain rows get added below it).
     if dashboard and env._dashboard_fn is not None:
@@ -1021,10 +1079,14 @@ def cleanup_volumes(project: str | None = None) -> None:
 
         cp.cleanup_volumes()                        # delete the current project's volume
         cp.cleanup_volumes(project="my-research")   # delete a specific project's volume
+
+    Also stops any kept-warm session for the project (the dashboard goes offline).
     """
     from cloudposterior.backends.modal_backend import ModalBackend
 
-    ModalBackend.cleanup_volumes(project=project or _detect_project_name())
+    project = project or _detect_project_name()
+    _teardown_live_envs(project)  # stop the kept-warm session first
+    ModalBackend.cleanup_volumes(project=project)
 
 
 def map(models, sample_kwargs=None, *, cache: bool | str = True,

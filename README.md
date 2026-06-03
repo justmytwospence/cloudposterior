@@ -262,13 +262,13 @@ The backend is abstracted behind a `ComputeBackend` interface. Support for addit
 3. **Sample** -- `pm.sample()` runs remotely. The container loads the payload from the mounted Volume (fast local read) and streams per-chain progress back in real time via msgpack. Only sample kwargs and a path string are sent over the wire per call.
 4. **Return** -- The InferenceData trace is compressed as NetCDF, sent back, and cached.
 
-Containers stay warm for 20 minutes after the last run, so iterating on sampling settings is near-instant.
+The container stays warm for ~20 minutes **after the `with` block exits**, so a re-run of the same model is near-instant and the live dashboard stays browsable in the meantime (open it on your phone, walk away, come back and check). It idles out on its own and is torn down when the kernel exits; stop it immediately with `cp.cleanup_volumes()` or `session.destroy()`.
 
 ---
 
 ## Cleanup
 
-Model payloads are stored in a project-scoped Modal Volume. Delete when you're done:
+Model payloads are stored in a project-scoped Modal Volume. The following also stops any kept-warm container/dashboard for the project:
 
 ```python
 cp.cleanup_volumes()                        # delete the current project's volume

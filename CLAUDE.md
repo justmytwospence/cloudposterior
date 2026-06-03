@@ -63,6 +63,8 @@ When `remote=True`, containers stay warm for 20 minutes. Model payloads are stor
 4. If the model changes between calls, the new payload is uploaded to the Volume (KB, fast)
 5. Volume is project-scoped (`cp-{project}`) -- cleaned up via `cp.cleanup_volumes(project=...)`
 
+The provisioned env is **kept warm past the `with` block** (not torn down in `__exit__`): it's held in `api._LIVE_ENVS` keyed by `(project, model_slug)` and reused by later runs of the same model, so the dashboard stays browsable and re-runs skip cold start. It's torn down by `cp.cleanup_volumes()` / `session.destroy()` / an `atexit` hook (Modal's `scaledown_window` idles the container out ~20 min regardless). Each run clears the control `Dict["stop"]` flag so a reused env doesn't inherit a stale stop.
+
 ### Naming conventions (two layers)
 
 Human-readable names for browsability, machine hashes for correctness:
