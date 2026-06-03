@@ -15,3 +15,6 @@ venv/
 
 # Local worktrees
 worktrees/
+
+# Local Claude Code settings and plans
+.claude/
