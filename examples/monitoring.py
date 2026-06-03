@@ -33,9 +33,32 @@ def _():
     import pymc as pm
     import arviz as az
 
+    return az, pd, pm
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Start fresh
+
+    Clear any cached results and this project's Modal volume so the notebook runs
+    cold and reproducibly. (Shown in marimo; hidden in the rendered notebook.)
+    """)
+    return
+
+
+@app.cell
+def _():
+    import shutil
+    from pathlib import Path
+
     import cloudposterior as cp
 
-    return az, cp, pd, pm
+    # Wipe the local result cache + this project's Modal volume so the example
+    # starts cold. The sampling cells below use `cp`, so marimo runs this first.
+    shutil.rmtree(Path(".cloudposterior"), ignore_errors=True)
+    cp.cleanup_volumes()
+    return (cp,)
 
 
 @app.cell

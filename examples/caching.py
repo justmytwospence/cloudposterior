@@ -33,9 +33,32 @@ def _():
     import pymc as pm
     import arviz as az
 
+    return az, pd, pm
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Start fresh
+
+    Wipe the local disk cache so the disk-caching demo below is a genuine miss
+    each run -- reproducible and clean to re-run. (Shown in marimo; hidden in the
+    rendered notebook. Remove this cell to watch the cache survive a restart.)
+    """)
+    return
+
+
+@app.cell
+def _():
+    import shutil
+    from pathlib import Path
+
     import cloudposterior as cp
 
-    return az, cp, pd, pm
+    # Clear .cloudposterior/ so the disk-cache cells below start cold. The
+    # sampling cells use `cp`, so marimo runs this first.
+    shutil.rmtree(Path(".cloudposterior"), ignore_errors=True)
+    return (cp,)
 
 
 @app.cell(hide_code=True)
@@ -96,9 +119,9 @@ def _(mo):
     mo.md(r"""
     ## Disk caching
 
-    With `cache="disk"`, results are saved to `.cloudposterior/` and survive kernel restarts. Restart your kernel and re-run this cell -- the result comes back instantly without any sampling.
+    With `cache="disk"`, results are saved to `.cloudposterior/` and persist across kernel restarts -- normally, restarting and re-running returns the result instantly without sampling. (Our *Start fresh* cell wipes that directory on load so this demo always runs cold; remove it to see persistence across a restart.)
 
-    The cache key includes the model structure, observed data, and all sampling parameters. Changing any of these triggers a new sample.
+    The first run below samples and writes the cache file; the second is an instant disk hit. The cache key includes the model structure, observed data, and all sampling parameters -- changing any of these triggers a new sample.
     """)
     return
 
@@ -113,6 +136,28 @@ def _(cp, pm, radon):
 @app.cell
 def _(cp, pm, radon):
     with cp.cloud(radon, cache='disk'):
+        _idata = pm.sample(draws=2000, tune=1000, chains=4)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Forcing a re-run with `overwrite`
+
+    A cache hit returns the stored result. To recompute deliberately -- you
+    changed something the cache key doesn't capture, or just want a fresh sample
+    -- pass `overwrite=True`: it ignores the cached entry, re-runs, and
+    **replaces** it. (Contrast `cache=False`, which skips the cache entirely and
+    saves nothing.)
+    """)
+    return
+
+
+@app.cell
+def _(cp, pm, radon):
+    # Ignore the cached result, re-sample, and overwrite the stored entry.
+    with cp.cloud(radon, cache="disk", overwrite=True):
         _idata = pm.sample(draws=2000, tune=1000, chains=4)
     return
 

@@ -32,9 +32,32 @@ def _():
     import pandas as pd
     import pymc as pm
 
+    return az, pd, pm
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Start fresh
+
+    Clear any cached fits and this project's Modal volume so the notebook runs
+    cold and reproducibly. (Shown in marimo; hidden in the rendered notebook.)
+    """)
+    return
+
+
+@app.cell
+def _():
+    import shutil
+    from pathlib import Path
+
     import cloudposterior as cp
 
-    return az, cp, pd, pm
+    # Wipe the local result cache + this project's Modal volume so the example
+    # starts cold. The cp.map cells below use `cp`, so marimo runs this first.
+    shutil.rmtree(Path(".cloudposterior"), ignore_errors=True)
+    cp.cleanup_volumes()
+    return (cp,)
 
 
 @app.cell(hide_code=True)
@@ -148,6 +171,48 @@ def _(az, idatas, models, pm):
 @app.cell
 def _(az, comparison):
     az.plot_compare(comparison, figsize=(8, 3))
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Adaptive early-stop with `until`
+
+    Pass `until=True` and each fit stops as soon as every scalar parameter clears
+    the convergence target (R-hat <= 1.01, ESS >= 400), with `draws=` as the cap.
+    The cheap pooled model converges in a few hundred draws while the richer
+    models keep going -- no compute wasted oversampling the easy ones. (nutpie /
+    pymc, remote.)
+    """)
+    return
+
+
+@app.cell
+def _(cp, models):
+    _idatas_until = cp.map(models, {"draws": 4000, "tune": 1000, "chains": 4}, until=True)
+    # draws each model kept -- early-stop => fewer than the 4000 cap
+    {m.name: int(it.posterior.sizes["draw"]) for m, it in zip(models, _idatas_until)}
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Forcing a re-fit with `overwrite`
+
+    The first `cp.map` cached each fit, so a plain re-run is an instant cache hit
+    (it prints `all 3 cached`). Pass `overwrite=True` to ignore the cache, refit
+    every model, and replace the stored results -- note it prints `fitting 3
+    model(s)` instead.
+    """)
+    return
+
+
+@app.cell
+def _(cp, models):
+    # Re-run ignoring the cache: refits all three (not a cache hit).
+    _idatas_overwrite = cp.map(models, {"draws": 1000, "tune": 1000, "chains": 4}, overwrite=True)
     return
 
 
