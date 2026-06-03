@@ -41,3 +41,15 @@ def test_until_normalization():
     assert cp.cloud(m, until=True).until == {"r_hat": 1.01, "ess": 400}
     assert cp.cloud(m, until={"ess": 1000}).until == {"r_hat": 1.01, "ess": 1000}
     assert cp.cloud(m, until=None).until is None
+
+
+def test_normalize_until():
+    """Shared normalizer used by cp.cloud + cp.map: True/dict/None all become a
+    dict-or-None so the worker never sees a bare True."""
+    from cloudposterior.api import _normalize_until
+
+    assert _normalize_until(True) == {"r_hat": 1.01, "ess": 400}
+    assert _normalize_until({"ess": 1000}) == {"r_hat": 1.01, "ess": 1000}
+    assert _normalize_until({"r_hat": 1.005, "ess": 800}) == {"r_hat": 1.005, "ess": 800}
+    assert _normalize_until(None) is None
+    assert _normalize_until(False) is None

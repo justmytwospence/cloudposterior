@@ -33,6 +33,7 @@ def _fake_modal(monkeypatch):
             counter["i"] += 1
             state["spawned"].append({
                 "payload_path": payload_path,
+                "kw": kw,
                 "progress_dict_name": progress_dict_name,
                 "progress_key": progress_key,
                 "stop_dict_name": stop_dict_name,
@@ -223,3 +224,46 @@ def test_cp_map_partial_cache_provisions_and_spawns_only_misses(monkeypatch):
         if isinstance(v, dict) and v.get("complete") is True
     ]
     assert len(complete_panels) == 1
+
+
+def test_cp_map_until_true_injects_normalized_target(monkeypatch):
+    """until=True is normalized to the Vehtari dict and threaded into every fit
+    (no bare True reaching the worker)."""
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    cp.map(_models(2), {"draws": 10}, cache=False, until=True)
+    assert len(state["spawned"]) == 2
+    for s in state["spawned"]:
+        assert s["kw"]["until"] == {"r_hat": 1.01, "ess": 400}
+
+
+def test_cp_map_until_dict_merges_over_defaults(monkeypatch):
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    cp.map(_models(1), {"draws": 10}, cache=False, until={"ess": 1000})
+    assert state["spawned"][0]["kw"]["until"] == {"r_hat": 1.01, "ess": 1000}
+
+
+def test_cp_map_until_warns_and_skips_for_jax_samplers(monkeypatch):
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    with pytest.warns(UserWarning, match="nutpie or pymc"):
+        cp.map(_models(2), {"draws": 10}, cache=False,
+               nuts_sampler="numpyro", until=True)
+    assert all("until" not in s["kw"] for s in state["spawned"])
+
+
+def test_cp_map_until_in_sample_kwargs_is_normalized(monkeypatch):
+    """A raw until left in sample_kwargs is normalized too (no True.get crash)."""
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    cp.map(_models(1), {"draws": 10, "until": True}, cache=False)
+    assert state["spawned"][0]["kw"]["until"] == {"r_hat": 1.01, "ess": 400}

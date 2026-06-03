@@ -47,6 +47,21 @@ def _env_key(project: str, model) -> tuple:
     return (project, model_slug(model))
 
 
+def _normalize_until(until) -> dict | None:
+    """Resolve an adaptive-stop target into a dict (or None).
+
+    ``True`` -> Vehtari defaults; a dict overrides ``r_hat`` / ``ess`` over
+    those defaults; anything else (None / False) -> None. Shared by
+    ``cp.cloud(until=...)`` and ``cp.map(until=...)`` so the worker always
+    receives a dict (it calls ``until.get(...)``), never a bare ``True``.
+    """
+    if until is True:
+        return {"r_hat": 1.01, "ess": 400}
+    if isinstance(until, dict):
+        return {"r_hat": 1.01, "ess": 400, **until}
+    return None
+
+
 def _teardown_live_envs(project: str | None = None) -> None:
     """Tear down kept-warm environments (all, or just one project)."""
     for key in list(_LIVE_ENVS):
@@ -124,16 +139,9 @@ class cloud:
         self.instance = instance
         self.progress = progress
         self.project = project or _detect_project_name()
-        # Adaptive convergence target (remote only). True -> Vehtari defaults;
-        # a dict overrides r_hat / ess. The worker early-stops once every scalar
-        # param clears it (draws= is the cap).
-        if until is True:
-            until = {"r_hat": 1.01, "ess": 400}
-        elif isinstance(until, dict):
-            until = {"r_hat": 1.01, "ess": 400, **until}
-        else:
-            until = None
-        self.until = until
+        # Adaptive convergence target (remote only). The worker early-stops once
+        # every scalar param clears it (draws= is the cap).
+        self.until = _normalize_until(until)
         self._originals: dict[str, object] = {}
         self._env = None
         self._model_bytes: bytes | None = None
@@ -1257,7 +1265,7 @@ def cleanup_volumes(project: str | None = None) -> None:
 def map(models, sample_kwargs=None, *, cache: bool | str = True,
         project: str | None = None, nuts_sampler: str | None = None,
         instance: str | None = None, progress: bool = True,
-        dashboard: bool | None = None) -> list:
+        dashboard: bool | None = None, until: dict | bool | None = None) -> list:
     """Fit many models in parallel on the cloud.
 
     ``models`` is a list of ``pm.Model`` -- vary priors, structure, or data for
@@ -1265,6 +1273,12 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     ``pm.sample`` kwargs applied to all, or a list aligned with ``models``. Each
     model is uploaded once and the fits run concurrently (Modal ``spawn``).
     Returns InferenceData in input order.
+
+    ``until`` enables adaptive early-stop (``True`` -> Vehtari defaults, or a
+    dict overriding ``r_hat`` / ``ess``): each fit stops once every scalar param
+    clears the target, with ``draws=`` as the cap. Applies to the whole batch
+    (nutpie / pymc samplers only); per-model targets are still possible by
+    putting ``until`` in each model's ``sample_kwargs`` dict.
 
     A live dashboard (on by default; pass ``dashboard=False`` to opt out) serves
     an overview of all models with drill-in per-model pages (chains, convergence,
@@ -1317,6 +1331,8 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     samplers = [nuts_sampler or _default_sampler(m, local=False) for m in models]
     project = project or _detect_project_name()
     dashboard_on = True if dashboard is None else bool(dashboard)
+    until_param = _normalize_until(until)
+    _until_warned = False
 
     # Unique per-model dashboard key (slugs collide for identical/unnamed models)
     # doubling as the per-model stop key; human name for display.
@@ -1337,6 +1353,24 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     # aligned with run_idx: (model_bytes, payload_path, kwargs, sampler, key, key_kwargs, label)
     run_meta: list = []
     for i, m in enumerate(models):
+        # Adaptive-stop target: the until= param wins; otherwise normalize (and
+        # de-footgun) any `until` left in this model's kwargs. Injected before the
+        # cache key so it participates in caching, matching cp.cloud.
+        raw_until = kwargs_list[i].pop("until", None)
+        eff_until = until_param if until is not None else _normalize_until(raw_until)
+        if eff_until is not None:
+            if samplers[i] in ("numpyro", "blackjax"):
+                if not _until_warned:
+                    import warnings
+
+                    warnings.warn(
+                        "until= requires the nutpie or pymc sampler; ignored for "
+                        f"nuts_sampler={samplers[i]!r}.", stacklevel=2,
+                    )
+                    _until_warned = True
+            else:
+                kwargs_list[i]["until"] = eff_until
+
         mb = model_bytes_list[i]
         payload_path = _compute_payload_path(model_slug(m), mb)
         ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
