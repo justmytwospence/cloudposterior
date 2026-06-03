@@ -99,12 +99,21 @@ class DiskCache:
         return None
 
     def save(self, key: str, idata, sample_kwargs: dict | None = None) -> None:
+        import os
+
         from cloudposterior.serialize import sanitize_inference_data
 
         path = self._path(key, sample_kwargs=sample_kwargs)
         path.parent.mkdir(parents=True, exist_ok=True)
         sanitize_inference_data(idata)
-        idata.to_netcdf(str(path))
+        # Write to a temp file then atomically replace. A plain to_netcdf(path)
+        # truncates in place, which fails ("unable to truncate a file which is
+        # already open") when overwrite= re-saves an entry that an earlier load
+        # left open via xarray's lazy file cache. os.replace also makes the write
+        # atomic (no half-written cache on a crash).
+        tmp = path.with_name(path.name + ".tmp")
+        idata.to_netcdf(str(tmp))
+        os.replace(tmp, path)
 
 
 # Module-level default memory cache (shared across all calls in a session)

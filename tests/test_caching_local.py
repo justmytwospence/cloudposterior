@@ -206,3 +206,18 @@ def test_overwrite_reruns_and_replaces_cache():
         idata3 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
     assert time.time() - t0 < 1.0, "expected a cache hit after overwrite"
     np.testing.assert_array_equal(_mu_a(idata2), _mu_a(idata3))
+
+
+def test_overwrite_disk_after_load_in_session(tmp_path):
+    """overwrite=True on a disk-cached model that was already loaded this session
+    must not fail to truncate a still-open file (DiskCache.save is atomic)."""
+    model = _make_radon_intercepts()
+    with cp.cloud(model, cache=tmp_path):
+        pm.sample(draws=10, tune=10, chains=1, progressbar=False)   # writes the cache
+    with cp.cloud(model, cache=tmp_path):
+        pm.sample(draws=10, tune=10, chains=1, progressbar=False)   # loads (keeps the file open)
+    with cp.cloud(model, cache=tmp_path, overwrite=True):
+        idata3 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)  # re-saves over the open file
+    assert idata3 is not None
+    assert list(tmp_path.rglob("*.nc")), "cache file should exist after overwrite"
+    assert not list(tmp_path.rglob("*.tmp")), "temp file should be replaced, not left behind"
