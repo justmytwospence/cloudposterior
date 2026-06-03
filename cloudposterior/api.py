@@ -1295,8 +1295,10 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     ``models`` is a list of ``pm.Model`` -- vary priors, structure, or data for
     model comparison / sensitivity. ``sample_kwargs`` is a single dict of
     ``pm.sample`` kwargs applied to all, or a list aligned with ``models``. Each
-    model is uploaded once and the fits run concurrently (Modal ``spawn``).
-    Returns InferenceData in input order.
+    model is uploaded once and the fits ``spawn`` concurrently; with no
+    per-container input concurrency Modal fans them out across containers, so
+    each fit is sized to *its own* model via ``Cls.with_options`` (cpu/memory)
+    rather than to the first. Returns InferenceData in input order.
 
     ``until`` enables adaptive early-stop (``True`` -> Vehtari defaults, or a
     dict overriding ``r_hat`` / ``ess``): each fit stops once every scalar param
@@ -1378,7 +1380,8 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     results: list = [None] * n
     cached_idx: list[int] = []
     run_idx: list[int] = []
-    # aligned with run_idx: (model_bytes, payload_path, kwargs, sampler, key, key_kwargs, label)
+    # aligned with run_idx:
+    #   (model_bytes, payload_path, kwargs, sampler, key, key_kwargs, label, config)
     run_meta: list = []
     for i, m in enumerate(models):
         # Adaptive-stop target: the until= param wins; otherwise normalize (and
@@ -1413,8 +1416,15 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
                     results[i] = hit
                     cached_idx.append(i)
                     continue
+        # Size each fit to its own model (each fans out to its own container);
+        # narrowed per-spawn via with_options below.
+        cfg = RemoteConfig.from_instance(
+            instance, model=m, sample_kwargs=kwargs_list[i], nuts_sampler=samplers[i],
+        )
         run_idx.append(i)
-        run_meta.append((mb, payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i]))
+        run_meta.append(
+            (mb, payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i], cfg)
+        )
 
     n_cached = len(cached_idx)
     if not run_idx:
@@ -1422,14 +1432,21 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         return results
 
     # -- At least one cache miss: provision the shared env (image + Volume, and
-    # the dashboard/stop infra when on) sized to the first model. --
-    config = RemoteConfig.from_instance(
-        instance, model=models[0], sample_kwargs=kwargs_list[0], nuts_sampler=samplers[0],
+    # the dashboard/stop infra when on). Each fit fans out to its own container
+    # (no per-container input concurrency), so size the shared image/gpu at the
+    # batch high-water mark and narrow each spawn to its model via with_options. --
+    run_configs = [meta[7] for meta in run_meta]
+    base_config = RemoteConfig(
+        cpu=max(c.cpu for c in run_configs),
+        memory=max(c.memory for c in run_configs),
+        timeout=max(c.timeout for c in run_configs),
+        gpu=next((c.gpu for c in run_configs if c.gpu), None),
+        auto_sized=any(c.auto_sized for c in run_configs),
     )
-    backend = ModalBackend(config=config)
+    backend = ModalBackend(config=base_config)
     env = backend.provision(
-        model_bytes_list[0], models[0], get_version_manifest(), config,
-        project=project, idle_timeout=config.idle_timeout,
+        model_bytes_list[0], models[0], get_version_manifest(), base_config,
+        project=project, idle_timeout=base_config.idle_timeout,
         dashboard=dashboard_on, stop_enabled=dashboard_on,
     )
 
@@ -1468,33 +1485,38 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
 
         _log(f"fitting {len(run_idx)} model(s) in parallel"
              + (f" ({n_cached} cached)" if n_cached else "") + " ...")
+        if any(meta[7].auto_sized for meta in run_meta):
+            sizes = ", ".join(f"{m[7].cpu:.0f}c/{m[7].memory // 1024}GB" for m in run_meta)
+            _log(f"per-model sizing: {sizes}")
         if dashboard_on and env._dashboard_url:
             _log(f"dashboard: {env._dashboard_url}")
 
         # Upload the miss payloads now that the env is running.
-        for (mb, payload_path, _kw, _sp, _ck, _cak, _lbl) in run_meta:
+        for (mb, payload_path, _kw, _sp, _ck, _cak, _lbl, _cfg) in run_meta:
             env._upload_if_needed(mb, payload_path)
 
-        sampler_obj = env._sampler_cls()
         dash_name = env._dashboard_dict_name if dashboard_on else None
         # spawn() is a blocking Modal call -- run it off the event loop so it
         # doesn't warn/stall inside an async host (marimo), mirroring how the
-        # .get() result fetch below is already wrapped. Each worker writes its
-        # own progress under its label and honors global / per-model stop.
+        # .get() result fetch below is already wrapped. with_options sizes each
+        # spawned container to its model (cpu/memory); the image/Volume/gpu are
+        # shared. Each worker writes its own progress and honors global/per-model stop.
         calls = [
             _run_blocking(
-                sampler_obj.sample_blocking.spawn, pp, kw, sp,
+                env._sampler_cls.with_options(cpu=cfg.cpu, memory=cfg.memory)()
+                .sample_blocking.spawn,
+                pp, kw, sp,
                 progress_dict_name=dash_name,
                 progress_key=(lbl if dashboard_on else None),
                 stop_dict_name=dash_name,
             )
-            for (_mb, pp, kw, sp, _ck, _cak, lbl) in run_meta
+            for (_mb, pp, kw, sp, _ck, _cak, lbl, cfg) in run_meta
         ]
         for j, i in enumerate(run_idx):
             idata = deserialize_inference_data(_run_blocking(calls[j].get))
             results[i] = idata
             _log(f"[{j + 1}/{len(run_idx)}] done")
-            _mb, _pp, _kw, _sp, ckey, ck_kwargs, _lbl = run_meta[j]
+            _mb, _pp, _kw, _sp, ckey, ck_kwargs, _lbl, _cfg = run_meta[j]
             if cache_backend is not None and ckey is not None:
                 cache_backend.save(ckey, idata, sample_kwargs=ck_kwargs)
 

@@ -12,7 +12,7 @@ def _fake_modal(monkeypatch):
     from cloudposterior.serialize import serialize_inference_data
 
     api._LIVE_ENVS.clear()  # avoid warm-env leakage across tests
-    state = {"captured": [], "spawned": [], "envs": [], "provision_kwargs": []}
+    state = {"captured": [], "spawned": [], "envs": [], "provision_kwargs": [], "sizes": []}
     counter = {"i": 0}
 
     class FakeCall:
@@ -42,6 +42,14 @@ def _fake_modal(monkeypatch):
 
     class FakeSampler:
         sample_blocking = FakeMethod()
+
+        def __init__(self, *a, **k):
+            pass
+
+        @classmethod
+        def with_options(cls, *, cpu=None, memory=None):
+            state["sizes"].append((cpu, memory))   # per-spawn resource sizing
+            return cls
 
     class FakeEnv:
         _model_slug = "m"
@@ -296,3 +304,19 @@ def test_cp_map_overwrite_forces_rerun_and_saves(monkeypatch):
     assert rc.loads == 0                 # never loaded
     assert len(state["spawned"]) == 2    # both re-run
     assert rc.saved == 2                 # both overwritten
+
+
+def test_cp_map_sizes_each_model_independently(monkeypatch):
+    """Each spawned fit is sized to its own model (with_options), not models[0]."""
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    # same model, but the second asks for more chains -> more cores; auto-size
+    # must reflect each model's own kwargs.
+    cp.map(
+        _models(2),
+        [{"draws": 10, "chains": 4}, {"draws": 10, "chains": 16}],
+        cache=False,
+    )
+    assert [cpu for cpu, _mem in state["sizes"]] == [4, 16]
