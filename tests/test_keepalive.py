@@ -69,3 +69,35 @@ def test_env_kept_warm_reused_and_torn_down(monkeypatch):
         assert key not in api._LIVE_ENVS
     finally:
         api._LIVE_ENVS.clear()
+
+
+def test_can_reuse_env_gates_on_gpu_for_jax_samplers():
+    """A warm CPU env must not be reused for numpyro/blackjax (its image has no
+    jax); GPU/CPU-default samplers reuse it fine."""
+    import pymc as pm
+
+    import cloudposterior as cp
+    from cloudposterior.config import RemoteConfig
+
+    with pm.Model() as m:
+        pm.Normal("x", 0, 1)
+    ctx = cp.cloud(m, remote=True)
+
+    class CpuEnv:
+        _dashboard_fn = object()           # has a dashboard
+        config = RemoteConfig(gpu=None)    # CPU image -> no jax
+
+    class GpuEnv:
+        _dashboard_fn = object()
+        config = RemoteConfig(gpu="A10G")  # jax-equipped
+
+    class NoCfgEnv:
+        _dashboard_fn = object()           # e.g. a cp.map env (no .config)
+
+    cpu = CpuEnv()
+    assert ctx._can_reuse_env(cpu, "nutpie") is True
+    assert ctx._can_reuse_env(cpu, "pymc") is True
+    assert ctx._can_reuse_env(cpu, "numpyro") is False   # CPU image lacks jax
+    assert ctx._can_reuse_env(cpu, "blackjax") is False
+    assert ctx._can_reuse_env(GpuEnv(), "numpyro") is True
+    assert ctx._can_reuse_env(NoCfgEnv(), "numpyro") is False  # conservative

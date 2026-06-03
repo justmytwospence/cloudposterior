@@ -177,15 +177,29 @@ class cloud:
         # cp.cleanup_volumes(), session.destroy(), or atexit on shutdown.
         return self.model.__exit__(*exc)
 
+    def _can_reuse_env(self, env, nuts_sampler: str) -> bool:
+        """Whether a kept-warm env satisfies this run's image/feature needs."""
+        # A run that wants the live dashboard can't reuse an env without one.
+        if self.dashboard and env._dashboard_fn is None:
+            return False
+        # External JAX samplers need a jax-equipped (GPU) image; a warm CPU image
+        # has no jax (it installs jax only when built with gpu), so re-provision.
+        # Be conservative when the warm env's config is unknown.
+        if nuts_sampler in ("numpyro", "blackjax"):
+            cfg = getattr(env, "config", None)
+            if cfg is None or cfg.gpu is None:
+                return False
+        return True
+
     def _provision_environment(self, nuts_sampler: str, sample_kwargs: dict):
         from cloudposterior.backends.modal_backend import ModalBackend
         from cloudposterior.serialize import get_version_manifest
 
-        # Reuse a kept-warm env for this model if one is still up -- unless this
-        # run needs a dashboard the warm env wasn't provisioned with.
+        # Reuse a kept-warm env for this model if one is still up -- unless it
+        # lacks what this run needs (a dashboard, or a jax/GPU image).
         key = _env_key(self.project, self.model)
         existing = _LIVE_ENVS.get(key)
-        if existing is not None and not (self.dashboard and existing._dashboard_fn is None):
+        if existing is not None and self._can_reuse_env(existing, nuts_sampler):
             self._env = existing
             return
         if existing is not None:  # insufficient for this run -- replace it
