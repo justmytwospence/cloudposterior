@@ -68,6 +68,21 @@ def deserialize_model(data: bytes):
     return pickle.loads(raw)
 
 
+def serialize_model_with_step(model, step) -> bytes:
+    """Serialize a model together with a step method in one cloudpickle blob.
+
+    A step method instance holds references into the model graph. Pickling it
+    *separately* from the model produces a step whose value variables belong to
+    a different graph instance than a separately-deserialized model, which makes
+    ``pm.sample(step=...)`` raise "not a value variable in the model". Bundling
+    both in a single pickle preserves shared object identity, so the worker can
+    reconstruct a matching ``(model, step)`` pair. The worker detects this dict
+    payload via :func:`deserialize_model` returning ``{"model", "step"}``.
+    """
+    raw = cloudpickle.dumps({"model": model, "step": step})
+    return lz4.frame.compress(raw)
+
+
 def serialize_inference_data(idata) -> bytes:
     """Serialize an arviz InferenceData to lz4-compressed NetCDF bytes.
 

@@ -47,6 +47,18 @@ def _run_blocking(fn, *args, **kwargs):
         return ex.submit(fn, *args, **kwargs).result()
 
 
+def _run_blocking_op(env, method_name: str, *args):
+    """Invoke a blocking @modal.method() on the env's Sampler Cls by name.
+
+    Ensures the app is running, instantiates the Cls, and runs the named method
+    off the event loop. Shared by the predictive, SMC, and compute_log_likelihood
+    client paths (all blocking, non-streaming remote ops).
+    """
+    env._ensure_running()
+    sampler = env._sampler_cls()
+    return _run_blocking(getattr(sampler, method_name).remote, *args)
+
+
 _MODAL_SETUP_MSG = (
     "Modal is not authenticated. To set up cloud execution:\n"
     "\n"
@@ -419,6 +431,21 @@ def _create_persistent_app(
             from cloudposterior.remote.worker import run_sampling_blocking
 
             return run_sampling_blocking(f"/data/{payload_path}", sample_kwargs, nuts_sampler)
+
+        @modal.method()
+        def sample_smc(self, payload_path: str, sample_kwargs: dict) -> bytes:
+            from cloudposterior.remote.worker import run_smc
+
+            return run_smc(f"/data/{payload_path}", sample_kwargs)
+
+        @modal.method()
+        def compute_log_likelihood(self, payload_path: str, idata_bytes: bytes,
+                                   sample_kwargs: dict) -> bytes:
+            from cloudposterior.remote.worker import run_compute_log_likelihood
+
+            return run_compute_log_likelihood(
+                f"/data/{payload_path}", idata_bytes, sample_kwargs
+            )
 
     # Add dashboard web endpoints if requested
     dashboard_fn = None

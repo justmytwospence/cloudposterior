@@ -71,6 +71,16 @@ class cloud:
 
     Remote containers stay warm for 20 minutes after the last run.
 
+    Runs the full MCMC workflow in the cloud: ``pm.sample`` (NUTS via nutpie /
+    pymc / numpyro / blackjax, and custom ``step=`` methods), ``pm.sample_smc``,
+    ``pm.sample_prior_predictive`` / ``pm.sample_posterior_predictive``, and
+    ``pm.compute_log_likelihood`` (for ``az.loo`` / ``az.waic`` / ``az.compare``).
+    Optimization-based inference (``pm.fit`` variational, ``pm.find_MAP``) and
+    non-InferenceData utilities (``pm.compute_deterministics``, ``pm.draw``) are
+    not yet routed to the cloud and still run locally. For remote ``pm.sample``,
+    ``return_inferencedata=False`` and a per-draw ``callback=`` can't be matched
+    exactly and warn instead of silently diverging.
+
     Usage::
 
         with cp.cloud(model, remote=True):               # cloud + live dashboard
@@ -134,9 +144,13 @@ class cloud:
         self._originals["sample"] = pm.sample
         self._originals["sample_prior_predictive"] = pm.sample_prior_predictive
         self._originals["sample_posterior_predictive"] = pm.sample_posterior_predictive
+        self._originals["sample_smc"] = pm.sample_smc
+        self._originals["compute_log_likelihood"] = pm.compute_log_likelihood
         pm.sample = self._make_intercepted_sample()
         pm.sample_prior_predictive = self._make_intercepted_predictive("prior")
         pm.sample_posterior_predictive = self._make_intercepted_predictive("posterior")
+        pm.sample_smc = self._make_intercepted_smc()
+        pm.compute_log_likelihood = self._make_intercepted_cll()
         self.model.__enter__()
         return self.model
 
@@ -146,6 +160,8 @@ class cloud:
         pm.sample = self._originals["sample"]
         pm.sample_prior_predictive = self._originals["sample_prior_predictive"]
         pm.sample_posterior_predictive = self._originals["sample_posterior_predictive"]
+        pm.sample_smc = self._originals["sample_smc"]
+        pm.compute_log_likelihood = self._originals["compute_log_likelihood"]
         # Leave the remote env warm (kept in _LIVE_ENVS) so the dashboard stays
         # browsable and a repeat run reuses the container. Stopped by
         # cp.cleanup_volumes(), session.destroy(), or atexit on shutdown.
@@ -211,8 +227,16 @@ class cloud:
         def intercepted_sample(**kwargs):
             _validate_sample_kwargs(kwargs)
             nuts_sampler = kwargs.pop("nuts_sampler", None)
-            if nuts_sampler is None:
+            has_step = kwargs.get("step") is not None
+            if has_step:
+                # A custom step= requires PyMC's own sampler -- nutpie and the
+                # JAX samplers ignore step= and would silently run NUTS instead.
+                nuts_sampler = "pymc"
+            elif nuts_sampler is None:
                 nuts_sampler = _default_sampler(ctx.model, local=not ctx.remote)
+
+            if ctx.remote:
+                _warn_remote_sample_fidelity(kwargs)
 
             # Adaptive early-stop: worker-side, so remote + nutpie/pymc only.
             if ctx.until is not None:
@@ -239,6 +263,17 @@ class cloud:
             else:
                 _warn_if_model_data_changed(ctx)
 
+            # Remote step= rides as a combined {model, step} payload so the
+            # step's value variables stay identity-linked to the model the
+            # worker deserializes (a separately-pickled step would not match).
+            call_model_bytes = ctx._model_bytes
+            if ctx.remote and has_step:
+                from cloudposterior.serialize import serialize_model_with_step
+
+                call_model_bytes = serialize_model_with_step(
+                    ctx.model, kwargs.pop("step")
+                )
+
             if ctx.remote and ctx._env is None:
                 # First sample call -- provision sized to these kwargs.
                 ctx._provision_environment(nuts_sampler, kwargs)
@@ -251,7 +286,7 @@ class cloud:
                 return _run_sample_persistent(
                     model=ctx.model,
                     env=ctx._env,
-                    model_bytes=ctx._model_bytes,
+                    model_bytes=call_model_bytes,
                     cache=ctx.cache,
                     dashboard=ctx.dashboard,
                     notify=ctx.notify,
@@ -268,7 +303,7 @@ class cloud:
                 nuts_sampler=nuts_sampler,
                 progress=ctx.progress,
                 original_sample=ctx._originals["sample"],
-                model_bytes=ctx._model_bytes,
+                model_bytes=call_model_bytes,
                 **kwargs,
             )
 
@@ -309,6 +344,68 @@ class cloud:
             return _run_predictive(ctx, kind, trace, kwargs)
 
         return intercepted_predictive
+
+    def _make_intercepted_smc(self):
+        """Intercept pm.sample_smc. Returns InferenceData, like pm.sample.
+
+        SMC has no per-draw callback, so the remote call is blocking (no live
+        streaming). Local runs defer to the original.
+        """
+        ctx = self
+
+        def intercepted_smc(draws=2000, **kwargs):
+            if not ctx.remote:
+                return ctx._originals["sample_smc"](draws, **kwargs)
+
+            kwargs["draws"] = draws
+            _validate_sample_kwargs(kwargs)
+            if ctx._model_bytes is None:
+                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            if ctx._env is None:
+                ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
+            return _run_smc(ctx, kwargs)
+
+        return intercepted_smc
+
+    def _make_intercepted_cll(self):
+        """Intercept pm.compute_log_likelihood (idata in -> idata out).
+
+        Matches PyMC exactly: with the default extend_inferencedata=True the
+        caller's idata is extended in place with a log_likelihood group and
+        returned; with extend_inferencedata=False a standalone idata holding
+        just that group is returned. Local runs defer to the original.
+        """
+        ctx = self
+
+        def intercepted_cll(idata=None, **kwargs):
+            if not ctx.remote:
+                return ctx._originals["compute_log_likelihood"](idata, **kwargs)
+            if idata is None:
+                raise TypeError(
+                    "compute_log_likelihood() missing required argument: 'idata'"
+                )
+            if ctx._model_bytes is None:
+                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            if ctx._env is None:
+                ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
+
+            extend = kwargs.get("extend_inferencedata", True)
+            out = _run_idata_op(ctx, "compute_log_likelihood", idata, kwargs)
+            from cloudposterior._idata import add_group, get_group, group_names
+
+            if extend:
+                # Match PyMC's in-place semantics: add the new group(s) to the
+                # caller's idata and return that same object.
+                existing = set(group_names(idata))
+                for name in group_names(out):
+                    if name not in existing:
+                        add_group(idata, name, get_group(out, name))
+                return idata
+            # extend_inferencedata=False: PyMC returns the bare log_likelihood
+            # Dataset, not an InferenceData.
+            return get_group(out, "log_likelihood")
+
+        return intercepted_cll
 
 
 def _ensure_model_bytes(model) -> bytes:
@@ -370,6 +467,27 @@ def _validate_sample_kwargs(kwargs: dict) -> None:
             val = kwargs[key]
             if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
                 raise TypeError(f"{key} must be a positive int, got {val!r}")
+
+
+def _warn_remote_sample_fidelity(kwargs: dict) -> None:
+    """Warn (don't silently diverge) about the two pm.sample behaviors that
+    can't be matched exactly for remote execution."""
+    import warnings
+
+    if kwargs.get("return_inferencedata") is False:
+        warnings.warn(
+            "return_inferencedata=False is not yet supported for remote "
+            "sampling (a MultiTrace can't be transported back); an "
+            "InferenceData is returned instead.",
+            stacklevel=3,
+        )
+    if kwargs.get("callback") is not None:
+        warnings.warn(
+            "callback= can't run per-draw against local state inside a remote "
+            "container; it is ignored for remote sampling (use remote=False to "
+            "run a callback locally).",
+            stacklevel=3,
+        )
 
 
 def _observed_data_fingerprint(model):
@@ -684,7 +802,7 @@ def _run_predictive(ctx, kind: str, trace, sample_kwargs: dict):
     """
     from cloudposterior.backends.modal_backend import (
         _compute_payload_path,
-        _run_blocking,
+        _run_blocking_op,
     )
     from cloudposterior.serialize import (
         deserialize_inference_data,
@@ -699,17 +817,78 @@ def _run_predictive(ctx, kind: str, trace, sample_kwargs: dict):
     # The worker loads the model from the Volume -- never ship one in kwargs.
     sample_kwargs.pop("model", None)
 
-    sampler = env._sampler_cls()
     if kind == "prior":
-        idata_bytes = _run_blocking(
-            sampler.prior_predictive.remote, payload_path, sample_kwargs
-        )
+        idata_bytes = _run_blocking_op(env, "prior_predictive", payload_path, sample_kwargs)
     else:
         trace_bytes = serialize_inference_data(trace)
-        idata_bytes = _run_blocking(
-            sampler.posterior_predictive.remote, payload_path, trace_bytes, sample_kwargs
+        idata_bytes = _run_blocking_op(
+            env, "posterior_predictive", payload_path, trace_bytes, sample_kwargs
         )
     return deserialize_inference_data(idata_bytes)
+
+
+def _run_smc(ctx, sample_kwargs: dict) -> az.InferenceData:
+    """Run pm.sample_smc on the remote persistent environment (blocking).
+
+    Caches the result like pm.sample, namespacing the key with the op so SMC
+    output never collides with a same-kwargs pm.sample / pm.fit run.
+    """
+    from cloudposterior.backends.modal_backend import (
+        _compute_payload_path,
+        _run_blocking_op,
+    )
+    from cloudposterior.cache import resolve_cache
+    from cloudposterior.naming import cache_key as compute_cache_key
+    from cloudposterior.serialize import deserialize_inference_data
+
+    cache_kwargs = {**sample_kwargs, "_cp_op": "smc"}
+    cache_backend = resolve_cache(ctx.cache, model=ctx.model)
+    cache_key = None
+    if cache_backend is not None:
+        cache_key = compute_cache_key(ctx._model_bytes, cache_kwargs)
+        cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
+        if cached is not None:
+            return cached
+
+    env = ctx._env
+    env._ensure_running()
+    payload_path = _compute_payload_path(env._model_slug, ctx._model_bytes)
+    env._upload_if_needed(ctx._model_bytes, payload_path)
+    sample_kwargs.pop("model", None)
+
+    idata_bytes = _run_blocking_op(env, "sample_smc", payload_path, sample_kwargs)
+    idata = deserialize_inference_data(idata_bytes)
+
+    if cache_backend is not None and cache_key:
+        cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+    return idata
+
+
+def _run_idata_op(ctx, op: str, in_idata, sample_kwargs: dict):
+    """Run an idata-in / idata-out op (e.g. compute_log_likelihood) remotely.
+
+    Ships the input idata to the worker, invokes ``op``, and returns the
+    decoded result. Not cached (matches the predictive precedent; the input
+    idata isn't folded into a key).
+    """
+    from cloudposterior.backends.modal_backend import (
+        _compute_payload_path,
+        _run_blocking_op,
+    )
+    from cloudposterior.serialize import (
+        deserialize_inference_data,
+        serialize_inference_data,
+    )
+
+    env = ctx._env
+    env._ensure_running()
+    payload_path = _compute_payload_path(env._model_slug, ctx._model_bytes)
+    env._upload_if_needed(ctx._model_bytes, payload_path)
+    sample_kwargs.pop("model", None)
+
+    in_bytes = serialize_inference_data(in_idata)
+    out_bytes = _run_blocking_op(env, op, payload_path, in_bytes, sample_kwargs)
+    return deserialize_inference_data(out_bytes)
 
 
 def _run_remote(

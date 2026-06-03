@@ -37,7 +37,7 @@ Each example in `examples/` exists in two formats that must be kept in sync:
 
 ### Request flow
 
-1. `cp.cloud(model)` context manager monkeypatches `pm.sample` to route through `_run_sample()` in `api.py`
+1. `cp.cloud(model)` context manager monkeypatches five PyMC functions to route through `api.py`: `pm.sample` (→ `_run_sample` / `_run_sample_persistent`), `pm.sample_prior_predictive` / `pm.sample_posterior_predictive` (→ `_run_predictive`), `pm.sample_smc` (→ `_run_smc`), and `pm.compute_log_likelihood` (→ `_run_idata_op`). The latter three reuse a blocking (non-streaming) remote-op template; only `pm.sample` streams per-draw progress.
 2. Model + observed data are serialized separately (cloudpickle + lz4 for the model, numpy + lz4 for data) in `serialize.py`
 3. Cache key is computed from the serialized bytes + sample kwargs (`cache.py`)
 4. If remote: `ModalBackend` (`backends/modal_backend.py`) submits a `SamplingPayload` to Modal, which runs `remote/worker.py` in a container with version-matched dependencies
@@ -91,11 +91,15 @@ When `notify=True` and `remote=True`, defaults to dashboard. When local, default
 - **`nutpie`** (the default): runs nutpie's background sampler (`blocking=False`) with its native `progress_callback`; the generator loop polls the stop Dict and calls `handle.abort()` to stop early (keeping the partial trace), then `handle.wait()` for the final result.
 - **`numpyro`/`blackjax`**: `pm.sample(nuts_sampler=..., progressbar=False)` with **no callback** -- PyMC's external NUTS samplers run inside JAX with no per-draw hook (and PyMC 6 raises if a callback is passed). These report phase-level progress only.
 
+Besides streaming sampling, the worker has **blocking (non-streaming) entries** that load the model and return lz4 NetCDF directly: `run_prior_predictive` / `run_posterior_predictive`, `run_smc` (`pm.sample_smc`), and `run_compute_log_likelihood`. They mount as `@modal.method()`s on the persistent `Sampler` Cls and are driven client-side by `_run_blocking_op`.
+
+**Custom `step=` over the wire**: a step instance pickled separately from the model has value variables in a different graph than the worker's Volume-loaded model (PyMC raises "not a value variable in the model"). So `intercepted_sample` ships a combined `{model, step}` blob via `serialize_model_with_step`; `_unpack_model_payload` on the worker detects the dict, re-injects the step, and forces the pymc sampler (so the per-draw callback / live progress still work).
+
 ### Samplers and arviz compatibility
 
 - **Default sampler**: `api._default_sampler()` picks nutpie for fully continuous models (PyMC's own default, ~2x faster) and the pymc sampler when there are discrete free RVs; locally it falls back to pymc when nutpie isn't installed. nutpie is always installed in CPU remote images (`_build_pip_specs`).
 - **Callback constraint**: PyMC's per-draw `callback` only fires for `nuts_sampler="pymc"`; PyMC 6 *raises* if a callback is passed to an external sampler. Only attach a callback on the pymc path (worker + `_run_local`).
-- **`_idata.py`**: thin shims so the codebase works on **both arviz 0.x (PyMC 5) and arviz 1.x (PyMC 6, DataTree)** -- `.groups()` vs `.groups`, removed `convert_to_inference_data`, changed `ess(method="tail")`, and the dict-valued `sample_stats` attr nutpie writes (`sanitize_inference_data`). Always go through these helpers instead of calling arviz idata methods directly.
+- **`_idata.py`**: thin shims so the codebase works on **both arviz 0.x (PyMC 5) and arviz 1.x (PyMC 6, DataTree)** -- `.groups()` vs `.groups`, removed `convert_to_inference_data`, changed `ess(method="tail")`, the dict-valued `sample_stats` attr nutpie writes, and object-dtype data vars from SMC's `sample_stats` (`beta`/`accept_rate`/`log_marginal_likelihood`, which even native `to_netcdf` rejects) -- both handled by `sanitize_inference_data`. `add_group` merges a remotely-computed group (e.g. `log_likelihood`) into a local idata in place. Always go through these helpers instead of calling arviz idata methods directly.
 
 ### Auto-sizing
 

@@ -168,6 +168,8 @@ with cp.cloud(model, remote=True):
 
 Live per-chain progress, convergence diagnostics (rank-normalized R-hat and ESS), and the stop button work with **nutpie** and **pymc**. JAX samplers (`numpyro`, `blackjax`) run entirely inside a compiled graph with no per-draw hook, so they report phase-level progress only.
 
+Custom step methods work too -- pass `step=pm.Metropolis()` (or `Slice`, `DEMetropolis`, a `CompoundStep`, ...) and cloudposterior routes to PyMC's sampler and ships the step alongside the model so it samples correctly in the cloud, with live progress. Discrete models that rely on PyMC's automatic step assignment need no `step=` at all -- just call `pm.sample()`.
+
 Works with both **PyMC 5 and PyMC 6** (PyMC 6 ships arviz 1.x's DataTree); the versions installed in the remote container are matched to your local environment.
 
 ### Adaptive sampling
@@ -194,9 +196,36 @@ az.compare(dict(zip(["pooled", "hier", "county"], idatas)))
 
 `sample_kwargs` is a shared dict or a list aligned with the models. Results return in input order. See [examples/parallelism.ipynb](examples/parallelism.ipynb).
 
-### Predictive checks
+### Predictive checks and model comparison
 
-`pm.sample_prior_predictive()` and `pm.sample_posterior_predictive()` are intercepted too, so prior/posterior predictive checks run on the same cloud container.
+`pm.sample_prior_predictive()` and `pm.sample_posterior_predictive()` are intercepted too, so prior/posterior predictive checks (and GP `.conditional()` predictions, which run through posterior predictive) execute on the same cloud container.
+
+`pm.compute_log_likelihood()` is intercepted as well -- compute pointwise log-likelihoods in the cloud, then run `az.loo` / `az.waic` / `az.compare` locally:
+
+```python
+with cp.cloud(model, remote=True):
+    idata = pm.sample(draws=2000)
+    pm.compute_log_likelihood(idata)   # adds the log_likelihood group, in the cloud
+az.loo(idata)
+```
+
+`pm.sample_smc()` (Sequential Monte Carlo) runs in the cloud too, for multimodal posteriors and model evidence.
+
+---
+
+## What runs in the cloud
+
+cloudposterior runs the **entire MCMC workflow** on the cloud container -- posterior sampling (NUTS and step methods, all four backends), prior/posterior predictive checks, SMC, and log-likelihood for model comparison. Optimization-based inference (variational inference, MAP) and a few non-`InferenceData` utilities are not yet routed to the cloud; they still run locally as usual.
+
+| Supported in the cloud | Not yet (runs locally) |
+|------------------------|------------------------|
+| `pm.sample()` -- NUTS (`nutpie`, `pymc`, `numpyro`, `blackjax`) | `pm.fit()` -- variational inference (ADVI, etc.) |
+| `pm.sample()` with custom `step=` (Metropolis, Slice, DEMetropolis, ...) | `pm.find_MAP()` -- MAP point estimation |
+| `pm.sample_smc()` -- Sequential Monte Carlo | `pm.compute_deterministics()` |
+| `pm.sample_prior_predictive()` / `pm.sample_posterior_predictive()` | `pm.draw()` |
+| `pm.compute_log_likelihood()` -- LOO/WAIC/`az.compare` | pymc-extras (`fit_pathfinder`, `fit_laplace`) |
+
+Two `pm.sample` details can't be matched exactly for remote execution and warn rather than silently diverge: `return_inferencedata=False` (a `MultiTrace` can't be transported, so you get an `InferenceData`) and a per-draw `callback=` (it can't run against local state inside a container -- use `remote=False` for that). VI, MAP, and the non-`InferenceData` utilities are a planned follow-up.
 
 ---
 

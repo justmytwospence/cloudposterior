@@ -49,6 +49,44 @@ def group_attrs(idata, name=None):
     return getattr(get_group(idata, name), "attrs", None)
 
 
+def add_group(idata, name: str, group) -> None:
+    """Add ``group`` to ``idata`` under ``name`` in place, across arviz majors.
+
+    Used to merge a remotely-computed group (e.g. ``log_likelihood``) into the
+    caller's local idata so cloudposterior matches PyMC's
+    ``extend_inferencedata=True`` in-place semantics. ``group`` may be an
+    xarray Dataset or a DataTree node; it is normalized to a Dataset.
+    """
+    import xarray as xr
+
+    ds = group
+    if not isinstance(group, xr.Dataset):
+        to_ds = getattr(group, "to_dataset", None)
+        if callable(to_ds):
+            try:
+                ds = to_ds()
+            except Exception:
+                ds = group
+
+    # arviz 0.x InferenceData exposes add_groups({name: ds}).
+    adder = getattr(idata, "add_groups", None)
+    if callable(adder):
+        try:
+            adder({name: ds})
+            return
+        except Exception:
+            pass
+
+    # arviz 1.x DataTree (and general fallback): item assignment creates a child.
+    try:
+        idata[name] = ds
+        return
+    except Exception:
+        pass
+
+    setattr(idata, name, ds)
+
+
 def load_all(idata) -> None:
     """Best-effort eager load of every group so a temp NetCDF file can be deleted."""
     for name in group_names(idata):
@@ -121,7 +159,26 @@ def sanitize_inference_data(idata):
                 except Exception:
                     attrs[key] = str(value)
 
+    def _coerce_object_datavars(group):
+        """Coerce object-dtype numeric data variables to float64 in place.
+
+        PyMC's SMC sample_stats (beta, accept_rate, log_marginal_likelihood)
+        come back as object arrays of mixed Python float/int that NetCDF can't
+        write (even native ``idata.to_netcdf()`` raises). The values are regular
+        (chain x stage) numbers, so float64 is lossless.
+        """
+        data_vars = getattr(group, "data_vars", None)
+        if data_vars is None:
+            return
+        for name in list(data_vars):
+            try:
+                if group[name].dtype == object:
+                    group[name] = group[name].astype("float64")
+            except (ValueError, TypeError, KeyError):
+                pass
+
     _fix(group_attrs(idata, None))
     for name in group_names(idata):
         _fix(group_attrs(idata, name))
+        _coerce_object_datavars(get_group(idata, name))
     return idata

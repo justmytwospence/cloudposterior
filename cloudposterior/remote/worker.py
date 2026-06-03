@@ -585,6 +585,25 @@ def _pymc_convergence(chain_traces, counters, msgpack):
     return None
 
 
+def _unpack_model_payload(obj, sample_kwargs: dict, nuts_sampler: str):
+    """Resolve a model payload that may bundle a step method.
+
+    A combined ``{"model", "step"}`` payload (see ``serialize_model_with_step``)
+    keeps the step's value variables identity-linked to the model. When a step
+    is present it is injected into ``sample_kwargs`` and the pymc sampler is
+    forced -- only it honors a custom ``step=`` and the per-draw progress
+    callback. Returns ``(model, sample_kwargs, nuts_sampler)``.
+    """
+    if isinstance(obj, dict) and "model" in obj:
+        model = obj["model"]
+        step = obj.get("step")
+        if step is not None:
+            sample_kwargs = {**sample_kwargs, "step": step}
+            nuts_sampler = "pymc"
+        return model, sample_kwargs, nuts_sampler
+    return obj, sample_kwargs, nuts_sampler
+
+
 def run_sampling(
     model_bytes: bytes,
     sample_kwargs: dict,
@@ -602,8 +621,10 @@ def run_sampling(
     import msgpack
 
     phase_start = time.time()
-    model_raw = lz4.frame.decompress(model_bytes)
-    model = pickle.loads(model_raw)
+    obj = pickle.loads(lz4.frame.decompress(model_bytes))
+    model, sample_kwargs, nuts_sampler = _unpack_model_payload(
+        obj, sample_kwargs, nuts_sampler
+    )
 
     elapsed = time.time() - phase_start
     phase_name = "container_ready" if persistent else "provisioning"
@@ -632,8 +653,10 @@ def run_sampling_from_volume(
     with open(payload_path, "rb") as f:
         model_bytes = f.read()
 
-    model_raw = lz4.frame.decompress(model_bytes)
-    model = pickle.loads(model_raw)
+    obj = pickle.loads(lz4.frame.decompress(model_bytes))
+    model, sample_kwargs, nuts_sampler = _unpack_model_payload(
+        obj, sample_kwargs, nuts_sampler
+    )
 
     elapsed = time.time() - phase_start
     yield msgpack.packb({
@@ -679,6 +702,52 @@ def run_posterior_predictive(payload_path: str, idata_bytes: bytes, sample_kwarg
     with model:
         idata = pm.sample_posterior_predictive(trace, **sample_kwargs)
     return serialize_inference_data(idata)
+
+
+def run_smc(payload_path: str, sample_kwargs: dict) -> bytes:
+    """Load model from Volume, run pm.sample_smc, return lz4 NetCDF bytes.
+
+    SMC exposes no per-draw callback, so this is a blocking call (no streaming).
+    """
+    import pymc as pm
+
+    from cloudposterior.serialize import serialize_inference_data
+
+    sample_kwargs.pop("model", None)
+    model = _load_model_from_volume(payload_path)
+    with model:
+        idata = pm.sample_smc(**sample_kwargs)
+    return serialize_inference_data(idata)
+
+
+def run_compute_log_likelihood(
+    payload_path: str, idata_bytes: bytes, sample_kwargs: dict
+) -> bytes:
+    """Load model + trace, run pm.compute_log_likelihood, return lz4 NetCDF bytes.
+
+    Always computes with ``extend_inferencedata=False`` so only the (small)
+    log_likelihood group travels back; the client decides whether to merge it
+    into the caller's idata in place (native default) or return it standalone.
+    """
+    import arviz as az
+    import pymc as pm
+
+    from cloudposterior.serialize import (
+        deserialize_inference_data,
+        serialize_inference_data,
+    )
+
+    sample_kwargs.pop("model", None)
+    sample_kwargs.pop("extend_inferencedata", None)
+    model = _load_model_from_volume(payload_path)
+    idata = deserialize_inference_data(idata_bytes)
+    with model:
+        ll = pm.compute_log_likelihood(idata, extend_inferencedata=False, **sample_kwargs)
+    # extend_inferencedata=False yields a bare Dataset on arviz 0.x; wrap it as a
+    # log_likelihood group so it travels over the NetCDF path.
+    if not hasattr(ll, "groups"):
+        ll = az.InferenceData(log_likelihood=ll)
+    return serialize_inference_data(ll)
 
 
 def run_sampling_blocking(payload_path: str, sample_kwargs: dict,
