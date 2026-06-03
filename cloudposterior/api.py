@@ -1366,8 +1366,11 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
              + (f" ({n_cached} cached)" if n_cached else "") + " ...")
 
         sampler_obj = env._sampler_cls()
+        # spawn() is a blocking Modal call -- run it off the event loop so it
+        # doesn't warn/stall inside an async host (marimo), mirroring how the
+        # .get() result fetch below is already wrapped.
         calls = [
-            sampler_obj.sample_blocking.spawn(pp, kw, sp)
+            _run_blocking(sampler_obj.sample_blocking.spawn, pp, kw, sp)
             for (pp, kw, sp, _ck, _cak) in run_meta
         ]
         for j, i in enumerate(run_idx):
