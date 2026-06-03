@@ -117,6 +117,7 @@ class cloud:
         progress: bool = True,
         project: str | None = None,
         until: dict | bool | None = None,
+        overwrite: bool = False,
     ):
         # dashboard=None means "default": on for remote, off for local with no
         # warning. dashboard=True with remote=False is a user mistake -- warn.
@@ -134,6 +135,7 @@ class cloud:
         self.model = model
         self.remote = remote
         self.cache = cache
+        self.overwrite = overwrite
         self.dashboard = dashboard and remote  # dashboard only works with remote
         self.notify = notify
         self.instance = instance
@@ -296,6 +298,7 @@ class cloud:
                     env=ctx._env,
                     model_bytes=call_model_bytes,
                     cache=ctx.cache,
+                    overwrite=ctx.overwrite,
                     dashboard=ctx.dashboard,
                     notify=ctx.notify,
                     nuts_sampler=nuts_sampler,
@@ -306,6 +309,7 @@ class cloud:
                 model=ctx.model,
                 remote=ctx.remote,
                 cache=ctx.cache,
+                overwrite=ctx.overwrite,
                 notify=ctx.notify,
                 instance=ctx.instance,
                 nuts_sampler=nuts_sampler,
@@ -576,6 +580,7 @@ def _run_sample(
     *,
     remote: bool,
     cache: bool,
+    overwrite: bool = False,
     notify: bool | str,
     instance: str | None,
     nuts_sampler: str,
@@ -598,7 +603,8 @@ def _run_sample(
 
     if cache_backend is not None:
         cache_key = compute_cache_key(model_bytes, cache_kwargs)
-        cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
+        # overwrite= forces a re-run: skip the load (still save below to replace).
+        cached = None if overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             if progress:
                 from cloudposterior.display import _emit_oneshot_html
@@ -847,7 +853,8 @@ def _run_smc(ctx, sample_kwargs: dict) -> az.InferenceData:
     cache_key = None
     if cache_backend is not None:
         cache_key = compute_cache_key(ctx._model_bytes, cache_kwargs)
-        cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
+        # overwrite= forces a re-run: skip the load (still save below to replace).
+        cached = None if ctx.overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             return cached
 
@@ -953,6 +960,7 @@ def _run_sample_persistent(
     env,
     model_bytes: bytes,
     cache: bool,
+    overwrite: bool = False,
     dashboard: bool = False,
     notify: bool | str | dict = False,
     nuts_sampler: str = "pymc",
@@ -976,7 +984,8 @@ def _run_sample_persistent(
     cache_key = None
     if cache_backend is not None:
         cache_key = compute_cache_key(model_bytes, cache_kwargs)
-        cached = cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
+        # overwrite= forces a re-run: skip the load (still save below to replace).
+        cached = None if overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
             if progress:
                 from cloudposterior.display import _emit_oneshot_html
@@ -1265,7 +1274,8 @@ def cleanup_volumes(project: str | None = None) -> None:
 def map(models, sample_kwargs=None, *, cache: bool | str = True,
         project: str | None = None, nuts_sampler: str | None = None,
         instance: str | None = None, progress: bool = True,
-        dashboard: bool | None = None, until: dict | bool | None = None) -> list:
+        dashboard: bool | None = None, until: dict | bool | None = None,
+        overwrite: bool = False) -> list:
     """Fit many models in parallel on the cloud.
 
     ``models`` is a list of ``pm.Model`` -- vary priors, structure, or data for
@@ -1279,6 +1289,10 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     clears the target, with ``draws=`` as the cap. Applies to the whole batch
     (nutpie / pymc samplers only); per-model targets are still possible by
     putting ``until`` in each model's ``sample_kwargs`` dict.
+
+    ``overwrite=True`` ignores any cached result, re-runs every model, and
+    replaces the stored entry (``cache=False`` instead skips the cache entirely,
+    saving nothing).
 
     A live dashboard (on by default; pass ``dashboard=False`` to opt out) serves
     an overview of all models with drill-in per-model pages (chains, convergence,
@@ -1376,12 +1390,15 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
         ckey = None
         if cache_backend is not None:
+            # Still compute the key (so the fresh result is saved) but skip the
+            # load when overwrite= forces a re-run.
             ckey = compute_cache_key(mb, ck_kwargs)
-            hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
-            if hit is not None:
-                results[i] = hit
-                cached_idx.append(i)
-                continue
+            if not overwrite:
+                hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
+                if hit is not None:
+                    results[i] = hit
+                    cached_idx.append(i)
+                    continue
         run_idx.append(i)
         run_meta.append((mb, payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i]))
 

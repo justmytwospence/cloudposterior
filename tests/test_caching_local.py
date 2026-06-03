@@ -187,3 +187,22 @@ def test_different_random_seed_misses_cache():
         "different random_seed values produced identical traces -- the second "
         "call must have hit the cache, contradicting cache-key sensitivity to seed"
     )
+
+
+def test_overwrite_reruns_and_replaces_cache():
+    """overwrite=True re-runs even on a warm cache and replaces the stored entry."""
+    model = _make_radon_intercepts()
+    with cp.cloud(model):
+        idata1 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
+
+    # overwrite -> re-sample (fresh RNG => different draws), not a cache hit
+    with cp.cloud(model, overwrite=True):
+        idata2 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
+    assert not np.array_equal(_mu_a(idata1), _mu_a(idata2)), "overwrite should re-run"
+
+    # the cache now holds the overwritten result: a plain re-run returns idata2
+    t0 = time.time()
+    with cp.cloud(model):
+        idata3 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
+    assert time.time() - t0 < 1.0, "expected a cache hit after overwrite"
+    np.testing.assert_array_equal(_mu_a(idata2), _mu_a(idata3))

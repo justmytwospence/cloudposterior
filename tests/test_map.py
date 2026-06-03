@@ -267,3 +267,32 @@ def test_cp_map_until_in_sample_kwargs_is_normalized(monkeypatch):
     state = _fake_modal(monkeypatch)
     cp.map(_models(1), {"draws": 10, "until": True}, cache=False)
     assert state["spawned"][0]["kw"]["until"] == {"r_hat": 1.01, "ess": 400}
+
+
+def test_cp_map_overwrite_forces_rerun_and_saves(monkeypatch):
+    """overwrite=True ignores a matching cache entry: every model re-runs and is
+    re-saved (load is never consulted)."""
+    pytest.importorskip("pymc")
+    import arviz as az
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+
+    class RecordingCache:
+        def __init__(self):
+            self.loads = 0
+            self.saved = 0
+
+        def load(self, key, **kw):
+            self.loads += 1
+            return az.from_dict(posterior={"x": np.zeros((2, 5))})  # would hit
+
+        def save(self, key, idata, **kw):
+            self.saved += 1
+
+    rc = RecordingCache()
+    out = cp.map(_models(2), {"draws": 10}, cache=rc, overwrite=True)
+    assert len(out) == 2
+    assert rc.loads == 0                 # never loaded
+    assert len(state["spawned"]) == 2    # both re-run
+    assert rc.saved == 2                 # both overwritten
