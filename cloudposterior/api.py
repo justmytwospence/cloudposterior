@@ -1323,9 +1323,41 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     labels = [f"{model_slug(m)}-{i}" for i, m in enumerate(models)]
     names = [getattr(m, "name", "") or model_slug(m) for m in models]
 
-    # Provision one env (image + Volume) sized to the first model; all variants
-    # share the warm container and the project Volume. The dashboard/stop infra
-    # (Modal Dict + web endpoints) is created here when dashboard is on.
+    def _log(msg):
+        if progress:
+            print(f"cp.map: {msg}")
+
+    # -- Cache check first: all local (cloudpickle + key hash + cache load touch
+    # no Modal), so only cache *misses* need a remote container. An all-cached
+    # map therefore provisions nothing -- no env, no dashboard. --
+    cache_backend = resolve_cache(cache, model=models[0]) if cache else None
+    results: list = [None] * n
+    cached_idx: list[int] = []
+    run_idx: list[int] = []
+    # aligned with run_idx: (model_bytes, payload_path, kwargs, sampler, key, key_kwargs, label)
+    run_meta: list = []
+    for i, m in enumerate(models):
+        mb = model_bytes_list[i]
+        payload_path = _compute_payload_path(model_slug(m), mb)
+        ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
+        ckey = None
+        if cache_backend is not None:
+            ckey = compute_cache_key(mb, ck_kwargs)
+            hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
+            if hit is not None:
+                results[i] = hit
+                cached_idx.append(i)
+                continue
+        run_idx.append(i)
+        run_meta.append((mb, payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i]))
+
+    n_cached = len(cached_idx)
+    if not run_idx:
+        _log(f"all {n} model(s) cached")
+        return results
+
+    # -- At least one cache miss: provision the shared env (image + Volume, and
+    # the dashboard/stop infra when on) sized to the first model. --
     config = RemoteConfig.from_instance(
         instance, model=models[0], sample_kwargs=kwargs_list[0], nuts_sampler=samplers[0],
     )
@@ -1335,11 +1367,6 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         project=project, idle_timeout=config.idle_timeout,
         dashboard=dashboard_on, stop_enabled=dashboard_on,
     )
-    cache_backend = resolve_cache(cache, model=models[0]) if cache else None
-
-    def _log(msg):
-        if progress:
-            print(f"cp.map: {msg}")
 
     def _dash_write(key, value):
         d = getattr(env, "_dashboard_dict", None)
@@ -1359,45 +1386,29 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
             _dash_write("stop", False)
             for lbl in labels:
                 _dash_write(f"stop:{lbl}", False)
-            # Publish the manifest so the dashboard renders one panel per model.
+            # Publish the manifest so the dashboard renders one panel per model;
+            # cached models show as already complete.
             _dash_write("models", [{"label": labels[i], "name": names[i]} for i in range(n)])
+            for i in cached_idx:
+                _dash_write(labels[i], {
+                    "phases": [{"label": "cache_hit", "status": "done",
+                                "detail": "loaded from cache"}],
+                    "sampling": None, "complete": True,
+                })
             if env._dashboard_fn is not None and env._dashboard_url:
                 url = env._dashboard_url
                 if not url.endswith("/"):
                     url += "/"
                 _show_link(url, label="Dashboard", show_qr=True)
 
-        results: list = [None] * n
-        run_idx: list[int] = []
-        # aligned with run_idx: (payload_path, kwargs, sampler, key, key_kwargs, label)
-        run_meta: list = []
-        for i, m in enumerate(models):
-            mb = model_bytes_list[i]
-            payload_path = _compute_payload_path(model_slug(m), mb)
-            ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
-            ckey = None
-            if cache_backend is not None:
-                ckey = compute_cache_key(mb, ck_kwargs)
-                hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
-                if hit is not None:
-                    results[i] = hit
-                    if dashboard_on:
-                        # Show cached models on the overview as already complete.
-                        _dash_write(labels[i], {
-                            "phases": [{"label": "cache_hit", "status": "done",
-                                        "detail": "loaded from cache"}],
-                            "sampling": None, "complete": True,
-                        })
-                    continue
-            env._upload_if_needed(mb, payload_path)
-            run_idx.append(i)
-            run_meta.append((payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i]))
-
-        n_cached = n - len(run_idx)
         _log(f"fitting {len(run_idx)} model(s) in parallel"
              + (f" ({n_cached} cached)" if n_cached else "") + " ...")
         if dashboard_on and env._dashboard_url:
             _log(f"dashboard: {env._dashboard_url}")
+
+        # Upload the miss payloads now that the env is running.
+        for (mb, payload_path, _kw, _sp, _ck, _cak, _lbl) in run_meta:
+            env._upload_if_needed(mb, payload_path)
 
         sampler_obj = env._sampler_cls()
         dash_name = env._dashboard_dict_name if dashboard_on else None
@@ -1412,13 +1423,13 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
                 progress_key=(lbl if dashboard_on else None),
                 stop_dict_name=dash_name,
             )
-            for (pp, kw, sp, _ck, _cak, lbl) in run_meta
+            for (_mb, pp, kw, sp, _ck, _cak, lbl) in run_meta
         ]
         for j, i in enumerate(run_idx):
             idata = deserialize_inference_data(_run_blocking(calls[j].get))
             results[i] = idata
             _log(f"[{j + 1}/{len(run_idx)}] done")
-            _pp, _kw, _sp, ckey, ck_kwargs, _lbl = run_meta[j]
+            _mb, _pp, _kw, _sp, ckey, ck_kwargs, _lbl = run_meta[j]
             if cache_backend is not None and ckey is not None:
                 cache_backend.save(ckey, idata, sample_kwargs=ck_kwargs)
 

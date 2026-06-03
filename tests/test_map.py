@@ -160,3 +160,66 @@ def test_cp_map_dashboard_false_opts_out(monkeypatch):
     assert all(s["stop_dict_name"] is None for s in state["spawned"])
     assert env.torn_down is True
     assert env not in api._LIVE_ENVS.values()
+
+
+def test_cp_map_all_cached_skips_provisioning(monkeypatch):
+    """When every model is a local cache hit, no Modal env / dashboard is spun up."""
+    pytest.importorskip("pymc")
+    import arviz as az
+    import cloudposterior as cp
+    import cloudposterior.api as api
+
+    state = _fake_modal(monkeypatch)
+
+    class AllHitCache:
+        def load(self, key, **kw):
+            return az.from_dict(posterior={"x": np.zeros((2, 5))})
+
+        def save(self, key, idata, **kw):
+            raise AssertionError("save should not run when everything is cached")
+
+    out = cp.map(_models(3), {"draws": 10}, cache=AllHitCache())
+    assert len(out) == 3 and all(o is not None for o in out)
+    # zero Modal work
+    assert state["provision_kwargs"] == []
+    assert state["spawned"] == []
+    assert state["envs"] == []
+    assert api._LIVE_ENVS == {}
+
+
+def test_cp_map_partial_cache_provisions_and_spawns_only_misses(monkeypatch):
+    """A partial cache still provisions, but spawns only the misses; the manifest
+    lists all models (cached ones shown as complete)."""
+    pytest.importorskip("pymc")
+    import arviz as az
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+
+    class FirstHitCache:
+        def __init__(self):
+            self.calls = 0
+
+        def load(self, key, **kw):
+            self.calls += 1
+            return az.from_dict(posterior={"x": np.zeros((2, 5))}) if self.calls == 1 else None
+
+        def save(self, key, idata, **kw):
+            pass
+
+    out = cp.map(_models(3), {"draws": 10}, cache=FirstHitCache())
+    assert len(out) == 3 and all(o is not None for o in out)
+    assert len(state["provision_kwargs"]) == 1       # provisioned once
+    assert len(state["spawned"]) == 2                # only the two misses
+    env = state["envs"][0]
+    manifest = env._dashboard_dict["models"]
+    assert len(manifest) == 3                         # manifest still covers all
+    # the cached model (input index 0) gets a complete panel; misses are written
+    # by the (faked) workers, not the client
+    cached_label = manifest[0]["label"]
+    assert env._dashboard_dict[cached_label]["complete"] is True
+    complete_panels = [
+        k for k, v in env._dashboard_dict.items()
+        if isinstance(v, dict) and v.get("complete") is True
+    ]
+    assert len(complete_panels) == 1
