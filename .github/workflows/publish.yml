@@ -4,22 +4,37 @@ on:
   release:
     types: [published]
 
-permissions:
-  id-token: write
-
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write   # OIDC token for PyPI Trusted Publishing (no stored secrets)
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install Python
+        run: uv python install 3.12
 
       - name: Build package
-        run: uv build
+        run: uv build --no-sources
 
+      # Catch a wheel/sdist that's missing bundled files (remote/worker.py, the
+      # embedded dashboard HTML) before anything is uploaded -- versions on PyPI
+      # are immutable, so a broken artifact would burn the version number.
+      - name: Smoke test (wheel)
+        run: uv run --isolated --no-project --with dist/*.whl tests/smoke_test.py
+
+      - name: Smoke test (source distribution)
+        run: uv run --isolated --no-project --with dist/*.tar.gz tests/smoke_test.py
+
+      # Trusted Publishing (OIDC) + automatic PEP 740 attestations. uv build does
+      # not generate attestations, so the upload stays on the PyPA action (kept on
+      # its maintained moving tag, release/v1, per PyPA guidance).
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

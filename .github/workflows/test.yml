@@ -10,9 +10,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       - name: Lint with ruff
         run: uvx ruff check cloudposterior/ tests/
 
@@ -21,16 +21,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
         # Exercise both arviz majors: PyMC 5 ships arviz 0.x, PyMC 6 requires
         # arviz 1.x (the DataTree rewrite). Modal e2e tests are not run in CI.
         pymc: ["5", "6"]
+        exclude:
+          # PyMC 5 is legacy; don't gate the release on it under the newest
+          # Python. 3.13 is still covered by the PyMC 6 leg.
+          - python-version: "3.13"
+            pymc: "5"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -38,12 +43,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --python ${{ matrix.python-version }}
 
+      # pymc/arviz are now runtime deps, so a plain resolve lands on PyMC 6 /
+      # arviz 1.x. Pin each leg explicitly so both majors are actually tested.
       - name: Run tests (PyMC ${{ matrix.pymc }})
         run: |
           if [ "${{ matrix.pymc }}" = "6" ]; then
             uv run --python ${{ matrix.python-version }} --with "pymc>=6,<7" --with "nutpie>=0.13" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           else
-            uv run --python ${{ matrix.python-version }} \
+            uv run --python ${{ matrix.python-version }} --with "pymc>=5,<6" --with "nutpie>=0.13" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           fi
