@@ -30,6 +30,11 @@ jobs:
           # Python. 3.13 is still covered by the PyMC 6 leg.
           - python-version: "3.13"
             pymc: "5"
+          # PyMC 6 needs arviz 1.x, whose compatible nutpie (>=0.16.10) ships no
+          # Python 3.11 wheel -- the combination is unsatisfiable. PyMC 6 is
+          # covered on 3.12 and 3.13.
+          - python-version: "3.11"
+            pymc: "6"
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -43,14 +48,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --python ${{ matrix.python-version }}
 
-      # pymc/arviz are now runtime deps, so a plain resolve lands on PyMC 6 /
-      # arviz 1.x. Pin each leg explicitly so both majors are actually tested.
+      # Pin pymc AND arviz per leg so each major is exercised deterministically
+      # (an unpinned resolve drifts to the newest arviz for both legs).
       - name: Run tests (PyMC ${{ matrix.pymc }})
         run: |
           if [ "${{ matrix.pymc }}" = "6" ]; then
-            uv run --python ${{ matrix.python-version }} --with "pymc>=6,<7" --with "nutpie>=0.13" \
+            uv run --python ${{ matrix.python-version }} \
+              --with "pymc>=6,<7" --with "arviz>=1.1,<2.0" --with "nutpie>=0.13" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           else
-            uv run --python ${{ matrix.python-version }} --with "pymc>=5,<6" --with "nutpie>=0.13" \
+            uv run --python ${{ matrix.python-version }} \
+              --with "pymc>=5,<6" --with "arviz>=0.18,<1.0" --with "nutpie>=0.13" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           fi
