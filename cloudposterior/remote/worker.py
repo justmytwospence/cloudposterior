@@ -22,6 +22,7 @@ from queue import Queue
 from threading import Thread
 
 from cloudposterior._idata import (
+    add_group as _add_group,
     ess_tail as _ess_tail,
     get_group as _get_group,
     sanitize_inference_data as _sanitize_idata_attrs,
@@ -749,10 +750,17 @@ def run_compute_log_likelihood(
     idata = deserialize_inference_data(idata_bytes)
     with model:
         ll = pm.compute_log_likelihood(idata, extend_inferencedata=False, **sample_kwargs)
-    # extend_inferencedata=False yields a bare Dataset on arviz 0.x; wrap it as a
-    # log_likelihood group so it travels over the NetCDF path.
+    # extend_inferencedata=False yields a bare Dataset; wrap it as a
+    # log_likelihood group so it travels over the NetCDF path. arviz 0.x accepts
+    # the group as a constructor kwarg; arviz 1.x (DataTree) rejects it, so fall
+    # back to attaching it via the version-agnostic add_group shim.
     if not hasattr(ll, "groups"):
-        ll = az.InferenceData(log_likelihood=ll)
+        try:
+            ll = az.InferenceData(log_likelihood=ll)
+        except TypeError:
+            wrapped = az.InferenceData()
+            _add_group(wrapped, "log_likelihood", ll)
+            ll = wrapped
     return serialize_inference_data(ll)
 
 
