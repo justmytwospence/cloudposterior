@@ -21,3 +21,10 @@ worktrees/
 
 # marimo export session/layout artifacts
 __marimo__/
+
+# Quarto docs site (build output + generated API pages + intermediates)
+_site/
+.quarto/
+/reference/
+/objects.json
+**/*.quarto_ipynb

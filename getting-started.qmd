@@ -1,0 +1,61 @@
+---
+title: "Getting started"
+---
+
+## Install
+
+```bash
+pip install cloudposterior
+```
+
+This pulls in PyMC and ArviZ. For cloud execution you also need a (free) [Modal](https://modal.com)
+account:
+
+```bash
+pip install modal
+modal setup
+```
+
+## Your first cloud sample
+
+The only change to your normal PyMC workflow is the `with cp.cloud(...)` line ---
+`pm.sample()` stays exactly the same.
+
+```python
+import pymc as pm
+import cloudposterior as cp
+
+with pm.Model() as model:
+    mu = pm.Normal("mu", 0, 5)
+    sigma = pm.HalfNormal("sigma", 5)
+    pm.Normal("obs", mu, sigma, observed=data)
+
+with cp.cloud(model, remote=True, cache="disk"):
+    idata = pm.sample(draws=2000, chains=4)
+```
+
+Run that cell again and the cached result returns instantly --- no re-sampling.
+
+## What you can toggle
+
+`cp.cloud(model, ...)` accepts independent switches:
+
+- `remote=True` --- sample on an auto-sized cloud VM. Omit it to run locally with
+  just caching/notifications.
+- `cache="disk"` --- persist results to `./.cloudposterior` (survives restarts).
+  The default `cache=True` keeps results for the current session; `cache=False`
+  disables it.
+- `notify=True` --- live progress on your phone (local) or a web dashboard (remote).
+- `instance="large"` --- override the auto-sized VM with a preset.
+
+See the [examples](examples/basics.ipynb) for each feature in depth.
+
+## Cleanup
+
+Remote runs keep a small project-scoped volume warm. Tear it down when you're done:
+
+```python
+import cloudposterior as cp
+
+cp.cleanup_volumes(project="my-project")
+```
