@@ -249,21 +249,27 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             counters["total_draws"] = total
 
         handle = None
+        nutpie_kwargs = dict(
+            draws=draws,
+            tune=user_tune,
+            chains=chains,
+            cores=cores,
+            seed=random_seed,
+            save_warmup=False,
+            progress_bar=False,
+            blocking=False,
+        )
         try:
-            handle = nutpie.sample(
-                compiled,
-                draws=draws,
-                tune=user_tune,
-                chains=chains,
-                cores=cores,
-                seed=random_seed,
-                save_warmup=False,
-                progress_bar=False,
-                progress_callback=nutpie_cb,
-                blocking=False,
-            )
-        except Exception as exc:
-            sampling_error = exc
+            handle = nutpie.sample(compiled, progress_callback=nutpie_cb, **nutpie_kwargs)
+        except Exception:
+            # Some nutpie builds (e.g. 0.16.8) accept progress_callback but fail to
+            # wire it ("'PyNutsSettings' object has no attribute
+            # 'progress_callback'"). Fall back to sampling without live per-draw
+            # progress rather than aborting the whole run.
+            try:
+                handle = nutpie.sample(compiled, **nutpie_kwargs)
+            except Exception as exc:
+                sampling_error = exc
 
         if handle is not None:
             def _finished():
