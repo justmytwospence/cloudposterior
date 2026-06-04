@@ -4,8 +4,21 @@ import numpy as np
 import pytest
 
 
-def _fake_modal(monkeypatch):
+def _posterior_idata(values):
+    """Minimal InferenceData with a posterior group, across arviz majors.
+
+    arviz 1.x dropped from_dict's per-group kwargs and made InferenceData a
+    DataTree, so build the group via dict_to_dataset + the add_group shim."""
     import arviz as az
+
+    from cloudposterior._idata import add_group
+
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset(values))
+    return idata
+
+
+def _fake_modal(monkeypatch):
 
     import cloudposterior.api as api
     from cloudposterior.backends import modal_backend as mb
@@ -23,7 +36,7 @@ def _fake_modal(monkeypatch):
             state["captured"].append(self._tag)
             # tag each result by spawn order so the caller can verify ordering
             return serialize_inference_data(
-                az.from_dict(posterior={"x": np.full((2, 5), float(self._tag))})
+                _posterior_idata({"x": np.full((2, 5), float(self._tag))})
             )
 
     class FakeMethod:
@@ -174,7 +187,6 @@ def test_cp_map_dashboard_false_opts_out(monkeypatch):
 def test_cp_map_all_cached_skips_provisioning(monkeypatch):
     """When every model is a local cache hit, no Modal env / dashboard is spun up."""
     pytest.importorskip("pymc")
-    import arviz as az
     import cloudposterior as cp
     import cloudposterior.api as api
 
@@ -182,7 +194,7 @@ def test_cp_map_all_cached_skips_provisioning(monkeypatch):
 
     class AllHitCache:
         def load(self, key, **kw):
-            return az.from_dict(posterior={"x": np.zeros((2, 5))})
+            return _posterior_idata({"x": np.zeros((2, 5))})
 
         def save(self, key, idata, **kw):
             raise AssertionError("save should not run when everything is cached")
@@ -200,7 +212,6 @@ def test_cp_map_partial_cache_provisions_and_spawns_only_misses(monkeypatch):
     """A partial cache still provisions, but spawns only the misses; the manifest
     lists all models (cached ones shown as complete)."""
     pytest.importorskip("pymc")
-    import arviz as az
     import cloudposterior as cp
 
     state = _fake_modal(monkeypatch)
@@ -211,7 +222,7 @@ def test_cp_map_partial_cache_provisions_and_spawns_only_misses(monkeypatch):
 
         def load(self, key, **kw):
             self.calls += 1
-            return az.from_dict(posterior={"x": np.zeros((2, 5))}) if self.calls == 1 else None
+            return _posterior_idata({"x": np.zeros((2, 5))}) if self.calls == 1 else None
 
         def save(self, key, idata, **kw):
             pass
@@ -281,7 +292,6 @@ def test_cp_map_overwrite_forces_rerun_and_saves(monkeypatch):
     """overwrite=True ignores a matching cache entry: every model re-runs and is
     re-saved (load is never consulted)."""
     pytest.importorskip("pymc")
-    import arviz as az
     import cloudposterior as cp
 
     state = _fake_modal(monkeypatch)
@@ -293,7 +303,7 @@ def test_cp_map_overwrite_forces_rerun_and_saves(monkeypatch):
 
         def load(self, key, **kw):
             self.loads += 1
-            return az.from_dict(posterior={"x": np.zeros((2, 5))})  # would hit
+            return _posterior_idata({"x": np.zeros((2, 5))})  # would hit
 
         def save(self, key, idata, **kw):
             self.saved += 1
