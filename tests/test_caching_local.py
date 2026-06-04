@@ -5,14 +5,27 @@ These run real pm.sample() against tiny hierarchical models, so they take a
 few seconds each but cost nothing.
 """
 
-import time
-
 import numpy as np
 import pymc as pm
 import pytest
 
 import cloudposterior as cp
 from cloudposterior.cache import _default_memory_cache
+
+
+def _sample_spy(monkeypatch):
+    """Count real pm.sample calls. cp.cloud invokes the original sampler only on
+    a cache MISS, so a count of 0 proves a cache hit -- robust where a wall-clock
+    threshold flakes on a slow CI runner."""
+    calls = {"n": 0}
+    real = pm.sample
+
+    def spy(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pm, "sample", spy)
+    return calls
 
 
 def _make_radon_intercepts(seed: int = 0):
@@ -83,26 +96,25 @@ def _mu_a(idata):
 
 # -- Mirror of cells 2 + 3 in caching.ipynb (memory cache miss, then hit) ----
 
-def test_memory_cache_hit_on_repeat_call():
+def test_memory_cache_hit_on_repeat_call(monkeypatch):
     """Second cp.cloud(model) block with identical kwargs returns the cached
-    result instantly without sampling."""
+    result without re-sampling."""
     model = _make_radon_intercepts()
     with cp.cloud(model):
         idata1 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
 
-    t0 = time.time()
+    calls = _sample_spy(monkeypatch)
     with cp.cloud(model):
         idata2 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
-    elapsed = time.time() - t0
 
-    assert elapsed < 1.0, f"cache hit took {elapsed:.2f}s -- expected sub-second"
+    assert calls["n"] == 0, "cache hit should not re-sample"
     np.testing.assert_array_equal(_mu_a(idata1), _mu_a(idata2))
 
 
 # -- Mirror of cells 4 + 5 in caching.ipynb (disk cache miss, then hit across
 #    a fresh in-memory cache to prove persistence) -----------------------------
 
-def test_disk_cache_persists_across_memory_cache_clear(tmp_path):
+def test_disk_cache_persists_across_memory_cache_clear(tmp_path, monkeypatch):
     """Disk cache survives a wiped in-memory cache (i.e. a kernel restart)."""
     model = _make_radon_intercepts()
     with cp.cloud(model, cache=tmp_path):
@@ -114,12 +126,11 @@ def test_disk_cache_persists_across_memory_cache_clear(tmp_path):
     # Simulate a fresh kernel by wiping the in-memory cache.
     _default_memory_cache._store.clear()
 
-    t0 = time.time()
+    calls = _sample_spy(monkeypatch)
     with cp.cloud(model, cache=tmp_path):
         idata2 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
-    elapsed = time.time() - t0
 
-    assert elapsed < 2.0, f"disk cache hit took {elapsed:.2f}s -- expected fast"
+    assert calls["n"] == 0, "disk cache hit should not re-sample"
     np.testing.assert_array_equal(_mu_a(idata1), _mu_a(idata2))
 
 
@@ -189,7 +200,7 @@ def test_different_random_seed_misses_cache():
     )
 
 
-def test_overwrite_reruns_and_replaces_cache():
+def test_overwrite_reruns_and_replaces_cache(monkeypatch):
     """overwrite=True re-runs even on a warm cache and replaces the stored entry."""
     model = _make_radon_intercepts()
     with cp.cloud(model):
@@ -201,10 +212,10 @@ def test_overwrite_reruns_and_replaces_cache():
     assert not np.array_equal(_mu_a(idata1), _mu_a(idata2)), "overwrite should re-run"
 
     # the cache now holds the overwritten result: a plain re-run returns idata2
-    t0 = time.time()
+    calls = _sample_spy(monkeypatch)
     with cp.cloud(model):
         idata3 = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
-    assert time.time() - t0 < 1.0, "expected a cache hit after overwrite"
+    assert calls["n"] == 0, "expected a cache hit after overwrite"
     np.testing.assert_array_equal(_mu_a(idata2), _mu_a(idata3))
 
 

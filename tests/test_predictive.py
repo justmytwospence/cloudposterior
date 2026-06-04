@@ -16,6 +16,7 @@ def _model():
 def test_local_predictive_defers_and_restores():
     pm = pytest.importorskip("pymc")
     import cloudposterior as cp
+    from cloudposterior._idata import group_names
 
     m = _model()
     orig_prior = pm.sample_prior_predictive
@@ -23,7 +24,7 @@ def test_local_predictive_defers_and_restores():
     with cp.cloud(m, remote=False):
         assert pm.sample_prior_predictive is not orig_prior  # patched
         idata = pm.sample_prior_predictive(draws=25)
-        assert "prior" in list(idata.groups())
+        assert "prior" in group_names(idata)
     # restored on exit
     assert pm.sample_prior_predictive is orig_prior
     assert pm.sample_posterior_predictive is orig_post
