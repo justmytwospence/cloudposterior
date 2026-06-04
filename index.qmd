@@ -1,0 +1,44 @@
+---
+title: "cloudposterior"
+subtitle: "Stop waiting for MCMC. Start shipping posteriors."
+toc: false
+---
+
+Run PyMC models on cloud VMs without changing your sampling code. One extra line
+gives you cloud compute, automatic caching, and phone notifications --- while
+`pm.sample()` stays exactly the same.
+
+```python
+import cloudposterior as cp
+
+with cp.cloud(model, remote=True):
+    idata = pm.sample(draws=5000, chains=8)  # 8 cores in the cloud, zero config
+```
+
+## Why
+
+You've built a hierarchical model. It's beautiful. But sampling takes 45 minutes
+on your laptop, your fans sound like a jet engine, and you can't use your machine
+for anything else. cloudposterior fixes that:
+
+- **Ship sampling to the cloud** with one line --- your model runs on a VM with as
+  many cores and as much RAM as it needs.
+- **Never re-run the same model twice** --- results are cached automatically, so
+  re-running a cell returns the posterior instantly.
+- **Monitor from anywhere** --- live progress notifications on your phone while the
+  model samples.
+
+All three work independently --- use any combination, or just the caching.
+
+## Install
+
+```bash
+pip install cloudposterior        # pulls in PyMC + ArviZ
+pip install modal && modal setup  # optional, for cloud execution
+```
+
+## Next steps
+
+- [Getting started](getting-started.qmd) --- install and your first cloud sample
+- [Examples](examples/basics.ipynb) --- cloud execution, caching, parallel fitting, monitoring
+- [API reference](reference/index.qmd) --- `cloud`, `sample`, `map`, and configuration
