@@ -8,6 +8,8 @@ on:
       - "cloudposterior/**"
       - "*.qmd"
       - "_quarto.yml"
+      - "*.scss"
+      - "scripts/build-docs.sh"
       - "pyproject.toml"
       - ".github/workflows/docs.yml"
   workflow_dispatch:

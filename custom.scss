@@ -1,0 +1,19 @@
+/*-- scss:rules --*/
+
+// Keep wide notebook outputs (arviz summary tables, trace plots, model DAGs,
+// long stdout) within the content column instead of overflowing the page.
+
+// Wide tables and long text output scroll within their own cell.
+.cell-output-display,
+.cell-output-stdout,
+.cell-output-stderr {
+  overflow-x: auto;
+}
+
+// Plots and graphviz model DAGs scale down to the column width rather than
+// spilling past it.
+.cell-output-display img,
+.cell-output-display svg {
+  max-width: 100%;
+  height: auto;
+}

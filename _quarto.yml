@@ -63,8 +63,13 @@ website:
 format:
   html:
     theme:
-      light: cosmo
-      dark: darkly
+      light: [cosmo, custom.scss]
+      dark: [darkly, custom.scss]
+    # Sidebar websites size content via the grid (page-layout has no effect here).
+    # Widen the body so the output-heavy example notebooks (wide arviz tables,
+    # trace plots) have room; custom.scss contains anything still wider.
+    grid:
+      body-width: 1200px
     toc: true
     code-copy: true
     code-overflow: wrap
