@@ -222,6 +222,8 @@ class cloud:
             # Provision the /stop endpoint for the in-notebook stop button even
             # when the full dashboard is off (any remote run with a progress UI).
             stop_enabled=self.progress,
+            # The image needs jax/numpyro for the JAX samplers on CPU presets.
+            nuts_sampler=nuts_sampler,
         )
         # Stash the resolved config so the displayed instance_desc matches
         # what was actually provisioned (no recomputation drift).
@@ -1504,10 +1506,17 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         auto_sized=any(c.auto_sized for c in run_configs),
     )
     backend = ModalBackend(config=base_config)
+    # The shared image must satisfy every fit in the batch: if any model uses
+    # a JAX sampler the image needs jax/numpyro installed.
+    run_samplers = [meta[3] for meta in run_meta]
+    image_sampler = next(
+        (s for s in run_samplers if s in ("numpyro", "blackjax")), run_samplers[0]
+    )
     env = backend.provision(
         model_bytes_list[0], models[0], get_version_manifest(), base_config,
         project=project, idle_timeout=base_config.idle_timeout,
         dashboard=dashboard_on, stop_enabled=dashboard_on,
+        nuts_sampler=image_sampler,
     )
 
     def _dash_write(key, value):

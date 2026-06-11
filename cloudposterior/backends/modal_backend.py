@@ -8,7 +8,6 @@ from typing import Iterator
 
 import msgpack
 
-from cloudposterior._idata import load_all
 from cloudposterior.backends import ComputeBackend, RemoteEnvironment, SamplingJob
 from cloudposterior.config import DEFAULT_PACKAGES, OPTIONAL_PACKAGES, RemoteConfig
 from cloudposterior.progress import (
@@ -124,14 +123,15 @@ def _build_pip_specs(
     return specs
 
 
-def _create_modal_app(manifest: dict[str, str], config: RemoteConfig):
+def _create_modal_app(manifest: dict[str, str], config: RemoteConfig,
+                      nuts_sampler: str = "pymc"):
     """Create a Modal app with an image matching the version manifest."""
     import modal
 
     python_version = manifest.get("python", "3.11.0")
     py_major_minor = ".".join(python_version.split(".")[:2])
 
-    pip_specs = _build_pip_specs(manifest, gpu=config.gpu)
+    pip_specs = _build_pip_specs(manifest, gpu=config.gpu, nuts_sampler=nuts_sampler)
 
     image = (
         modal.Image.debian_slim(python_version=py_major_minor)
@@ -179,27 +179,36 @@ class ModalSamplingJob(SamplingJob):
         app, remote_sample = _create_modal_app(
             self._payload.version_manifest,
             self._config,
+            self._nuts_sampler,
         )
 
         # Don't call modal.enable_output() -- it enables a spinner and status
         # lines that interleave with our own progress display. Without it,
         # Modal runs silently and we show progress via our own Rich/ipywidgets UI.
+        # Enter/exit app.run() off the event loop (like the persistent path's
+        # _ensure_running): its blocking Modal calls warn and stall inside an
+        # async host (marimo, async web apps).
         try:
             run_ctx = app.run()
+            _run_blocking(run_ctx.__enter__)
         except Exception as exc:
             raise _handle_modal_error(exc)
-        with run_ctx:
+        try:
             gen = remote_sample.remote_gen(
                 self._payload.model_bytes,
                 self._payload.sample_kwargs,
                 self._nuts_sampler,
             )
             self._idata_bytes = yield from _stream_events(gen, self._events)
+        finally:
+            try:
+                _run_blocking(run_ctx.__exit__, None, None, None)
+            except Exception:
+                pass
 
     def result(self):
         """Return the InferenceData. Must call stream_progress first."""
-        import arviz as az
-        import lz4.frame
+        from cloudposterior.serialize import deserialize_inference_data
 
         if self._idata_bytes is None:
             # If stream_progress wasn't called, run it now
@@ -209,20 +218,7 @@ class ModalSamplingJob(SamplingJob):
         if self._idata_bytes is None:
             raise RuntimeError("Sampling did not produce results")
 
-        import os
-        import tempfile
-
-        raw = lz4.frame.decompress(self._idata_bytes)
-        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        try:
-            # Load every group eagerly into memory so the temp file can be deleted
-            idata = az.from_netcdf(tmp_path)
-            load_all(idata)
-            return idata
-        finally:
-            os.unlink(tmp_path)
+        return deserialize_inference_data(self._idata_bytes)
 
     def cancel(self):
         # Modal doesn't have a clean cancel API for generators yet
@@ -309,13 +305,14 @@ def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
     return idata_bytes
 
 
-def _build_image(manifest: dict[str, str], gpu: str | None = None):
+def _build_image(manifest: dict[str, str], gpu: str | None = None,
+                 nuts_sampler: str = "pymc"):
     """Build a Modal image with packages matching the version manifest."""
     import modal
 
     python_version = manifest.get("python", "3.11.0")
     py_major_minor = ".".join(python_version.split(".")[:2])
-    pip_specs = _build_pip_specs(manifest, gpu=gpu)
+    pip_specs = _build_pip_specs(manifest, gpu=gpu, nuts_sampler=nuts_sampler)
 
     return (
         modal.Image.debian_slim(python_version=py_major_minor)
@@ -332,6 +329,7 @@ def _create_persistent_app(
     dashboard: bool = False,
     model_label: str = "model",
     stop_token: str | None = None,
+    nuts_sampler: str = "pymc",
 ):
     """Create a Modal app with a class-based sampler and mounted Volume.
 
@@ -343,7 +341,7 @@ def _create_persistent_app(
     """
     import modal
 
-    image = _build_image(manifest, gpu=config.gpu)
+    image = _build_image(manifest, gpu=config.gpu, nuts_sampler=nuts_sampler)
     app = modal.App("cloudposterior-persistent")
 
     max_scaledown = 1200  # Modal caps at 20 minutes
@@ -524,8 +522,7 @@ class PersistentModalSamplingJob(SamplingJob):
         self._idata_bytes = yield from _stream_events(gen, self._events)
 
     def result(self):
-        import arviz as az
-        import lz4.frame
+        from cloudposterior.serialize import deserialize_inference_data
 
         if self._idata_bytes is None:
             for _ in self.stream_progress():
@@ -534,18 +531,7 @@ class PersistentModalSamplingJob(SamplingJob):
         if self._idata_bytes is None:
             raise RuntimeError("Sampling did not produce results")
 
-        import os
-
-        raw = lz4.frame.decompress(self._idata_bytes)
-        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        try:
-            idata = az.from_netcdf(tmp_path)
-            load_all(idata)
-            return idata
-        finally:
-            os.unlink(tmp_path)
+        return deserialize_inference_data(self._idata_bytes)
 
     def cancel(self):
         pass
@@ -635,7 +621,10 @@ class ModalEnvironment(RemoteEnvironment):
             dir_path = "/".join(payload_path.split("/")[:-1])
             entries = _run_blocking(self._volume.listdir, f"/{dir_path}")
             filename = payload_path.split("/")[-1]
-            if any(e.path == filename for e in entries):
+            # TODO(e2e): confirm whether Volume.listdir entries carry bare
+            # filenames or dir-prefixed paths; comparing basenames is correct
+            # under either shape.
+            if any(e.path.split("/")[-1] == filename for e in entries):
                 self._uploaded_hashes.add(p_hash)
                 return False
         except Exception:
@@ -675,14 +664,20 @@ class ModalEnvironment(RemoteEnvironment):
             logging.getLogger(__name__).debug("listdir failed during prune: %s", exc)
             return
 
-        payloads = [e for e in entries if e.path.startswith("payload-") and e.path.endswith(".bin")]
+        # Compare basenames: correct whether listdir entries are bare
+        # filenames or dir-prefixed paths (TODO(e2e): confirm which).
+        payloads = [
+            e for e in entries
+            if e.path.split("/")[-1].startswith("payload-") and e.path.endswith(".bin")
+        ]
         if len(payloads) <= _PAYLOAD_KEEP_PER_MODEL:
             return
 
         payloads.sort(key=lambda e: getattr(e, "mtime", 0), reverse=True)
         for stale in payloads[_PAYLOAD_KEEP_PER_MODEL:]:
             try:
-                _run_blocking(self._volume.remove_file, f"/{dir_path}/{stale.path}")
+                name = stale.path.split("/")[-1]
+                _run_blocking(self._volume.remove_file, f"/{dir_path}/{name}")
             except Exception as exc:
                 logging.getLogger(__name__).debug(
                     "failed to prune %s: %s", stale.path, exc,
@@ -712,6 +707,15 @@ class ModalEnvironment(RemoteEnvironment):
             _run_blocking(self._exit_stack.close)
         except Exception:
             pass
+        # The control Dict is a named, persistent Modal object created fresh
+        # per provision -- delete it or orphans accumulate in the workspace.
+        if self._dashboard_dict_name:
+            try:
+                import modal
+
+                _run_blocking(modal.Dict.objects.delete, self._dashboard_dict_name)
+            except Exception:
+                pass
         self._running = False
 
 
@@ -735,6 +739,7 @@ class ModalBackend(ComputeBackend):
         idle_timeout: int = 1200,
         dashboard: bool = False,
         stop_enabled: bool = False,
+        nuts_sampler: str = "pymc",
     ) -> ModalEnvironment:
         """Provision a persistent environment (no upload -- deferred to first cache miss).
 
@@ -774,6 +779,7 @@ class ModalBackend(ComputeBackend):
             dashboard=dashboard,
             model_label=m_slug.replace("_", "-"),
             stop_token=stop_token,
+            nuts_sampler=nuts_sampler,
         )
         return ModalEnvironment(
             app, sampler_cls, volume, project, m_slug,
