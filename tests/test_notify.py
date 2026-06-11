@@ -117,3 +117,37 @@ def test_notifier_best_effort(mock_post):
         message="test",
         elapsed=0.0,
     ))
+
+
+@patch("cloudposterior.notify.requests.post")
+def test_notifier_completion_styling(mock_post):
+    """The sampling-done send carries the completion tag/priority/title
+    (regression: _is_complete() required a phase that never arrived in time,
+    so the checkmark styling was dead code)."""
+    notifier = NtfyNotifier(topic="test-topic")
+    notifier.show_phase(PhaseUpdate(
+        phase=JobPhase.SAMPLING, status="done",
+        message="sampling complete", elapsed=10.0,
+    ))
+
+    mock_post.assert_called_once()
+    headers = mock_post.call_args[1]["headers"]
+    assert headers["X-Tags"] == "white_check_mark"
+    assert headers["X-Priority"] == "3"
+    assert headers["X-Title"].endswith("[complete]")
+
+
+@patch("cloudposterior.notify.requests.post")
+def test_notifier_sends_failure_styling_on_error(mock_post):
+    """An error phase triggers a send with the failure styling."""
+    notifier = NtfyNotifier(topic="test-topic")
+    notifier.show_phase(PhaseUpdate(
+        phase=JobPhase.SAMPLING, status="error",
+        message="kaboom", elapsed=3.0,
+    ))
+
+    mock_post.assert_called_once()
+    headers = mock_post.call_args[1]["headers"]
+    assert headers["X-Tags"] == "rotating_light"
+    assert headers["X-Priority"] == "4"
+    assert headers["X-Title"].endswith("[failed]")

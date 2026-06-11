@@ -86,8 +86,8 @@ class NtfyNotifier:
         if not found:
             self._phases.append((update.status, update.phase.value, detail))
 
-        # Send on sampling start and completion only
-        if update.phase == JobPhase.SAMPLING:
+        # Send on sampling start/completion, and on any error phase.
+        if update.phase == JobPhase.SAMPLING or update.status == "error":
             self._send_update()
 
     def show_sampling(self, progress: SamplingProgress):
@@ -132,21 +132,27 @@ class NtfyNotifier:
         return "\n".join(lines)
 
     def _is_complete(self) -> bool:
-        for status, label, _ in self._phases:
-            if label == JobPhase.DOWNLOADING.value and status == "done":
-                return True
-            if label == JobPhase.CACHE_HIT.value:
-                return True
-        return False
+        # Sampling finishing is the completion signal: sends are triggered by
+        # SAMPLING phase events, so a later phase (e.g. the remote download)
+        # can never be "done" by the time the last send fires.
+        return any(
+            label == JobPhase.SAMPLING.value and status == "done"
+            for status, label, _ in self._phases
+        )
+
+    def _has_error(self) -> bool:
+        return any(status == "error" for status, _, _ in self._phases)
 
     def _send_update(self):
-        complete = self._is_complete()
-
         title = "cloudposterior"
         if self._instance_desc:
             title += f" -- {self._instance_desc}"
 
-        if complete:
+        if self._has_error():
+            tags = "rotating_light"
+            priority = "4"
+            title += " [failed]"
+        elif self._is_complete():
             tags = "white_check_mark"
             priority = "3"
             title += " [complete]"
