@@ -85,3 +85,30 @@ def test_deserialized_model_can_sample():
     assert "mu" in idata.posterior.data_vars
     assert "tau" in idata.posterior.data_vars
     assert "theta" in idata.posterior.data_vars
+
+
+def test_deserialize_inference_data_is_eagerly_loaded(tmp_path, monkeypatch):
+    """The temp NetCDF file is deleted on return, so every group must be
+    eagerly loaded -- a lazy idata would fail when xarray's file manager
+    reopens the deleted path."""
+    import numpy as np
+
+    from cloudposterior._idata import add_group, group_names
+    from cloudposterior.serialize import (
+        deserialize_inference_data,
+        serialize_inference_data,
+    )
+    import arviz as az
+
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"mu": np.random.randn(2, 50)}))
+
+    out = deserialize_inference_data(serialize_inference_data(idata))
+    assert "posterior" in group_names(out)
+
+    # Force-close any cached file handles; values must still be readable
+    # because the data was loaded into memory before the temp file vanished.
+    import xarray as xr
+
+    xr.backends.file_manager.FILE_CACHE.clear()
+    assert out.posterior["mu"].values.shape == (2, 50)

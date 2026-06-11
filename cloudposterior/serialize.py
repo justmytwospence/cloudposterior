@@ -104,18 +104,27 @@ def serialize_inference_data(idata) -> bytes:
 
 
 def deserialize_inference_data(data: bytes):
-    """Load an arviz InferenceData from lz4-compressed NetCDF bytes."""
+    """Load an arviz InferenceData from lz4-compressed NetCDF bytes.
+
+    Groups are eagerly loaded before the temp file is deleted: xarray's file
+    manager can otherwise close and later reopen the (deleted) file by path,
+    and Windows can't unlink an open file at all.
+    """
     import os
     import tempfile
 
     import arviz as az
+
+    from cloudposterior._idata import load_all
 
     raw = lz4.frame.decompress(data)
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         tmp.write(raw)
         tmp_path = tmp.name
     try:
-        return az.from_netcdf(tmp_path)
+        idata = az.from_netcdf(tmp_path)
+        load_all(idata)
+        return idata
     finally:
         os.unlink(tmp_path)
 
