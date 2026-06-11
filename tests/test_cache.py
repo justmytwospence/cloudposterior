@@ -132,3 +132,28 @@ def test_resolve_cache_rejects_unknown_types(bad):
     """Unknown types raise TypeError instead of silently returning the default."""
     with pytest.raises(TypeError, match="cache must be"):
         resolve_cache(bad)
+
+
+def test_resolve_cache_memory_alias():
+    """cache="memory" is an alias for the default in-memory cache, not a disk
+    cache rooted in a directory literally named "memory"."""
+    from cloudposterior.cache import get_default_cache, resolve_cache
+
+    assert resolve_cache("memory") is get_default_cache()
+
+
+def test_resolve_cache_custom_dir_string(tmp_path):
+    from cloudposterior.cache import DiskCache, resolve_cache
+
+    backend = resolve_cache(str(tmp_path / "custom"))
+    assert isinstance(backend, DiskCache)
+    assert backend._base == tmp_path / "custom"
+
+
+def test_disk_cache_load_miss_creates_no_directories(tmp_path):
+    """A cache probe must not litter empty model directories on disk."""
+    from cloudposterior.cache import DiskCache
+
+    cache = DiskCache(base_dir=tmp_path / "cp-cache")
+    assert cache.load("a" * 64, sample_kwargs={"draws": 10}) is None
+    assert not (tmp_path / "cp-cache").exists()

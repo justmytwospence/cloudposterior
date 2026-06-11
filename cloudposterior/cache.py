@@ -77,8 +77,9 @@ class DiskCache:
         self._model_slug = model_slug(model)
 
     def _path(self, key: str, sample_kwargs: dict | None = None) -> Path:
+        # Pure path computation -- directories are created on save() only, so
+        # a cache probe (load miss) doesn't litter empty directories.
         cache_dir = self._base / self._model_slug
-        cache_dir.mkdir(parents=True, exist_ok=True)
         # Use first 8 chars of cache key hash for uniqueness
         key_prefix = key[:8] if len(key) >= 8 else key
         if sample_kwargs is not None:
@@ -128,17 +129,18 @@ def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
     """Resolve the cache argument from cp.cloud() into a CacheBackend.
 
     Args:
-        cache_arg: True (memory), False (disabled), "disk" (project-local),
-                   Path/str (custom disk path), or a CacheBackend instance.
+        cache_arg: True or "memory" (session memory cache), False (disabled),
+                   "disk" (project-local ./.cloudposterior), any other
+                   str/Path (custom disk cache directory), or a CacheBackend
+                   instance.
 
     Raises:
-        TypeError: if ``cache_arg`` is none of the above. Catches typos like
-            ``cache=42`` or ``cache="memory"`` rather than silently falling
-            back to the default cache.
+        TypeError: if ``cache_arg`` is none of the above (e.g. ``cache=42``)
+            rather than silently falling back to the default cache.
     """
     if cache_arg is False:
         return None
-    if cache_arg is True:
+    if cache_arg is True or cache_arg == "memory":
         return get_default_cache()
     if isinstance(cache_arg, str) and cache_arg == "disk":
         return DiskCache(model=model)
