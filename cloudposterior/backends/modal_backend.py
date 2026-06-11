@@ -288,7 +288,12 @@ def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
                 if isinstance(decoded, dict) and decoded.get("type") == "result":
                     expecting_result = True
                     continue
-                event = _decode_progress_event(decoded)
+                # A single undecodable event (e.g. malformed fields) must not
+                # make the whole chunk be mistaken for the result bytes below.
+                try:
+                    event = _decode_progress_event(decoded)
+                except Exception:
+                    continue
                 if event is not None:
                     events_list.append(event)
                     yield event

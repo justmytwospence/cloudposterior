@@ -80,8 +80,15 @@ def decode_progress_event(data: dict) -> ProgressEvent | None:
     msg_type = data.get("type")
 
     if msg_type == "phase":
+        # Tolerate phase names this client doesn't know (a newer worker may add
+        # one); skipping the event is better than the caller mistaking the
+        # undecodable chunk for the result payload.
+        try:
+            phase = JobPhase(data["phase"])
+        except (KeyError, ValueError):
+            return None
         return PhaseUpdate(
-            phase=JobPhase(data["phase"]),
+            phase=phase,
             status=data["status"],
             message=data["message"],
             elapsed=data["elapsed"],
@@ -145,11 +152,17 @@ def make_sampling_callback(queue: Queue, tune: int, draws: int):
 
     The callback receives (trace, draw) on each MCMC iteration.
     PyMC's draw object provides: chain, tuning, stats, etc.
+
+    NOTE: this mirrors the per-draw bookkeeping in the remote worker's
+    ``progress_callback`` (cloudposterior/remote/worker.py) -- the worker
+    version additionally accumulates traces and honors the stop flag. Keep the
+    draw counting / phase reset / windowed tree-depth logic in sync.
     """
     chain_draw_counts: dict[int, int] = {}
     chain_start_times: dict[int, float] = {}
     chain_divergences: dict[int, int] = {}
     chain_tree_depths: dict[int, list[float]] = {}
+    chain_phase: dict[int, bool] = {}  # chain -> is_tuning
 
     def callback(trace, draw):
         chain = draw.chain
@@ -160,6 +173,14 @@ def make_sampling_callback(queue: Queue, tune: int, draws: int):
             chain_draw_counts[chain] = 0
             chain_divergences[chain] = 0
             chain_tree_depths[chain] = []
+            chain_phase[chain] = is_tuning
+
+        # Tuning -> sampling transition: restart the draw count and clock so
+        # progress shows draws out of `draws` (not tune+draws) with a sane ETA.
+        if chain_phase.get(chain) and not is_tuning:
+            chain_draw_counts[chain] = 0
+            chain_start_times[chain] = time.time()
+            chain_phase[chain] = False
 
         chain_draw_counts[chain] += 1
         current_draw = chain_draw_counts[chain]
@@ -167,6 +188,7 @@ def make_sampling_callback(queue: Queue, tune: int, draws: int):
         stats = draw.stats[0] if draw.stats else {}
         diverging = stats.get("diverging", False)
         tree_depth = stats.get("tree_depth", 0)
+        tree_size = stats.get("n_steps", stats.get("tree_size", 0))
         step_size = stats.get("step_size", 0.0)
 
         if diverging:
@@ -176,10 +198,11 @@ def make_sampling_callback(queue: Queue, tune: int, draws: int):
         elapsed = time.time() - chain_start_times[chain]
         dps = current_draw / elapsed if elapsed > 0 else 0.0
         total = tune if is_tuning else draws
-        remaining = total - current_draw
+        remaining = max(0, total - current_draw)
         eta = remaining / dps if dps > 0 else 0.0
 
-        mean_td = sum(chain_tree_depths[chain]) / len(chain_tree_depths[chain])
+        recent_td = chain_tree_depths[chain][-100:]
+        mean_td = sum(recent_td) / len(recent_td)
 
         progress = ChainProgress(
             draw=current_draw,
@@ -190,6 +213,7 @@ def make_sampling_callback(queue: Queue, tune: int, draws: int):
             divergences=chain_divergences[chain],
             mean_tree_depth=mean_td,
             step_size=step_size,
+            tree_size=tree_size,
         )
         queue.put((chain, progress))
 

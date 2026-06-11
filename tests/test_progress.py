@@ -80,6 +80,49 @@ def test_decode_progress_event_round_trips_each_type():
     assert decode_progress_event({"type": "result"}) is None
 
 
+def test_decode_progress_event_skips_unknown_phase():
+    """A phase name from a newer worker decodes to None instead of raising."""
+    from cloudposterior.progress import decode_progress_event
+
+    assert decode_progress_event(
+        {"type": "phase", "phase": "brand_new_phase", "status": "done",
+         "message": "x", "elapsed": 0.0}
+    ) is None
+
+
+def _fake_draw(chain, tuning, n_steps=7, tree_depth=3.0, diverging=False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        chain=chain,
+        tuning=tuning,
+        stats=[{"diverging": diverging, "tree_depth": tree_depth,
+                "n_steps": n_steps, "step_size": 0.5}],
+    )
+
+
+def test_callback_resets_draw_count_at_tuning_transition():
+    """The draw counter restarts at the tuning->sampling flip, so progress
+    never shows more draws than the phase total (and ETA never goes negative)."""
+    queue = Queue()
+    callback = make_sampling_callback(queue, tune=5, draws=10)
+
+    for _ in range(5):
+        callback(None, _fake_draw(0, tuning=True))
+    last_tuning = None
+    while not queue.empty():
+        _, last_tuning = queue.get()
+    assert last_tuning.phase == "tuning"
+    assert last_tuning.draw == 5 and last_tuning.total == 5
+
+    callback(None, _fake_draw(0, tuning=False))
+    _, first_sampling = queue.get()
+    assert first_sampling.phase == "sampling"
+    assert first_sampling.draw == 1 and first_sampling.total == 10
+    assert first_sampling.eta_seconds >= 0
+    assert first_sampling.tree_size == 7  # propagated from n_steps
+
+
 def test_dispatch_event_routes_and_tolerates_missing_methods():
     """dispatch_event calls the right sink method and skips convergence when absent."""
     from cloudposterior.progress import (
