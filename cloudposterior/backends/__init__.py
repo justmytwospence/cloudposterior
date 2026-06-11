@@ -43,12 +43,15 @@ class RemoteEnvironment(ABC):
 
     @abstractmethod
     def submit(
-        self, model_bytes: bytes, sample_kwargs: dict, nuts_sampler: str
+        self, model_bytes: bytes, sample_kwargs: dict, nuts_sampler: str,
+        payload_path: str | None = None,
     ) -> SamplingJob:
         """Submit a sampling job.
 
         model_bytes is used to check if the payload needs uploading to the
-        Volume. Only the payload path + kwargs are sent to the remote.
+        Volume. Only ``payload_path`` + kwargs are sent to the remote (the
+        caller uploads the payload, after its cache check, via the
+        environment's upload helper).
         """
         ...
 
@@ -74,6 +77,9 @@ class ComputeBackend(ABC):
         config: RemoteConfig,
         project: str = "cloudposterior",
         idle_timeout: int = 1200,
+        dashboard: bool = False,
+        stop_enabled: bool = False,
+        nuts_sampler: str = "pymc",
     ) -> RemoteEnvironment:
         """Provision a reusable environment.
 
@@ -87,6 +93,11 @@ class ComputeBackend(ABC):
             config: Resource configuration.
             project: Project name for Volume scoping.
             idle_timeout: Container idle timeout in seconds.
+            dashboard: Provision the live-dashboard web endpoints.
+            stop_enabled: Provision the control Dict + /stop endpoint (for the
+                in-notebook stop button) even when the dashboard is off.
+            nuts_sampler: Resolved sampler; JAX samplers need jax/numpyro
+                baked into the image.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support persistent environments"

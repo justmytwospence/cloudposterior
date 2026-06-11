@@ -94,7 +94,9 @@ class cloud:
     non-InferenceData utilities (``pm.compute_deterministics``, ``pm.draw``) are
     not yet routed to the cloud and still run locally. For remote ``pm.sample``,
     ``return_inferencedata=False`` and a per-draw ``callback=`` can't be matched
-    exactly and warn instead of silently diverging.
+    exactly and warn instead of silently diverging. The Stop button can abort
+    nutpie/pymc runs early (keeping the partial trace); JAX samplers
+    (numpyro/blackjax) and SMC have no per-draw hook and run to completion.
 
     Usage::
 

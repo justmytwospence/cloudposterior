@@ -18,7 +18,7 @@ uv run pytest tests/test_cache.py::test_name -v  # run single test
 
 Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`) hit real Modal infrastructure and incur cloud costs. They are skipped unless `--run-modal` is passed. See `tests/conftest.py` for the marker plumbing.
 
-CI runs pytest on Python 3.11 and 3.12 (free tests only -- Modal tests are not in CI).
+CI runs pytest on Python 3.11-3.13 (free tests only -- Modal tests are not in CI).
 
 ## Example notebooks
 
@@ -38,8 +38,8 @@ Each example in `examples/` exists in two formats that must be kept in sync:
 ### Request flow
 
 1. `cp.cloud(model)` context manager monkeypatches five PyMC functions to route through `api.py`: `pm.sample` (→ `_run_sample` / `_run_sample_persistent`), `pm.sample_prior_predictive` / `pm.sample_posterior_predictive` (→ `_run_predictive`), `pm.sample_smc` (→ `_run_smc`), and `pm.compute_log_likelihood` (→ `_run_idata_op`). The latter three reuse a blocking (non-streaming) remote-op template; only `pm.sample` streams per-draw progress.
-2. Model + observed data are serialized separately (cloudpickle + lz4 for the model, numpy + lz4 for data) in `serialize.py`
-3. Cache key is computed from the serialized bytes + sample kwargs (`cache.py`)
+2. The model is serialized as a single cloudpickle + lz4 blob in `serialize.py` (observed data is captured inside the model pickle -- no separate data payload)
+3. Cache key is computed from the serialized bytes + sample kwargs (`naming.cache_key`); cache backends live in `cache.py`
 4. If remote: `ModalBackend` (`backends/modal_backend.py`) submits a `SamplingPayload` to Modal, which runs `remote/worker.py` in a container with version-matched dependencies
 5. If local: the original `pm.sample` is called directly
 6. Progress events stream back via msgpack and are rendered by display sinks (an anywidget that animates live in both Jupyter and marimo notebooks, Rich for terminals) in `display.py`
@@ -51,13 +51,13 @@ Each example in `examples/` exists in two formats that must be kept in sync:
 - **`RemoteEnvironment`** (`backends/__init__.py`): Persistent execution environment with data pre-loaded (via Modal Volumes). Accepts multiple sampling jobs without re-uploading data. Provisioned via `ComputeBackend.provision()`.
 - **`CacheBackend`** (`cache.py`): Protocol with `MemoryCache` (default, session-scoped) and `DiskCache` (persistent, human-readable directory tree under `.cloudposterior/`).
 - **`ProgressEvent`** (`progress.py`): Union type of `PhaseUpdate` and `SamplingProgress` that flows through display sinks.
-- **`SamplingPayload`** (`serialize.py`): Dataclass bundling serialized model, data, version manifest, and sample kwargs for transport.
+- **`SamplingPayload`** (`serialize.py`): Dataclass bundling the serialized model (data included in the pickle), version manifest, and sample kwargs for transport.
 
 ### Persistent containers and volumes
 
 When `remote=True`, containers stay warm for 20 minutes. Model payloads are stored in a project-scoped Modal Volume so only sample kwargs are sent per-call:
 
-1. Model is serialized once in `__enter__()` and uploaded to a Volume at `{model_slug}/{data_slug}/payload-{hash}.bin`
+1. Model is serialized once on the first `pm.sample()` call (lazy first-touch, memoized on the model) and uploaded to a Volume at `{model_slug}/payload-{hash}.bin`
 2. A `modal.Cls`-based sampler loads the payload from the mounted Volume (fast local read)
 3. Each `pm.sample()` call sends only kwargs + a path string -- no model/data bytes on the wire
 4. If the model changes between calls, the new payload is uploaded to the Volume (KB, fast)
@@ -71,17 +71,17 @@ Human-readable names for browsability, machine hashes for correctness:
 
 | System | Human-readable (cosmetic) | Machine-correct (identity) |
 |--------|--------------------------|---------------------------|
-| Local disk cache | `{model_slug}/{data_slug}/{params}.nc` | `compute_cache_key()` SHA-256 |
-| Remote Volume | `{model_slug}/{data_slug}/payload-{hash}.bin` | `payload_hash()` SHA-256 prefix |
+| Local disk cache | `{model_slug}/{params_label}-{key8}.nc` | `cache_key()` SHA-256 |
+| Remote Volume | `{model_slug}/payload-{hash}.bin` | `payload_hash()` SHA-256 prefix |
 | Notifications | `{model_slug}-{random_wordhash}` | N/A |
 
-Shared utilities in `naming.py`: `model_slug()`, `data_slug()`, `payload_hash()`, `wordhash()`
+Shared utilities: `model_slug()`, `payload_hash()`, `cache_key()` in `naming.py`; `wordhash()` in `wordhash.py`
 
-### Live dashboard (`notify="dashboard"` or `notify=True` with `remote=True`)
+### Live dashboard (`dashboard=` kwarg; on by default for `remote=True`)
 
 `dashboard.py` contains `DashboardSink` (writes progress to a Modal Dict) and `DASHBOARD_HTML` (self-contained page with JS polling). Two `@modal.fastapi_endpoint` functions serve the HTML and progress JSON. The dashboard URL includes the model name for readability (e.g., `radon-intercepts-a3f7b2-dev.modal.run`).
 
-When `notify=True` and `remote=True`, defaults to dashboard. When local, defaults to ntfy (start + complete notifications only).
+The dashboard is controlled by the separate `dashboard: bool | None` kwarg (default: on for remote runs, off -- with a warning if explicitly requested -- for local). `notify=` is ntfy-only: `True` auto-generates a topic, a string is the topic, a dict accepts `{"topic", "server"}`; sends fire on sampling start, completion, and errors.
 
 ### Remote worker
 

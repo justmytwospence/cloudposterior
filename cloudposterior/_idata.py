@@ -118,6 +118,9 @@ def to_inference_data(trace):
     return trace
 
 
+_ess_tail_fallback_warned = False
+
+
 def ess_tail(arr) -> float:
     """Tail-ESS across majors (arviz 1.x changed ``ess(method="tail")``)."""
     import arviz as az
@@ -130,7 +133,18 @@ def ess_tail(arr) -> float:
                 return float(az.ess(arr, **kwargs))
             except Exception:
                 continue
-        return float(az.ess(arr))  # last resort: bulk ESS
+        # Last resort: bulk ESS. Warn once -- silently relabeling bulk as tail
+        # would misreport convergence across future arviz API changes.
+        global _ess_tail_fallback_warned
+        if not _ess_tail_fallback_warned:
+            _ess_tail_fallback_warned = True
+            import warnings
+
+            warnings.warn(
+                "arviz tail-ESS API unavailable; reporting bulk ESS in place "
+                "of tail ESS.", stacklevel=2,
+            )
+        return float(az.ess(arr))
 
 
 def sanitize_inference_data(idata):
@@ -145,7 +159,9 @@ def sanitize_inference_data(idata):
     try:
         import numpy as np
 
-        ok = (str, bytes, int, float, list, tuple, np.ndarray, np.number)
+        # np.bool_ is not an np.number; without it boolean attrs (which the
+        # NetCDF writer accepts) would be needlessly JSON-encoded.
+        ok = (str, bytes, int, float, list, tuple, np.ndarray, np.number, np.bool_)
     except Exception:
         ok = (str, bytes, int, float, list, tuple)
 

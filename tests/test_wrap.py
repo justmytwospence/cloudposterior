@@ -195,3 +195,7 @@ def test_local_user_callback_composes_with_progress_callback():
         draws=10, tune=10, chains=1, callback=user_cb, progressbar=False,
     )
     assert calls["n"] > 0
+
+
+def test_package_exposes_version():
+    assert cp.__version__ and cp.__version__ != "0.0.0+unknown"

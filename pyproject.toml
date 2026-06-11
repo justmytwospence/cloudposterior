@@ -23,6 +23,9 @@ dependencies = [
     "pymc>=5",
     "arviz>=0.17,<2.0",
     "numpy>=1.24",
+    # imported directly (api.py fingerprints SharedVariables); pymc pins the
+    # actual version, this floor just makes the dependency explicit
+    "pytensor>=2.18",
     "anywidget>=0.9",
     "cloudpickle>=3.0",
     "coolname>=4.0",

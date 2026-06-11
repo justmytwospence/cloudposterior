@@ -130,7 +130,6 @@ def test_phase_html_escapes_worker_messages():
 
 def test_notebook_display_escapes_active_phase():
     from cloudposterior.display import NotebookDisplay
-    from cloudposterior.progress import JobPhase, PhaseUpdate
 
     display = NotebookDisplay.__new__(NotebookDisplay)
     display._instance_desc = ""

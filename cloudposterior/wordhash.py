@@ -7,8 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import random
+import threading
 
 import coolname
+
+# coolname.replace_random swaps library-global state; serialize callers so
+# concurrent wordhash() calls (threads in cp.map / notify) can't interleave
+# the swap-generate-restore sequence.
+_coolname_lock = threading.Lock()
 
 
 def wordhash(data: str | bytes, words: int = 2) -> str:
@@ -21,8 +27,9 @@ def wordhash(data: str | bytes, words: int = 2) -> str:
         data = data.encode()
     seed = int.from_bytes(hashlib.sha256(data).digest()[:8], "big")
     rng = random.Random(seed)
-    coolname.replace_random(rng)
-    try:
-        return coolname.generate_slug(words)
-    finally:
-        coolname.replace_random(random)
+    with _coolname_lock:
+        coolname.replace_random(rng)
+        try:
+            return coolname.generate_slug(words)
+        finally:
+            coolname.replace_random(random)
