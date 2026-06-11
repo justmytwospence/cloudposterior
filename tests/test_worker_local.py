@@ -1,8 +1,9 @@
 """Test the remote worker locally (no Modal) to validate the full pipeline."""
 
+import msgpack
 import numpy as np
 import pymc as pm
-import msgpack
+import pytest
 
 from cloudposterior.serialize import create_payload
 from cloudposterior.remote.worker import run_sampling
@@ -128,3 +129,80 @@ def test_stop_requested_honors_global_and_per_model():
     assert _stop_requested({"stop:pooled-0": True}, "pooled-0") is True   # per-model
     assert _stop_requested({"stop:pooled-0": True}, "other") is False     # not mine
     assert _stop_requested({"stop": False}, "pooled-0") is False
+
+
+def _tiny_model():
+    with pm.Model() as model:
+        pm.Normal("mu", 0, 1, observed=np.array([0.1, -0.2, 0.3]))
+        pm.Normal("theta", 0, 1)
+    return model
+
+
+def _drain_worker(gen):
+    """Run a worker generator; return (decoded_events, result_bytes)."""
+    events, idata_bytes = [], None
+    for chunk in gen:
+        try:
+            events.append(msgpack.unpackb(chunk, raw=False))
+        except Exception:
+            idata_bytes = chunk
+    return events, idata_bytes
+
+
+def test_worker_drops_return_inferencedata():
+    """return_inferencedata=False must not crash the worker after sampling
+    (the client warns an InferenceData is returned instead)."""
+    payload = create_payload(
+        _tiny_model(),
+        {"draws": 10, "tune": 10, "chains": 1, "return_inferencedata": False},
+    )
+    events, idata_bytes = _drain_worker(
+        run_sampling(payload.model_bytes, payload.sample_kwargs, nuts_sampler="pymc")
+    )
+    assert idata_bytes is not None
+    assert any(e.get("type") == "result" for e in events)
+
+
+def test_split_nutpie_kwargs_partitions_by_signature():
+    from cloudposterior.remote.worker import _split_nutpie_kwargs
+
+    class FakeNutpie:
+        @staticmethod
+        def sample(compiled_model, *, draws=1000, target_accept=0.8,
+                   maxdepth=10, blocking=True):
+            pass
+
+    forwarded, dropped = _split_nutpie_kwargs(
+        FakeNutpie, {"target_accept": 0.95, "idata_kwargs": {"log_likelihood": True}}
+    )
+    assert forwarded == {"target_accept": 0.95}
+    assert set(dropped) == {"idata_kwargs"}
+
+    class VarKwargsNutpie:
+        @staticmethod
+        def sample(compiled_model, **kwargs):
+            pass
+
+    # **kwargs signatures don't mean "accepts anything": nutpie's settings
+    # parser raises on unknown names, so only known settings are forwarded.
+    forwarded, dropped = _split_nutpie_kwargs(
+        VarKwargsNutpie, {"target_accept": 0.9, "anything": 1}
+    )
+    assert forwarded == {"target_accept": 0.9} and set(dropped) == {"anything"}
+
+
+def test_worker_nutpie_forwards_target_accept_and_reports_dropped():
+    """The nutpie branch forwards supported kwargs and reports unsupported ones."""
+    pytest.importorskip("nutpie")
+    payload = create_payload(
+        _tiny_model(),
+        {"draws": 10, "tune": 10, "chains": 2, "target_accept": 0.95,
+         "definitely_not_a_kwarg": 1},
+    )
+    events, idata_bytes = _drain_worker(
+        run_sampling(payload.model_bytes, payload.sample_kwargs, nuts_sampler="nutpie")
+    )
+    assert idata_bytes is not None
+    messages = [e.get("message", "") for e in events if e.get("type") == "phase"]
+    assert any("definitely_not_a_kwarg" in m for m in messages)
+    assert not any("target_accept" in m for m in messages)  # forwarded, not dropped

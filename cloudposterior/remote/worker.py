@@ -104,6 +104,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     random_seed = sample_kwargs.get("random_seed", None)
     sample_kwargs.pop("progressbar", None)
     sample_kwargs.pop("callback", None)
+    # The client warns that return_inferencedata=False is unsupported remotely
+    # (a MultiTrace can't be transported back); drop it here so the pymc path
+    # doesn't produce a MultiTrace that crashes serialization after sampling.
+    sample_kwargs.pop("return_inferencedata", None)
     # Adaptive: early-stop once every scalar param hits this convergence target.
     # cp-only kwarg (never passed to the sampler); applies to nutpie + pymc.
     until = sample_kwargs.pop("until", None)
@@ -251,7 +255,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
         handle = None
         nutpie_kwargs = dict(
             draws=draws,
-            tune=user_tune,
+            # Match pm.sample's tune default (1000); nutpie's own default (~300)
+            # would silently diverge from an equivalent local run.
+            tune=tune,
             chains=chains,
             cores=cores,
             seed=random_seed,
@@ -259,6 +265,20 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             progress_bar=False,
             blocking=False,
         )
+        # Forward the remaining pm.sample kwargs nutpie understands (e.g.
+        # target_accept, maxdepth) instead of silently dropping them; report
+        # whatever nutpie can't accept so the user knows it was ignored.
+        forwarded, dropped = _split_nutpie_kwargs(nutpie, sample_kwargs)
+        forwarded.pop("random_seed", None)  # already mapped to seed=
+        dropped.pop("random_seed", None)
+        nutpie_kwargs.update(forwarded)
+        if dropped:
+            yield msgpack.packb({
+                "type": "phase", "phase": "sampling", "status": "in_progress",
+                "message": "ignoring kwargs unsupported by nutpie: "
+                           + ", ".join(sorted(dropped)),
+                "elapsed": 0.0,
+            })
         try:
             handle = nutpie.sample(compiled, progress_callback=nutpie_cb, **nutpie_kwargs)
         except Exception:
@@ -337,8 +357,20 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
 
         jax_thread = Thread(target=do_sample_jax)
         jax_thread.start()
+        stop_noted = False
         while jax_thread.is_alive():
             time.sleep(0.5)
+            # JAX samplers expose no per-draw hook, so an early stop can't
+            # abort the run -- at least acknowledge the request once instead
+            # of silently ignoring the dashboard's Stop button.
+            if not stop_noted and _stop_requested(stop_dict, stop_key):
+                stop_noted = True
+                yield msgpack.packb({
+                    "type": "phase", "phase": "sampling", "status": "in_progress",
+                    "message": f"stop requested -- {nuts_sampler} (JAX) cannot "
+                               "stop early; waiting for completion",
+                    "elapsed": round(time.time() - sample_start, 1),
+                })
         jax_thread.join()
 
     # ===================== pymc: per-draw callback (only sampler that supports it) =====================
@@ -351,6 +383,9 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
         should_stop = {"v": False}
 
         def progress_callback(trace, draw):
+            # NOTE: the draw counting / phase reset / windowed tree-depth logic
+            # mirrors make_sampling_callback in cloudposterior/progress.py
+            # (used for local runs) -- keep the two in sync.
             # Cheap local flag only -- the network poll lives in the generator loop (D3).
             if should_stop["v"]:
                 raise KeyboardInterrupt("early stop requested")
@@ -484,6 +519,11 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
 
     # -- Serialize and return InferenceData --
     if idata is None:
+        if stopped_early:
+            raise RuntimeError(
+                "sampling was stopped before any draws could be returned "
+                "(the partial trace was not recoverable)"
+            )
         raise RuntimeError("Sampling produced no results")
 
     _sanitize_idata_attrs(idata)
@@ -506,6 +546,45 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     })
 
     yield idata_compressed
+
+
+# Sampler settings nutpie accepts through ``nutpie.sample(**kwargs)``. Its
+# signature is ``**kwargs``-open but unknown names raise at runtime ("Unknown
+# settings attribute"), so only forward names known to be settings.
+_NUTPIE_SETTINGS_KWARGS = {
+    "target_accept",
+    "maxdepth",
+    "max_energy_error",
+    "store_divergences",
+    "store_gradient",
+    "store_unconstrained",
+    "store_mass_matrix",
+    "use_grad_based_mass_matrix",
+}
+
+
+def _split_nutpie_kwargs(nutpie, sample_kwargs: dict) -> tuple[dict, dict]:
+    """Partition leftover pm.sample kwargs into ``(forwarded, dropped)`` for
+    ``nutpie.sample``.
+
+    Forwards names in nutpie's explicit signature plus the known settings
+    kwargs (e.g. ``target_accept``, ``maxdepth``); everything else is dropped
+    (and reported by the caller) rather than crashing nutpie's settings parser.
+    """
+    import inspect
+
+    accepted = set(_NUTPIE_SETTINGS_KWARGS)
+    try:
+        params = inspect.signature(nutpie.sample).parameters
+        accepted |= {
+            name for name, p in params.items()
+            if p.kind is not inspect.Parameter.VAR_KEYWORD
+        }
+    except Exception:
+        pass
+    forwarded = {k: v for k, v in sample_kwargs.items() if k in accepted}
+    dropped = {k: v for k, v in sample_kwargs.items() if k not in accepted}
+    return forwarded, dropped
 
 
 def _conv_meets_target(conv_bytes, until) -> bool:
@@ -712,8 +791,14 @@ def run_posterior_predictive(payload_path: str, idata_bytes: bytes, sample_kwarg
 
     model = _load_model_from_volume(payload_path)
     trace = deserialize_inference_data(idata_bytes)
+    # Always compute standalone: extending the worker's deserialized copy of
+    # the trace would be invisible to the caller. The client merges the new
+    # group(s) into its own idata when extend_inferencedata=True was requested.
+    sample_kwargs.pop("extend_inferencedata", None)
     with model:
-        idata = pm.sample_posterior_predictive(trace, **sample_kwargs)
+        idata = pm.sample_posterior_predictive(
+            trace, extend_inferencedata=False, **sample_kwargs
+        )
     return serialize_inference_data(idata)
 
 
