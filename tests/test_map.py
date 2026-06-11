@@ -330,3 +330,43 @@ def test_cp_map_sizes_each_model_independently(monkeypatch):
         cache=False,
     )
     assert [cpu for cpu, _mem in state["sizes"]] == [4, 16]
+
+
+def test_cp_map_disk_cache_routes_per_model_slug(tmp_path, monkeypatch):
+    """Each model's result is filed under its own slug directory, so a later
+    cp.cloud(model, cache=...) run finds it (regression: everything was saved
+    under models[0]'s slug)."""
+    pytest.importorskip("pymc")
+    import pymc as pm
+
+    import cloudposterior as cp
+    from cloudposterior.naming import model_slug
+
+    models = []
+    for name in ("alpha", "beta"):
+        with pm.Model() as m:
+            pm.Normal(name, 0, 1)
+        models.append(m)
+    assert model_slug(models[0]) != model_slug(models[1])
+
+    _fake_modal(monkeypatch)
+    out = cp.map(models, {"draws": 10}, cache=str(tmp_path))
+    assert all(o is not None for o in out)
+    for m in models:
+        slug_dir = tmp_path / model_slug(m)
+        assert slug_dir.is_dir() and list(slug_dir.glob("*.nc")), slug_dir
+
+    # Second run: everything is cached -- nothing provisioned or spawned.
+    state2 = _fake_modal(monkeypatch)
+    out2 = cp.map(models, {"draws": 10}, cache=str(tmp_path))
+    assert all(o is not None for o in out2)
+    assert state2["captured"] == [] and state2["envs"] == []
+
+
+def test_cp_map_validates_sample_kwargs(monkeypatch):
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    _fake_modal(monkeypatch)
+    with pytest.raises(TypeError, match="draws"):
+        cp.map(_models(2), {"draws": -5}, cache=False)

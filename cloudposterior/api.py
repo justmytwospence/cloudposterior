@@ -249,6 +249,35 @@ class cloud:
         ctx = self
 
         def intercepted_sample(**kwargs):
+            # A pm.sample() call that targets a *different* model than the one
+            # this cp.cloud(...) block wraps (an explicit model= kwarg, or an
+            # inner `with other_model:` context) must not be intercepted --
+            # we'd silently sample the wrapped model instead. Fall back to
+            # native PyMC for that call.
+            target_model = kwargs.get("model")
+            if target_model is None:
+                try:
+                    import pymc as pm
+
+                    target_model = pm.modelcontext(None)
+                except Exception:
+                    target_model = None
+            if target_model is not None and target_model is not ctx.model:
+                import warnings
+
+                warnings.warn(
+                    "pm.sample() inside cp.cloud(...) targets a different "
+                    "model than the one the block wraps; running it with "
+                    "native PyMC (no cloud execution or caching) for this "
+                    "call. Wrap that model in its own cp.cloud(...) block "
+                    "to run it remotely.",
+                    stacklevel=2,
+                )
+                return ctx._originals["sample"](**kwargs)
+            # The target is the wrapped model -- drop a redundant model= kwarg
+            # so it doesn't leak into cache keys or the remote payload.
+            kwargs.pop("model", None)
+
             _validate_sample_kwargs(kwargs)
             nuts_sampler = kwargs.pop("nuts_sampler", None)
             has_step = kwargs.get("step") is not None
@@ -261,6 +290,10 @@ class cloud:
 
             if ctx.remote:
                 _warn_remote_sample_fidelity(kwargs)
+                # The warning says callback= is ignored remotely -- actually
+                # remove it: a function kwarg would poison the cache key (its
+                # repr embeds a memory address) and ride the wire for nothing.
+                kwargs.pop("callback", None)
 
             # Adaptive early-stop: worker-side, so remote + nutpie/pymc only.
             if ctx.until is not None:
@@ -298,21 +331,32 @@ class cloud:
                     ctx.model, kwargs.pop("step")
                 )
 
-            if ctx.remote and ctx._env is None:
-                # First sample call -- provision sized to these kwargs.
-                ctx._provision_environment(nuts_sampler, kwargs)
-            elif ctx._env is not None:
-                # Later call -- warn if auto-sizing would have picked
-                # different resources (first call wins; container is fixed).
-                _warn_if_resize_drift(ctx, nuts_sampler, kwargs)
+            if ctx.remote:
+                # Check the cache BEFORE provisioning: a hit must not create
+                # Modal infra (Volume / control Dict / app) just to be skipped.
+                cache_kwargs = {**kwargs, "nuts_sampler": nuts_sampler}
+                cache_backend, cache_key, cached = _cache_lookup(
+                    ctx.cache, ctx.model, call_model_bytes, cache_kwargs,
+                    overwrite=ctx.overwrite, progress=ctx.progress,
+                )
+                if cached is not None:
+                    return cached
 
-            if ctx._env is not None:
+                if ctx._env is None:
+                    # First sample call -- provision sized to these kwargs.
+                    ctx._provision_environment(nuts_sampler, kwargs)
+                else:
+                    # Later call -- warn if auto-sizing would have picked
+                    # different resources (first call wins; container is fixed).
+                    _warn_if_resize_drift(ctx, nuts_sampler, kwargs)
+
                 return _run_sample_persistent(
                     model=ctx.model,
                     env=ctx._env,
                     model_bytes=call_model_bytes,
-                    cache=ctx.cache,
-                    overwrite=ctx.overwrite,
+                    cache_backend=cache_backend,
+                    cache_key=cache_key,
+                    cache_kwargs=cache_kwargs,
                     dashboard=ctx.dashboard,
                     notify=ctx.notify,
                     nuts_sampler=nuts_sampler,
@@ -357,6 +401,7 @@ class cloud:
                 ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
 
             trace = None
+            extend = False
             if kind == "posterior":
                 if args:
                     trace = args[0]
@@ -364,10 +409,23 @@ class cloud:
                     trace = kwargs.pop("trace")
                 else:
                     raise TypeError("sample_posterior_predictive requires a trace")
+                # PyMC's extend_inferencedata=True extends the caller's idata
+                # in place; the worker only ever computes standalone, so merge
+                # client-side (mirrors intercepted_cll).
+                extend = bool(kwargs.pop("extend_inferencedata", False))
             elif args:  # prior predictive: first positional is draws
                 kwargs["draws"] = args[0]
 
-            return _run_predictive(ctx, kind, trace, kwargs)
+            out = _run_predictive(ctx, kind, trace, kwargs)
+            if kind == "posterior" and extend:
+                from cloudposterior._idata import add_group, get_group, group_names
+
+                existing = set(group_names(trace))
+                for name in group_names(out):
+                    if name not in existing:
+                        add_group(trace, name, get_group(out, name))
+                return trace
+            return out
 
         return intercepted_predictive
 
@@ -589,11 +647,50 @@ def _warn_if_resize_drift(ctx, nuts_sampler: str, sample_kwargs: dict) -> None:
         )
 
 
+def _emit_cached_indicator() -> None:
+    """Show the one-line "cached result" indicator (notebook HTML or Rich)."""
+    from cloudposterior.display import _emit_oneshot_html
+
+    def _cached_terminal():
+        from rich.console import Console
+        Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
+
+    _emit_oneshot_html(
+        [
+            '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
+            '<span style="color:#5cb85c;">&#10003;</span> cached result'
+            '</div>'
+        ],
+        terminal_fallback=_cached_terminal,
+    )
+
+
+def _cache_lookup(cache_arg, model, model_bytes: bytes, cache_kwargs: dict, *,
+                  overwrite: bool, progress: bool):
+    """Resolve the cache backend and look up an entry.
+
+    Returns ``(backend, key, cached_or_None)``. ``overwrite=`` forces a re-run:
+    the load is skipped but the key is still returned so the fresh result can
+    replace the stored entry. Emits the "cached result" indicator on a hit.
+    """
+    from cloudposterior.cache import resolve_cache
+    from cloudposterior.naming import cache_key as compute_cache_key
+
+    backend = resolve_cache(cache_arg, model=model)
+    if backend is None:
+        return None, None, None
+    key = compute_cache_key(model_bytes, cache_kwargs)
+    cached = None if overwrite else backend.load(key, sample_kwargs=cache_kwargs)
+    if cached is not None and progress:
+        _emit_cached_indicator()
+    return backend, key, cached
+
+
 def _run_sample(
     model,
     *,
     remote: bool,
-    cache: bool,
+    cache: bool | str,
     overwrite: bool = False,
     notify: bool | str,
     instance: str | None,
@@ -604,38 +701,17 @@ def _run_sample(
     **sample_kwargs,
 ) -> az.InferenceData:
     """Core sampling logic with cache, remote, and notification support."""
-    from cloudposterior.cache import resolve_cache
-    from cloudposterior.naming import cache_key as compute_cache_key
-
     if model_bytes is None:
         model_bytes = _ensure_model_bytes(model)
 
     # -- Check cache (include nuts_sampler so different samplers don't collide) --
     cache_kwargs = {**sample_kwargs, "nuts_sampler": nuts_sampler}
-    cache_backend = resolve_cache(cache, model=model)
-    cache_key = None
-
-    if cache_backend is not None:
-        cache_key = compute_cache_key(model_bytes, cache_kwargs)
-        # overwrite= forces a re-run: skip the load (still save below to replace).
-        cached = None if overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
-        if cached is not None:
-            if progress:
-                from cloudposterior.display import _emit_oneshot_html
-
-                def _cached_terminal():
-                    from rich.console import Console
-                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
-
-                _emit_oneshot_html(
-                    [
-                        '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
-                        '<span style="color:#5cb85c;">&#10003;</span> cached result'
-                        '</div>'
-                    ],
-                    terminal_fallback=_cached_terminal,
-                )
-            return cached
+    cache_backend, cache_key, cached = _cache_lookup(
+        cache, model, model_bytes, cache_kwargs,
+        overwrite=overwrite, progress=progress,
+    )
+    if cached is not None:
+        return cached
 
     # -- Build sinks (only needed for cache miss) --
     if remote:
@@ -645,51 +721,45 @@ def _run_sample(
         instance_desc = "local"
 
     # For local runs, skip progress display -- let PyMC show its native output.
-    if remote:
-        sinks = _build_sinks(
-            progress=progress,
-            notify=notify,
-            instance_desc=instance_desc,
-            model=model,
-        )
-    else:
-        sinks = _build_sinks(
-            progress=False,
-            notify=notify,
-            instance_desc=instance_desc,
-            model=model,
-        )
+    sinks = _build_sinks(
+        progress=progress if remote else False,
+        notify=notify,
+        instance_desc=instance_desc,
+        model=model,
+    )
 
     def emit(event):
         dispatch_event(event, sinks)
 
-    # -- Run sampling --
-    if remote:
-        idata = _run_remote(
-            model=model,
-            model_bytes=model_bytes,
-            config=config,
-            nuts_sampler=nuts_sampler,
-            sinks=sinks,
-            emit=emit,
-            **sample_kwargs,
-        )
-    else:
-        idata = _run_local(
-            model=model,
-            original_sample=original_sample,
-            sinks=sinks,
-            emit=emit,
-            nuts_sampler=nuts_sampler,
-            **sample_kwargs,
-        )
+    # -- Run sampling (sinks must be stopped even when it raises, or a
+    # terminal Rich Live display would keep repainting over the traceback) --
+    try:
+        if remote:
+            idata = _run_remote(
+                model=model,
+                model_bytes=model_bytes,
+                config=config,
+                nuts_sampler=nuts_sampler,
+                sinks=sinks,
+                emit=emit,
+                **sample_kwargs,
+            )
+        else:
+            idata = _run_local(
+                model=model,
+                original_sample=original_sample,
+                sinks=sinks,
+                emit=emit,
+                nuts_sampler=nuts_sampler,
+                **sample_kwargs,
+            )
 
-    # -- Cache store --
-    if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
-
-    _stop_sinks(sinks)
-    return idata
+        # -- Cache store --
+        if cache_backend is not None and cache_key:
+            cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+        return idata
+    finally:
+        _stop_sinks(sinks)
 
 
 _NOTIFY_DICT_KEYS = {"topic", "server"}
@@ -973,8 +1043,9 @@ def _run_sample_persistent(
     *,
     env,
     model_bytes: bytes,
-    cache: bool,
-    overwrite: bool = False,
+    cache_backend=None,
+    cache_key: str | None = None,
+    cache_kwargs: dict | None = None,
     dashboard: bool = False,
     notify: bool | str | dict = False,
     nuts_sampler: str = "pymc",
@@ -984,41 +1055,13 @@ def _run_sample_persistent(
     """Sampling via a persistent environment.
 
     Model payload is in the Volume. Per-call sends only kwargs + a path
-    identifying which payload to load. Volume upload is deferred until
-    after cache check (no upload needed on cache hit).
+    identifying which payload to load. The cache lookup already happened in
+    the caller (before the env was provisioned -- a hit never creates Modal
+    infra); ``cache_backend``/``cache_key`` are only used to save the result.
     """
     from cloudposterior.backends.modal_backend import _compute_payload_path
-    from cloudposterior.cache import resolve_cache
-    from cloudposterior.naming import cache_key as compute_cache_key
 
-    # Cache check -- include nuts_sampler in key so different samplers don't collide
-    cache_kwargs = {**sample_kwargs, "nuts_sampler": nuts_sampler}
-
-    cache_backend = resolve_cache(cache, model=model)
-    cache_key = None
-    if cache_backend is not None:
-        cache_key = compute_cache_key(model_bytes, cache_kwargs)
-        # overwrite= forces a re-run: skip the load (still save below to replace).
-        cached = None if overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
-        if cached is not None:
-            if progress:
-                from cloudposterior.display import _emit_oneshot_html
-
-                def _cached_terminal():
-                    from rich.console import Console
-                    Console().print("[green]\u2713[/green] [dim]cached result[/dim]")
-
-                _emit_oneshot_html(
-                    [
-                        '<div style="font-family:monospace;font-size:13px;color:#888;padding:2px 0;">'
-                        '<span style="color:#5cb85c;">&#10003;</span> cached result'
-                        '</div>'
-                    ],
-                    terminal_fallback=_cached_terminal,
-                )
-            return cached
-
-    # Cache miss -- read the actually-provisioned config from the env so the
+    # Read the actually-provisioned config from the env so the
     # displayed instance description matches what's running (no recomputation drift).
     config = env.config
     instance_desc = f"Modal ({config.describe()})"
@@ -1063,81 +1106,85 @@ def _run_sample_persistent(
     def emit(event):
         dispatch_event(event, sinks)
 
-    # Upload payload to Volume if needed
-    payload_path = _compute_payload_path(env._model_slug, model_bytes)
+    # Sinks must be stopped even when the run raises (a worker error re-raised
+    # mid-stream would otherwise leave a terminal Rich Live display running).
+    try:
+        # Upload payload to Volume if needed
+        payload_path = _compute_payload_path(env._model_slug, model_bytes)
 
-    payload_mb = len(model_bytes) / (1024 * 1024)
-    emit(PhaseUpdate(
-        phase=JobPhase.DATA_UPLOADING,
-        status="in_progress",
-        message=f"uploading to volume ({payload_mb:.1f} MB)",
-        elapsed=0.0,
-    ))
-    upload_start = time.time()
-    uploaded = env._upload_if_needed(model_bytes, payload_path)
-    if uploaded:
+        payload_mb = len(model_bytes) / (1024 * 1024)
         emit(PhaseUpdate(
             phase=JobPhase.DATA_UPLOADING,
-            status="done",
-            message="uploaded to volume",
-            elapsed=time.time() - upload_start,
+            status="in_progress",
+            message=f"uploading to volume ({payload_mb:.1f} MB)",
+            elapsed=0.0,
         ))
-    else:
-        emit(PhaseUpdate(
-            phase=JobPhase.DATA_UPLOADING,
-            status="done",
-            message="volume up to date",
-            elapsed=time.time() - upload_start,
-        ))
-
-    # Submit to container (env no longer uploads -- we already did)
-    job = env.submit(model_bytes, sample_kwargs, nuts_sampler, payload_path=payload_path)
-
-    emit(PhaseUpdate(
-        phase=JobPhase.PROVISIONING,
-        status="in_progress",
-        message="provisioning container",
-        elapsed=0.0,
-    ))
-
-    provision_start = time.time()
-    first_event = True
-    download_start = None
-    for event in job.stream_progress():
-        if first_event:
+        upload_start = time.time()
+        uploaded = env._upload_if_needed(model_bytes, payload_path)
+        if uploaded:
             emit(PhaseUpdate(
-                phase=JobPhase.PROVISIONING,
+                phase=JobPhase.DATA_UPLOADING,
                 status="done",
-                message="container ready",
-                elapsed=time.time() - provision_start,
+                message="uploaded to volume",
+                elapsed=time.time() - upload_start,
             ))
-            first_event = False
-        emit(event)
-        # Start download timer when sampling completes (remote compression + transfer follows)
-        if isinstance(event, PhaseUpdate) and event.phase == JobPhase.SAMPLING and event.status == "done":
-            download_start = time.time()
+        else:
             emit(PhaseUpdate(
-                phase=JobPhase.DOWNLOADING,
-                status="in_progress",
-                message="compressing and transferring trace",
-                elapsed=0.0,
+                phase=JobPhase.DATA_UPLOADING,
+                status="done",
+                message="volume up to date",
+                elapsed=time.time() - upload_start,
             ))
 
-    # result() does local lz4 decompression + netcdf parsing
-    idata = job.result()
+        # Submit to container (env no longer uploads -- we already did)
+        job = env.submit(model_bytes, sample_kwargs, nuts_sampler, payload_path=payload_path)
 
-    emit(PhaseUpdate(
-        phase=JobPhase.DOWNLOADING,
-        status="done",
-        message="trace loaded",
-        elapsed=time.time() - (download_start or time.time()),
-    ))
+        emit(PhaseUpdate(
+            phase=JobPhase.PROVISIONING,
+            status="in_progress",
+            message="provisioning container",
+            elapsed=0.0,
+        ))
 
-    if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+        provision_start = time.time()
+        first_event = True
+        download_start = None
+        for event in job.stream_progress():
+            if first_event:
+                emit(PhaseUpdate(
+                    phase=JobPhase.PROVISIONING,
+                    status="done",
+                    message="container ready",
+                    elapsed=time.time() - provision_start,
+                ))
+                first_event = False
+            emit(event)
+            # Start download timer when sampling completes (remote compression + transfer follows)
+            if isinstance(event, PhaseUpdate) and event.phase == JobPhase.SAMPLING and event.status == "done":
+                download_start = time.time()
+                emit(PhaseUpdate(
+                    phase=JobPhase.DOWNLOADING,
+                    status="in_progress",
+                    message="compressing and transferring trace",
+                    elapsed=0.0,
+                ))
 
-    _stop_sinks(sinks)
-    return idata
+        # result() does local lz4 decompression + netcdf parsing
+        idata = job.result()
+
+        emit(PhaseUpdate(
+            phase=JobPhase.DOWNLOADING,
+            status="done",
+            message="trace loaded",
+            elapsed=time.time() - (download_start or time.time()),
+        ))
+
+        if cache_backend is not None and cache_key:
+            cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+
+        return idata
+    finally:
+        _stop_sinks(sinks)
 
 
 def _run_local(
@@ -1173,7 +1220,16 @@ def _run_local(
         tune = sample_kwargs.get("tune", 1000)
         draws = sample_kwargs.get("draws", 1000)
         progress_queue: Queue = Queue()
-        callback = make_sampling_callback(progress_queue, tune, draws)
+        progress_cb = make_sampling_callback(progress_queue, tune, draws)
+        # pm.sample takes a single callback: compose ours with the user's
+        # instead of passing callback= twice (TypeError).
+        user_cb = sample_kwargs.pop("callback", None)
+        if user_cb is not None:
+            def callback(trace, draw, _progress_cb=progress_cb, _user_cb=user_cb):
+                _progress_cb(trace, draw)
+                _user_cb(trace, draw)
+        else:
+            callback = progress_cb
         aggregator = ProgressAggregator(progress_queue)
 
         def stream_progress():
@@ -1356,6 +1412,8 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
             raise ValueError(
                 f"sample_kwargs list ({len(kwargs_list)}) must align with models ({n})"
             )
+    for kw in kwargs_list:
+        _validate_sample_kwargs(kw)
 
     model_bytes_list = [_ensure_model_bytes(m) for m in models]
     samplers = [nuts_sampler or _default_sampler(m, local=False) for m in models]
@@ -1375,8 +1433,10 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
 
     # -- Cache check first: all local (cloudpickle + key hash + cache load touch
     # no Modal), so only cache *misses* need a remote container. An all-cached
-    # map therefore provisions nothing -- no env, no dashboard. --
-    cache_backend = resolve_cache(cache, model=models[0]) if cache else None
+    # map therefore provisions nothing -- no env, no dashboard. Resolve one
+    # backend per model: a disk cache derives its directory from the model's
+    # slug, so a shared backend would file every result under models[0]. --
+    cache_backends = [resolve_cache(cache, model=m) for m in models]
     results: list = [None] * n
     cached_idx: list[int] = []
     run_idx: list[int] = []
@@ -1406,12 +1466,12 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         payload_path = _compute_payload_path(model_slug(m), mb)
         ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
         ckey = None
-        if cache_backend is not None:
+        if cache_backends[i] is not None:
             # Still compute the key (so the fresh result is saved) but skip the
             # load when overwrite= forces a re-run.
             ckey = compute_cache_key(mb, ck_kwargs)
             if not overwrite:
-                hit = cache_backend.load(ckey, sample_kwargs=ck_kwargs)
+                hit = cache_backends[i].load(ckey, sample_kwargs=ck_kwargs)
                 if hit is not None:
                     results[i] = hit
                     cached_idx.append(i)
@@ -1517,14 +1577,23 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
             results[i] = idata
             _log(f"[{j + 1}/{len(run_idx)}] done")
             _mb, _pp, _kw, _sp, ckey, ck_kwargs, _lbl, _cfg = run_meta[j]
-            if cache_backend is not None and ckey is not None:
-                cache_backend.save(ckey, idata, sample_kwargs=ck_kwargs)
+            if cache_backends[i] is not None and ckey is not None:
+                cache_backends[i].save(ckey, idata, sample_kwargs=ck_kwargs)
 
         if dashboard_on:
             # Keep the env warm (reusing the cp.cloud registry) so the dashboard
             # stays browsable after the run; Modal idles it out via
-            # scaledown_window / the atexit hook.
-            _LIVE_ENVS[_env_key(project, models[0])] = env
+            # scaledown_window / the atexit hook. Tear down any *other* env
+            # already registered under this key first -- silently overwriting
+            # it would leak a warm container until its scaledown window.
+            key = _env_key(project, models[0])
+            previous = _LIVE_ENVS.get(key)
+            if previous is not None and previous is not env:
+                try:
+                    previous.teardown()
+                except Exception:
+                    pass
+            _LIVE_ENVS[key] = env
             teardown = False
         return results
     finally:

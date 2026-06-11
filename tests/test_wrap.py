@@ -94,3 +94,104 @@ def test_cloud_explicit_dashboard_without_remote_warns():
     with pytest.warns(UserWarning, match="dashboard=True has no effect"):
         with cp.cloud(model, dashboard=True):
             pass
+
+
+def test_remote_pops_callback_from_kwargs_and_cache_key():
+    """callback= is warned about and removed for remote runs: a function repr
+    embeds a memory address, which would make disk-cache keys unstable."""
+    model = _make_model()
+    captured = {}
+
+    def fake_lookup(cache_arg, m, mb, cache_kwargs, *, overwrite, progress):
+        captured["cache_kwargs"] = cache_kwargs
+        return None, None, None
+
+    def fake_provision(self, nuts_sampler, kwargs):
+        self._env = MagicMock()
+
+    with patch("cloudposterior.api._cache_lookup", side_effect=fake_lookup), \
+         patch("cloudposterior.api._run_sample_persistent") as mock_run, \
+         patch.object(cp.cloud, "_provision_environment", fake_provision):
+        mock_run.return_value = MagicMock()
+        with cp.cloud(model, remote=True):
+            with pytest.warns(UserWarning, match="callback"):
+                pm.sample(draws=10, callback=lambda *a, **k: None)
+
+    assert "callback" not in captured["cache_kwargs"]
+    assert "callback" not in mock_run.call_args[1]
+
+
+def test_remote_cache_hit_skips_provisioning():
+    """A cache hit must not create Modal infra (Volume/Dict/app)."""
+    model = _make_model()
+    sentinel = MagicMock(name="cached_idata")
+
+    def fake_lookup(*args, **kwargs):
+        return MagicMock(), "key", sentinel
+
+    def boom(self, nuts_sampler, kwargs):
+        raise AssertionError("provisioned despite cache hit")
+
+    with patch("cloudposterior.api._cache_lookup", side_effect=fake_lookup), \
+         patch.object(cp.cloud, "_provision_environment", boom):
+        with cp.cloud(model, remote=True):
+            out = pm.sample(draws=10)
+
+    assert out is sentinel
+
+
+def test_sample_inside_other_model_falls_back_to_native():
+    """pm.sample() targeting a model other than the wrapped one must run
+    natively (intercepting would silently sample the wrong model)."""
+    m1 = _make_model()
+    m2 = _make_model()
+    native = MagicMock(name="native_sample")
+    real_sample = pm.sample
+    pm.sample = native
+    try:
+        with cp.cloud(m1):
+            with m2:
+                with pytest.warns(UserWarning, match="different model"):
+                    pm.sample(draws=10)
+        native.assert_called_once_with(draws=10)
+    finally:
+        pm.sample = real_sample
+
+
+def test_sinks_stopped_when_sampling_raises():
+    """A failed run must still stop the sinks (a Rich Live display left
+    running garbles the terminal)."""
+    from cloudposterior.api import _run_sample
+
+    model = _make_model()
+    sink = MagicMock()
+
+    with patch("cloudposterior.api._build_sinks", return_value=[sink]), \
+         patch("cloudposterior.api._run_local", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            _run_sample(
+                model=model, remote=False, cache=False, notify=False,
+                instance=None, nuts_sampler="pymc", progress=False,
+                original_sample=MagicMock(), draws=10,
+            )
+
+    sink.stop.assert_called_once()
+
+
+def test_local_user_callback_composes_with_progress_callback():
+    """notify/progress sinks attach our per-draw callback; a user callback=
+    must compose with it instead of raising a duplicate-kwarg TypeError."""
+    from cloudposterior.api import _run_local
+
+    model = _make_model()
+    calls = {"n": 0}
+
+    def user_cb(trace, draw):
+        calls["n"] += 1
+
+    _run_local(
+        model=model, original_sample=pm.sample, sinks=[MagicMock()],
+        emit=lambda e: None, nuts_sampler="pymc",
+        draws=10, tune=10, chains=1, callback=user_cb, progressbar=False,
+    )
+    assert calls["n"] > 0
