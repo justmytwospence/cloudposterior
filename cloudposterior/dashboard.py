@@ -297,6 +297,13 @@ function cleanName(name) {
   return idx >= 0 ? name.substring(idx + 2) : name;
 }
 
+// Escape dynamic strings (param names, worker messages) before they land in
+// innerHTML -- a parameter named "beta<sub>" must render, not inject markup.
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // A single-model cp.cloud run is just N=1 of the map shape -- normalize so the
 // rest of the UI has exactly one code path.
 function normalize(data) {
@@ -448,13 +455,13 @@ function renderPhases(el, phases, compact) {
     // Overview: collapse to the single most-relevant phase line.
     const active = [...phases].reverse().find(p => p.status === 'in_progress') || phases[phases.length - 1];
     el.innerHTML = active
-      ? '<div class="phase">' + phaseIcon(active.status) + ' <span class="detail">' + active.detail + '</span></div>'
+      ? '<div class="phase">' + phaseIcon(active.status) + ' <span class="detail">' + esc(active.detail) + '</span></div>'
       : '<div class="phase"><span class="spinner"></span> <span class="detail">waiting...</span></div>';
     return;
   }
   let html = '';
   for (const p of phases) {
-    html += '<div class="phase">' + phaseIcon(p.status) + ' <span class="detail">' + p.detail + '</span></div>';
+    html += '<div class="phase">' + phaseIcon(p.status) + ' <span class="detail">' + esc(p.detail) + '</span></div>';
   }
   el.innerHTML = html;
 }
@@ -481,7 +488,7 @@ function renderSampling(el, s, compact) {
     const speed = c.draws_per_sec > 0 ? Math.round(c.draws_per_sec) + '/s' : '--';
     const eta = c.eta_seconds > 0 ? c.eta_seconds.toFixed(0) + 's' : '--';
     html += '<tr>'
-      + '<td>' + id + ' <span class="detail">[' + c.phase.slice(0,4) + ']</span></td>'
+      + '<td>' + esc(id) + ' <span class="detail">[' + esc(c.phase.slice(0,4)) + ']</span></td>'
       + '<td><div class="bar-bg"><div class="bar-fill ' + barClass + '" style="width:' + pct + '%"></div></div></td>'
       + '<td>' + c.draw + '/' + c.total + '</td>'
       + '<td' + (c.divergences > 0 ? ' class="error"' : '') + '>' + c.divergences + '</td>'
@@ -605,7 +612,7 @@ function renderTraces(container, traces, prefix) {
       // Create wrapper with label and two chart divs side by side
       const wrapper = document.createElement('div');
       wrapper.style.marginTop = '16px';
-      wrapper.innerHTML = '<div style="color:var(--text-muted);font-size:12px;margin-bottom:4px;font-weight:600;font-family:monospace;">' + cleanName(param) + '</div>';
+      wrapper.innerHTML = '<div style="color:var(--text-muted);font-size:12px;margin-bottom:4px;font-weight:600;font-family:monospace;">' + esc(cleanName(param)) + '</div>';
       const row = document.createElement('div');
       row.style.display = 'flex';
       row.style.gap = '8px';
@@ -673,7 +680,7 @@ function renderConvergence(el, conv, compact) {
   for (const name of names) {
     const p = params[name];
     tableHtml += '<tr>'
-      + '<td style="font-family:monospace;font-size:12px;">' + cleanName(name) + '</td>'
+      + '<td style="font-family:monospace;font-size:12px;">' + esc(cleanName(name)) + '</td>'
       + '<td class="' + rhatClass(p.rhat) + '">' + p.rhat.toFixed(3) + '</td>'
       + '<td class="' + essClass(p.ess_bulk) + '">' + p.ess_bulk + '</td>'
       + '<td class="' + essClass(p.ess_tail) + '">' + p.ess_tail + '</td>'

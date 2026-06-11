@@ -96,3 +96,18 @@ def test_render_dashboard_html_has_unified_multimodel_scaffold():
         "function normalize", "function requestStop", "function renderTraces(container, traces, prefix)",
     ]:
         assert needle in html, f"missing scaffold: {needle}"
+
+
+def test_dashboard_html_escapes_dynamic_strings():
+    """Param names and worker messages are escaped before innerHTML."""
+    from cloudposterior.dashboard import render_dashboard_html
+
+    html = render_dashboard_html(
+        progress_label="m-p", stop_label="m-s", dashboard_label="m", stop_token="t"
+    )
+    assert "function esc(" in html
+    # every dynamic-string render site goes through esc()
+    assert "esc(cleanName(param))" in html
+    assert "esc(cleanName(name))" in html
+    assert "esc(active.detail)" in html
+    assert "esc(p.detail)" in html

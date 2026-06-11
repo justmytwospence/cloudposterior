@@ -116,3 +116,29 @@ def test_notebook_display_render_degrades_when_trait_set_raises(monkeypatch):
 
     d._widget = _Boom()
     d.show_sampling(_sampling())  # must not raise
+
+
+def test_phase_html_escapes_worker_messages():
+    """Phase details carry worker messages (including exception text) -- a
+    stray '<' must render as text, not inject markup into the widget."""
+    from cloudposterior.display import _phase_html
+
+    html = _phase_html([("error", "sampling", "<script>alert(1)</script>")])
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_notebook_display_escapes_active_phase():
+    from cloudposterior.display import NotebookDisplay
+    from cloudposterior.progress import JobPhase, PhaseUpdate
+
+    display = NotebookDisplay.__new__(NotebookDisplay)
+    display._instance_desc = ""
+    display._phases = []
+    display._active_phase = None
+    display._sampling = None
+
+    display._active_phase = "compiling <model>"
+    html = display._compose_html()
+    assert "<model>" not in html
+    assert "&lt;model&gt;" in html

@@ -142,6 +142,8 @@ _CSS_SPINNER = (
 
 def _phase_html(phases: list[tuple[str, str, str]]) -> str:
     """Render phase checklist as HTML. Each tuple: (status, label, detail)."""
+    import html
+
     lines = []
     for status, label, detail in phases:
         if status == "done":
@@ -153,7 +155,9 @@ def _phase_html(phases: list[tuple[str, str, str]]) -> str:
         lines.append(
             f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
             f'  {icon} '
-            f'<span style="color:#888;">{detail}</span>'
+            # detail carries worker messages, including exception text --
+            # escape so a stray "<" can't break (or script) the widget HTML.
+            f'<span style="color:#888;">{html.escape(detail)}</span>'
             f'</div>'
         )
     return "".join(lines)
@@ -297,10 +301,12 @@ class NotebookDisplay:
         if self._phases:
             parts.append(_phase_html(self._phases))
         if self._active_phase:
+            import html
+
             parts.append(
                 f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
                 f'  {_CSS_SPINNER}'
-                f'<span style="color:#888;">{self._active_phase}...</span>'
+                f'<span style="color:#888;">{html.escape(self._active_phase)}...</span>'
                 f'</div>'
             )
         if self._sampling and self._sampling.chains:
