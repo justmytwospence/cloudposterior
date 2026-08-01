@@ -10,11 +10,18 @@ cloudposterior lets you run PyMC MCMC sampling on cloud VMs (currently Modal) wi
 
 ```bash
 uv sync                          # install all deps (including dev group)
+uv lock --no-config              # re-lock (see note below -- not plain `uv lock`)
 uv run pytest tests/ -v          # run free local tests (default)
 uv run pytest tests/ -v --run-modal   # also run paid Modal e2e tests
 uv run pytest tests/test_cache.py -v          # run one test file
 uv run pytest tests/test_cache.py::test_name -v  # run single test
 ```
+
+**Re-lock with `uv lock --no-config`.** CI runs `uv sync --locked`, so the
+committed `uv.lock` has to resolve identically on a clean machine. A user-level
+`~/.config/uv/uv.toml` with `exclude-newer` bakes an `exclude-newer-span` into
+the lockfile that CI does not share, and every `--locked` job then fails with
+"the lockfile needs to be updated". `--no-config` ignores user-level settings.
 
 Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`) hit real Modal infrastructure and incur cloud costs. They are skipped unless `--run-modal` is passed. See `tests/conftest.py` for the marker plumbing.
 
