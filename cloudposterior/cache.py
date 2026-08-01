@@ -19,6 +19,8 @@ random_seed or target_accept get different files.
 
 from __future__ import annotations
 
+import copy
+from collections import OrderedDict
 from pathlib import Path
 from typing import Protocol
 
@@ -43,16 +45,33 @@ class CacheBackend(Protocol):
 
 
 class MemoryCache:
-    """In-memory cache. Fast, lives for the session."""
+    """In-memory LRU cache. Fast, lives for the session.
 
-    def __init__(self):
-        self._store: dict[str, object] = {}
+    Entries are copied on load. Callers routinely extend a returned trace in
+    place (``pm.compute_log_likelihood`` merges a ``log_likelihood`` group into
+    it), which would otherwise mutate the cached entry itself and hand every
+    later hit a trace the original run never produced. DiskCache already
+    materializes a fresh object per load; this keeps the two consistent.
+
+    ``max_entries`` bounds the store: each entry is a full posterior, and the
+    default instance lives for the whole process.
+    """
+
+    def __init__(self, max_entries: int = 8):
+        self._store: OrderedDict[str, object] = OrderedDict()
+        self._max_entries = max_entries
 
     def load(self, key: str, **kwargs):
-        return self._store.get(key)
+        if key not in self._store:
+            return None
+        self._store.move_to_end(key)
+        return copy.deepcopy(self._store[key])
 
     def save(self, key: str, idata, **kwargs) -> None:
         self._store[key] = idata
+        self._store.move_to_end(key)
+        while len(self._store) > self._max_entries:
+            self._store.popitem(last=False)
 
 
 class DiskCache:
