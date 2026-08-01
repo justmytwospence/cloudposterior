@@ -93,7 +93,7 @@ The dashboard is controlled by the separate `dashboard: bool | None` kwarg (defa
 
 Besides streaming sampling, the worker has **blocking (non-streaming) entries** that load the model and return lz4 NetCDF directly: `run_prior_predictive` / `run_posterior_predictive`, `run_smc` (`pm.sample_smc`), and `run_compute_log_likelihood`. They mount as `@modal.method()`s on the persistent `Sampler` Cls and are driven client-side by `_run_blocking_op`.
 
-**Custom `step=` over the wire**: a step instance pickled separately from the model has value variables in a different graph than the worker's Volume-loaded model (PyMC raises "not a value variable in the model"). So `intercepted_sample` ships a combined `{model, step}` blob via `serialize_model_with_step`; `_unpack_model_payload` on the worker detects the dict, re-injects the step, and forces the pymc sampler (so the per-draw callback / live progress still work).
+**Custom `step=` over the wire**: a step instance pickled separately from the model has value variables in a different graph than the worker's Volume-loaded model (PyMC raises -- 5.28 words it "the following variables are not random variables in the model"). So `intercepted_sample` ships a combined `{model, step}` blob via `serialize_model_with_step`; `_unpack_model_payload` on the worker detects the dict, re-injects the step, and forces the pymc sampler (so the per-draw callback / live progress still work).
 
 ### Samplers and arviz compatibility
 

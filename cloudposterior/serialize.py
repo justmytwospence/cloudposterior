@@ -43,8 +43,19 @@ def get_version_manifest() -> dict[str, str]:
         except ImportError:
             pass
 
-    # Check optional samplers
-    for pkg in ("nutpie", "numpyro", "jax"):
+    # arviz 1.x is a metapackage: the effective API comes from these, so pin
+    # them too or the remote container can resolve a different arviz API than
+    # the client serialized against.
+    for pkg in ("arviz_base", "arviz_stats", "arviz_plots"):
+        try:
+            mod = importlib.import_module(pkg)
+            manifest[pkg.replace("_", "-")] = getattr(mod, "__version__", "unknown")
+        except ImportError:
+            pass
+
+    # Check optional samplers (blackjax is an accepted nuts_sampler too, and
+    # went unpinned remotely without this).
+    for pkg in ("nutpie", "numpyro", "jax", "blackjax"):
         try:
             mod = importlib.import_module(pkg)
             manifest[pkg] = getattr(mod, "__version__", "unknown")
@@ -74,7 +85,8 @@ def serialize_model_with_step(model, step) -> bytes:
     A step method instance holds references into the model graph. Pickling it
     *separately* from the model produces a step whose value variables belong to
     a different graph instance than a separately-deserialized model, which makes
-    ``pm.sample(step=...)`` raise "not a value variable in the model". Bundling
+    ``pm.sample(step=...)`` raise (PyMC 5.28 words it "the following variables
+    are not random variables in the model"). Bundling
     both in a single pickle preserves shared object identity, so the worker can
     reconstruct a matching ``(model, step)`` pair. The worker detects this dict
     payload via :func:`deserialize_model` returning ``{"model", "step"}``.

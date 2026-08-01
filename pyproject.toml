@@ -22,7 +22,9 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "pymc>=5",
+    # <7 so a future major that changes the sampling API again can't silently
+    # break installs; PyMC 5 and 6 are both supported (see _idata.pymc_major).
+    "pymc>=5,<7",
     "arviz>=0.17,<2.0",
     "numpy>=1.24",
     # imported directly (api.py fingerprints SharedVariables); pymc pins the
@@ -33,7 +35,10 @@ dependencies = [
     "coolname>=4.0",
     "ipywidgets>=8.0",
     "lz4>=4.0",
-    "modal>=1.0",
+    # The backend uses Dict.objects/Volume.objects, fastapi_endpoint,
+    # Cls.with_options(cpu=/memory=/gpu=) and scaledown_window -- all
+    # Modal-1.x API surface, and none of it exercised in CI.
+    "modal>=1.0,<2",
     "msgpack>=1.0",
     "qrcode>=7.0",
     "requests>=2.28",

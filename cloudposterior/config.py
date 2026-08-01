@@ -182,4 +182,9 @@ DEFAULT_PACKAGES = [
 # recompiled remotely, so only the model pickle (pymc/pytensor/numpy) must version-match.
 OPTIONAL_PACKAGES = {
     "numpyro": "numpyro",
+    "blackjax": "blackjax",
+    # arviz 1.x metapackage components; absent under arviz 0.x.
+    "arviz-base": "arviz-base",
+    "arviz-stats": "arviz-stats",
+    "arviz-plots": "arviz-plots",
 }

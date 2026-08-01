@@ -5,7 +5,9 @@ PyMC 6 hard-requires ``arviz>=1.1``, a DataTree-based rewrite that:
 - makes ``InferenceData.groups()`` a ``DataTree.groups`` *property* returning
   slash-prefixed paths (``/posterior``) plus a ``/`` root,
 - removes ``arviz.convert_to_inference_data``,
-- changes ``arviz.ess(..., method="tail")`` to require a ``prob`` argument,
+- may reject ``arviz.ess(..., method="tail")`` without a ``prob`` argument
+  (current 1.x releases accept it defaulted; the shim tries the plain call
+  first and only then supplies one),
 - returns ``xarray.DataTree`` from samplers / ``from_netcdf`` instead of
   ``arviz.InferenceData``.
 
@@ -93,6 +95,23 @@ def add_group(idata, name: str, group) -> None:
         raise RuntimeError(
             f"could not attach group {name!r} to this InferenceData/DataTree"
         )
+
+
+def pymc_major() -> int:
+    """Major version of the installed PyMC.
+
+    Single place for version branching. PyMC 6 changed several things this
+    library sits directly on top of: nuts_sampler defaults to auto-selecting
+    nutpie, tune resolves per sampler (400 for nutpie vs 1000 for pymc),
+    sample_posterior_predictive's var_names became output-only, and a new
+    backend= kwarg appeared across the sampling entry points.
+    """
+    try:
+        import pymc
+
+        return int(pymc.__version__.split(".")[0])
+    except Exception:
+        return 5
 
 
 def load_all(idata) -> None:

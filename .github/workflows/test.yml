@@ -61,7 +61,7 @@ jobs:
         run: |
           if [ "${{ matrix.pymc }}" = "6" ]; then
             uv run --python ${{ matrix.python-version }} \
-              --with "pymc>=6,<7" --with "arviz>=1.1,<2.0" --with "nutpie>=0.13" \
+              --with "pymc>=6,<7" --with "arviz>=1.1,<2.0" --with "nutpie>=0.16.10" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           else
             uv run --python ${{ matrix.python-version }} \

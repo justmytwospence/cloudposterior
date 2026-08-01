@@ -351,6 +351,12 @@ class cloud:
             elif nuts_sampler is None:
                 nuts_sampler = _default_sampler(ctx.model, local=not ctx.remote)
 
+            # Send tune explicitly. Under PyMC 6 an unset tune resolves per
+            # sampler (400 for nutpie, 1000 for pymc), so leaving it out made
+            # progress totals and the auto-sized timeout disagree with what
+            # the worker actually ran.
+            kwargs["tune"] = resolve_tune(kwargs, nuts_sampler)
+
             if ctx.remote:
                 _warn_remote_sample_fidelity(kwargs)
                 # The warning says callback= is ignored remotely -- actually
@@ -455,6 +461,7 @@ class cloud:
             ):
                 return ctx._originals[orig_key](*args, **kwargs)
             kwargs.pop("model", None)
+            _warn_predictive_kwarg_drift(kind, kwargs)
 
             ctx._model_bytes = _ensure_model_bytes(ctx.model)
             if ctx._env is None:
@@ -710,11 +717,59 @@ def _validate_sample_kwargs(kwargs: dict) -> None:
     """Catch the common typo class early: the core sampling counts must be
     positive ints. Everything else passes through to pm.sample unchanged.
     """
+    from cloudposterior._idata import pymc_major
+
     for key in _CORE_INT_KWARGS:
         if key in kwargs and kwargs[key] is not None:
             val = kwargs[key]
             if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
                 raise TypeError(f"{key} must be a positive int, got {val!r}")
+
+    if kwargs.get("backend") is not None and pymc_major() < 6:
+        raise TypeError(
+            "backend= requires PyMC 6 or newer; the installed PyMC "
+            f"{pymc_major()}.x has no such kwarg"
+        )
+
+
+def resolve_tune(sample_kwargs: dict, nuts_sampler: str) -> int:
+    """Resolve the tune count the sampler will actually use.
+
+    PyMC 6 made ``tune=None`` the default and resolves it per sampler: 400 for
+    nutpie, 1000 for the pymc sampler. Progress totals and the auto-sized
+    timeout both need the real number, so it is resolved client-side and sent
+    explicitly rather than left for the worker to guess.
+    """
+    from cloudposterior._idata import pymc_major
+
+    tune = sample_kwargs.get("tune")
+    if tune is not None:
+        return tune
+    if nuts_sampler == "nutpie" and pymc_major() >= 6:
+        return 400
+    return 1000
+
+
+def _warn_predictive_kwarg_drift(kind: str, kwargs: dict) -> None:
+    """Flag predictive kwargs whose meaning changed in PyMC 6.
+
+    PyMC 6 overhauled ``sample_posterior_predictive``: ``var_names`` now
+    selects only which outputs are *stored*, while ``sample_vars`` /
+    ``freeze_vars`` control what gets resampled. Code written against 5.x that
+    passed ``var_names`` to force deterministics to be recomputed silently
+    gets different results, so say so rather than let it pass.
+    """
+    from cloudposterior._idata import pymc_major
+
+    if kind != "posterior" or pymc_major() < 6:
+        return
+    if kwargs.get("var_names") is not None and kwargs.get("sample_vars") is None:
+        warnings.warn(
+            "under PyMC 6, sample_posterior_predictive's var_names only "
+            "selects which variables are stored -- it no longer decides what "
+            "is resampled. Pass sample_vars= to control resampling.",
+            stacklevel=3,
+        )
 
 
 def _warn_remote_sample_fidelity(kwargs: dict) -> None:

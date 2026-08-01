@@ -18,6 +18,7 @@ Live progress support depends on the sampler:
 from __future__ import annotations
 
 import time
+from importlib import import_module
 from queue import Queue
 from threading import Thread
 
@@ -753,13 +754,10 @@ def run_sampling(
     Observed data is bundled inside the cloudpickled model, so no separate
     data payload is needed.
     """
-    import pickle
-
-    import lz4.frame
     import msgpack
 
     phase_start = time.time()
-    obj = pickle.loads(lz4.frame.decompress(model_bytes))
+    obj = _deserialize_payload(model_bytes)
     model, sample_kwargs, nuts_sampler = _unpack_model_payload(
         obj, sample_kwargs, nuts_sampler
     )
@@ -782,16 +780,11 @@ def run_sampling_from_volume(
     stop_dict_name: str | None = None,
 ):
     """Persistent path: load model from Volume and run sampling."""
-    import pickle
-
-    import lz4.frame
     import msgpack
 
     phase_start = time.time()
     with open(payload_path, "rb") as f:
-        model_bytes = f.read()
-
-    obj = pickle.loads(lz4.frame.decompress(model_bytes))
+        obj = _deserialize_payload(f.read())
     model, sample_kwargs, nuts_sampler = _unpack_model_payload(
         obj, sample_kwargs, nuts_sampler
     )
@@ -805,13 +798,34 @@ def run_sampling_from_volume(
     yield from _sample_and_stream(model, sample_kwargs, nuts_sampler, stop_dict_name=stop_dict_name)
 
 
+def _deserialize_payload(data: bytes):
+    """Unpickle a model payload, turning version skew into a readable error.
+
+    A cloudpickle/pymc mismatch between the client that pickled the model and
+    this container otherwise surfaces as a bare pickle error with no hint that
+    versions are the problem.
+    """
+    from cloudposterior.serialize import deserialize_model
+
+    try:
+        return deserialize_model(data)
+    except Exception as exc:
+        versions = []
+        for name in ("cloudpickle", "pymc", "pytensor", "numpy"):
+            try:
+                versions.append(f"{name}={import_module(name).__version__}")
+            except Exception:
+                versions.append(f"{name}=?")
+        raise RuntimeError(
+            f"could not deserialize the model payload ({exc}). The container "
+            f"has {', '.join(versions)}; this usually means the local "
+            "environment that pickled the model has different versions."
+        ) from exc
+
+
 def _load_model_from_volume(payload_path: str):
-    import pickle
-
-    import lz4.frame
-
     with open(payload_path, "rb") as f:
-        return pickle.loads(lz4.frame.decompress(f.read()))
+        return _deserialize_payload(f.read())
 
 
 def run_prior_predictive(payload_path: str, sample_kwargs: dict) -> bytes:
