@@ -397,6 +397,7 @@ class cloud:
                     notify=ctx.notify,
                     nuts_sampler=nuts_sampler,
                     progress=ctx.progress,
+                    notify_topic_holder=ctx,
                     **kwargs,
                 )
             return _run_sample(
@@ -410,6 +411,7 @@ class cloud:
                 progress=ctx.progress,
                 original_sample=ctx._originals["sample"],
                 model_bytes=call_model_bytes,
+                notify_topic_holder=ctx,
                 **kwargs,
             )
 
@@ -792,6 +794,7 @@ def _run_sample(
     progress: bool,
     original_sample,
     model_bytes: bytes | None = None,
+    notify_topic_holder=None,
     **sample_kwargs,
 ) -> az.InferenceData:
     """Core sampling logic with cache, remote, and notification support."""
@@ -820,6 +823,7 @@ def _run_sample(
         notify=notify,
         instance_desc=instance_desc,
         model=model,
+        notify_topic_holder=notify_topic_holder,
     )
 
     def emit(event):
@@ -885,46 +889,67 @@ def _parse_notify(notify) -> tuple[str | None, str | None]:
 
 def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
                  instance_desc: str, model=None, dashboard_dict=None,
-                 stop_url: str | None = None, stop_token: str | None = None) -> list:
-    """Create display, dashboard, and notification sinks."""
-    sinks = []
+                 stop_url: str | None = None, stop_token: str | None = None,
+                 notify_topic_holder=None) -> list:
+    """Create display, dashboard, and notification sinks.
 
-    if progress:
-        from cloudposterior.display import (
-            NotebookDisplay,
-            TerminalDisplay,
-            _is_marimo,
-            _is_notebook,
-        )
+    ``notify_topic_holder`` is the ``cloud`` instance (when there is one), used
+    to reuse one auto-generated ntfy topic for the block: a fresh random topic
+    per pm.sample() call meant a user who subscribed on their phone for the
+    first run received nothing for the second.
+    """
+    sinks: list = []
+    # Anything after a started display (a bad notify= value raises by design)
+    # must not escape with the display still running: a live Rich Live keeps
+    # its refresh thread going and paints over the traceback.
+    try:
+        if progress:
+            from cloudposterior.display import (
+                NotebookDisplay,
+                TerminalDisplay,
+                _is_marimo,
+                _is_notebook,
+            )
 
-        if _is_marimo() or _is_notebook():
-            display = NotebookDisplay(instance_desc, stop_url=stop_url, stop_token=stop_token)
-        else:
-            display = TerminalDisplay(instance_desc)
-            display.start()
-        sinks.append(display)
+            if _is_marimo() or _is_notebook():
+                display = NotebookDisplay(
+                    instance_desc, stop_url=stop_url, stop_token=stop_token
+                )
+            else:
+                display = TerminalDisplay(instance_desc)
+                display.start()
+            sinks.append(display)
 
-    # Live dashboard (convergence, traces, stop button)
-    if dashboard and dashboard_dict is not None:
-        from cloudposterior.dashboard import DashboardSink
-        sinks.append(DashboardSink(dashboard_dict))
+        # Live dashboard (convergence, traces, stop button)
+        if dashboard and dashboard_dict is not None:
+            from cloudposterior.dashboard import DashboardSink
+            sinks.append(DashboardSink(dashboard_dict))
 
-    # Push notifications (ntfy)
-    if notify:
-        from cloudposterior.notify import NtfyNotifier
+        # Push notifications (ntfy)
+        if notify:
+            from cloudposterior.notify import NtfyNotifier
 
-        topic, server = _parse_notify(notify)
+            topic, server = _parse_notify(notify)
 
-        auto_generated = topic is None
-        notifier = NtfyNotifier(
-            topic=topic,
-            server=server,
-            model=model,
-            instance_desc=instance_desc,
-        )
-        sinks.append(notifier)
+            auto_generated = topic is None
+            if auto_generated and notify_topic_holder is not None:
+                # Reuse the block's topic across repeat pm.sample() calls.
+                topic = getattr(notify_topic_holder, "_notify_topic", None)
 
-        _show_link(notifier.url, label="Notifications", show_qr=auto_generated)
+            notifier = NtfyNotifier(
+                topic=topic,
+                server=server,
+                model=model,
+                instance_desc=instance_desc,
+            )
+            if auto_generated and notify_topic_holder is not None:
+                notify_topic_holder._notify_topic = notifier.topic
+            sinks.append(notifier)
+
+            _show_link(notifier.url, label="Notifications", show_qr=auto_generated)
+    except BaseException:
+        _stop_sinks(sinks)
+        raise
 
     return sinks
 
@@ -935,9 +960,12 @@ def _show_link(url: str, label: str = "Link", show_qr: bool = False):
 
     # HTML fragments for browser frontends (Jupyter + marimo). The SVG QR
     # renders in both; the terminal fallback prints an ASCII QR instead.
+    import html as _html
+
+    safe_url = _html.escape(url, quote=True)
     parts = [
         '<div style="font-family:monospace;font-size:12px;padding:4px 0;">',
-        f'{label}: <a href="{url}" target="_blank">{url}</a>',
+        f'{_html.escape(label)}: <a href="{safe_url}" target="_blank">{safe_url}</a>',
     ]
     if show_qr:
         try:
@@ -976,7 +1004,12 @@ def _show_link(url: str, label: str = "Link", show_qr: bool = False):
 def _stop_sinks(sinks: list):
     for sink in sinks:
         if hasattr(sink, "stop"):
-            sink.stop()
+            try:
+                sink.stop()
+            except Exception:
+                # One sink failing to shut down must not prevent the others
+                # from doing so -- a live Rich Live would wreck the terminal.
+                pass
 
 
 def _run_predictive(ctx, kind: str, trace, sample_kwargs: dict):
@@ -1144,6 +1177,7 @@ def _run_sample_persistent(
     notify: bool | str | dict = False,
     nuts_sampler: str = "pymc",
     progress: bool,
+    notify_topic_holder=None,
     **sample_kwargs,
 ) -> az.InferenceData:
     """Sampling via a persistent environment.
@@ -1195,6 +1229,7 @@ def _run_sample_persistent(
         dashboard_dict=getattr(env, "_dashboard_dict", None),
         stop_url=getattr(env, "_stop_url", None),
         stop_token=getattr(env, "_stop_token", None),
+        notify_topic_holder=notify_topic_holder,
     )
 
     def emit(event):

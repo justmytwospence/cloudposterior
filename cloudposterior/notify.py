@@ -1,8 +1,12 @@
-"""ntfy.sh push notifications with live-updating progress."""
+"""ntfy.sh push notifications for sampling start, completion, and errors."""
 
 from __future__ import annotations
 
+import logging
 import os
+import queue
+import re
+import threading
 import uuid
 
 import requests
@@ -12,6 +16,12 @@ from cloudposterior.progress import (
     PhaseUpdate,
     SamplingProgress,
 )
+
+_log = logging.getLogger(__name__)
+
+# ntfy's own topic charset. Validated because the topic is interpolated into a
+# URL path (a '/' or '?' would retarget the POST) and rendered into a link.
+_TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _format_time(seconds: float) -> str:
@@ -28,12 +38,23 @@ def _ascii_bar(fraction: float, width: int = 12) -> str:
 
 
 def _model_topic_name(model) -> str:
-    """Generate an ntfy topic like 'eight-schools-subtle-pug'."""
+    """Generate an ntfy topic like 'eight-schools-subtle-pug-1f3c9a2b8d7e4f60'.
+
+    ntfy topics are world-readable and world-writable: anyone who knows the
+    topic reads every notification and can publish spoofed ones. The wordhash
+    alone is ~22 bits behind a guessable model-name prefix, so a random 64-bit
+    suffix carries the actual secrecy; the readable part is for the user.
+    """
     from cloudposterior.naming import get_model_name, slugify
     from cloudposterior.wordhash import wordhash
 
     name = slugify(get_model_name(model), separator="-")
-    return f"{name}-{wordhash(uuid.uuid4().bytes)}"
+    secret = uuid.uuid4().hex[:16]
+    words = wordhash(uuid.uuid4().bytes)
+    # ntfy caps topics at 64 chars; the readable prefix yields first.
+    budget = 64 - len(secret) - len(words) - 2
+    name = name[:max(0, budget)].strip("-")
+    return "-".join(p for p in (name, words, secret) if p)
 
 
 class NtfyNotifier:
@@ -51,6 +72,11 @@ class NtfyNotifier:
         instance_desc: str = "",
     ):
         self.topic = topic or self._resolve_topic(model)
+        if not _TOPIC_RE.fullmatch(self.topic):
+            raise ValueError(
+                f"invalid ntfy topic {self.topic!r}: must be 1-64 characters "
+                "of A-Z, a-z, 0-9, '_' or '-'"
+            )
         self.server = (
             server
             or os.environ.get("CLOUDPOSTERIOR_NTFY_SERVER")
@@ -60,7 +86,11 @@ class NtfyNotifier:
         self._instance_desc = instance_desc
         self._phases: list[tuple[str, str, str]] = []
         self._sampling: SamplingProgress | None = None
-        self._sent_count: int = 0
+        # Sends run on a worker thread: show_phase is called from the thread
+        # consuming the progress stream, where a slow or unreachable ntfy
+        # server would otherwise stall the display for up to the full timeout.
+        self._queue: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
 
     def _resolve_topic(self, model=None) -> str:
         env_topic = os.environ.get("CLOUDPOSTERIOR_NTFY_TOPIC")
@@ -160,17 +190,48 @@ class NtfyNotifier:
             tags = "hourglass_flowing_sand"
             priority = "2"
 
-        try:
-            requests.post(
-                self._base_url,
-                data=self._build_body().encode("utf-8"),
-                headers={
-                    "X-Title": title,
-                    "X-Markdown": "yes",
-                    "X-Priority": priority,
-                    "X-Tags": tags,
-                },
-                timeout=5,
+        self._enqueue(
+            self._build_body().encode("utf-8"),
+            {
+                "X-Title": title,
+                "X-Markdown": "yes",
+                "X-Priority": priority,
+                "X-Tags": tags,
+            },
+        )
+
+    def _enqueue(self, body: bytes, headers: dict) -> None:
+        if self._worker is None:
+            self._worker = threading.Thread(
+                target=self._drain, name="cloudposterior-ntfy", daemon=True
             )
-        except Exception:
-            pass  # notifications are best-effort
+            self._worker.start()
+        self._queue.put((body, headers))
+
+    def _drain(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:  # close() sentinel
+                return
+            body, headers = item
+            try:
+                resp = requests.post(
+                    self._base_url, data=body, headers=headers, timeout=5
+                )
+                if resp.status_code >= 400:
+                    # Silently swallowing this hid a permanently misconfigured
+                    # server, and a 403 from a protected topic, completely.
+                    _log.debug(
+                        "ntfy POST to %s returned %s: %s",
+                        self._base_url, resp.status_code, resp.text[:200],
+                    )
+            except Exception as exc:
+                _log.debug("ntfy POST to %s failed: %s", self._base_url, exc)
+
+    def stop(self) -> None:
+        """Flush pending notifications and retire the worker thread."""
+        if self._worker is None:
+            return
+        self._queue.put(None)
+        self._worker.join(timeout=5)
+        self._worker = None

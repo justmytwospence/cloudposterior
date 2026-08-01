@@ -15,8 +15,8 @@ def test_notifier_generates_topic_from_model_name():
 
     notifier = NtfyNotifier(model=model)
     assert notifier.topic.startswith("eight-schools-")
-    # model-name + wordhash: eight-schools-adjective-noun
-    assert len(notifier.topic.split("-")) == 4
+    # model-name + wordhash + random suffix
+    assert len(notifier.topic.split("-")) == 5
 
 
 def test_notifier_generates_topic_from_rv_names():
@@ -26,8 +26,8 @@ def test_notifier_generates_topic_from_rv_names():
         pm.HalfCauchy("tau", 5)
 
     notifier = NtfyNotifier(model=model)
-    # Should contain RV-derived slug + wordhash
-    assert len(notifier.topic) < 40
+    assert notifier.topic.startswith("mu-tau-")
+    assert len(notifier.topic) <= 64  # ntfy's limit
 
 
 def test_notifier_custom_topic():
@@ -69,6 +69,7 @@ def test_notifier_sends_on_sampling_start(mock_post):
         message="MCMC sampling started",
         elapsed=0.0,
     ))
+    notifier.stop()  # sends run on a worker thread; flush before asserting
 
     mock_post.assert_called_once()
     call_kwargs = mock_post.call_args
@@ -98,6 +99,7 @@ def test_notifier_sends_on_sampling_complete(mock_post):
         message="sampling complete",
         elapsed=10.0,
     ))
+    notifier.stop()
 
     mock_post.assert_called_once()
     body = mock_post.call_args[1]["data"].decode()
@@ -117,6 +119,7 @@ def test_notifier_best_effort(mock_post):
         message="test",
         elapsed=0.0,
     ))
+    notifier.stop()
 
 
 @patch("cloudposterior.notify.requests.post")
@@ -129,6 +132,7 @@ def test_notifier_completion_styling(mock_post):
         phase=JobPhase.SAMPLING, status="done",
         message="sampling complete", elapsed=10.0,
     ))
+    notifier.stop()
 
     mock_post.assert_called_once()
     headers = mock_post.call_args[1]["headers"]
@@ -145,6 +149,7 @@ def test_notifier_sends_failure_styling_on_error(mock_post):
         phase=JobPhase.SAMPLING, status="error",
         message="kaboom", elapsed=3.0,
     ))
+    notifier.stop()
 
     mock_post.assert_called_once()
     headers = mock_post.call_args[1]["headers"]
