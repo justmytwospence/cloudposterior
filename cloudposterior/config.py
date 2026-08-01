@@ -62,7 +62,9 @@ class RemoteConfig:
 
         chains = sample_kwargs.get("chains") or 4
         cores = sample_kwargs.get("cores") or chains
-        draws = sample_kwargs.get("draws", 1000)
+        # `or` (not a get default): pm.sample accepts draws=None, and a literal
+        # None here would blow up the trace-size arithmetic below.
+        draws = sample_kwargs.get("draws") or 1000
 
         # -- CPU: max of chains and cores so neither side is starved --
         cpu = max(4, min(max(chains, cores), 32))
