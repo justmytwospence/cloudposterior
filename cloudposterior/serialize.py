@@ -92,7 +92,9 @@ def serialize_inference_data(idata) -> bytes:
     import os
     import tempfile
 
-    sanitize_inference_data(idata)
+    # copy=True: this is a snapshot for the wire, so don't rewrite the attrs
+    # of the trace the caller is still holding.
+    idata = sanitize_inference_data(idata, copy=True)
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         tmp_path = tmp.name
     try:

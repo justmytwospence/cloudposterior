@@ -236,6 +236,10 @@ class NotebookDisplay:
         self._active_phase: str | None = None
         self._sampling: SamplingProgress | None = None
 
+        # anywidget is a hard dependency, but a stripped environment or a
+        # traitlets/ipywidgets version skew must not take down the whole
+        # sampling call -- every other frontend interaction here is already
+        # defensive. Callers fall back to TerminalDisplay (see _build_sinks).
         self._widget = _progress_widget_class()()
         # Setting stop_url before mount makes the Stop button appear in the
         # initial render (remote runs only; empty string => button hidden).
@@ -243,6 +247,18 @@ class NotebookDisplay:
         self._widget.stop_token = stop_token or ""
         self._mount()
         self._render()
+
+    def stop(self) -> None:
+        """Clear the Stop button.
+
+        stop_url is otherwise cleared only on a terminal sampling phase, so a
+        failure during provisioning/compiling left a live-looking Stop button
+        in the notebook forever.
+        """
+        try:
+            self._widget.stop_url = ""
+        except Exception:
+            pass
 
     def _mount(self) -> None:
         """Display the widget once. marimo mounts via mo.output.append; Jupyter

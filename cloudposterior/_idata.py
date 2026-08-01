@@ -84,18 +84,33 @@ def add_group(idata, name: str, group) -> None:
     except Exception:
         pass
 
+    # Last resort. This can set a plain Python attribute that is not a real
+    # group -- it would not appear in groups(), would not serialize, and would
+    # vanish on a netcdf round-trip -- so verify rather than lose the data
+    # silently (the caller merges a remotely-computed log_likelihood here).
     setattr(idata, name, ds)
+    if name not in group_names(idata):
+        raise RuntimeError(
+            f"could not attach group {name!r} to this InferenceData/DataTree"
+        )
 
 
 def load_all(idata) -> None:
     """Best-effort eager load of every group so a temp NetCDF file can be deleted."""
+    import logging
+
     for name in group_names(idata):
         loader = getattr(get_group(idata, name), "load", None)
         if callable(loader):
             try:
                 loader()
-            except Exception:
-                pass
+            except Exception as exc:
+                # A group left lazy here resurfaces much later as an opaque
+                # "file not found" from an already-deleted temp path, so at
+                # least record which group and why.
+                logging.getLogger(__name__).debug(
+                    "could not eagerly load group %r: %s", name, exc
+                )
 
 
 def to_inference_data(trace):
@@ -127,7 +142,10 @@ def ess_tail(arr) -> float:
 
     try:
         return float(az.ess(arr, method="tail"))
-    except TypeError:
+    except (TypeError, ValueError):
+        # ValueError too: arviz 1.x validates prob inside the function, so a
+        # missing-prob rejection need not surface as TypeError. Letting it
+        # escape would kill adaptive early-stop for the whole run.
         for kwargs in ({"method": "tail", "prob": (0.025, 0.975)}, {"method": "tail", "prob": 0.05}):
             try:
                 return float(az.ess(arr, **kwargs))
@@ -147,14 +165,25 @@ def ess_tail(arr) -> float:
         return float(az.ess(arr))
 
 
-def sanitize_inference_data(idata):
-    """Make all attrs (top-level + each group) NetCDF-serializable, in place.
+def sanitize_inference_data(idata, copy: bool = False):
+    """Make all attrs (top-level, group, variable, coord) NetCDF-serializable.
 
     nutpie stores a dict-valued ``sample_stats`` attr that xarray's NetCDF writer
     rejects (it only accepts str/Number/ndarray/list/tuple/bytes). Any other value
     is JSON-encoded. Idempotent for already-clean objects.
+
+    Mutates in place by default. Pass ``copy=True`` on paths that only need a
+    serializable *snapshot* (caching, shipping over the wire): those would
+    otherwise rewrite the attrs of the object the user still holds, so merely
+    enabling the cache changed the type of ``idata.attrs[...]`` under them.
     """
     import json
+
+    if copy:
+        try:
+            idata = idata.copy()
+        except Exception:
+            pass  # no copy available -- fall back to in-place
 
     try:
         import numpy as np
@@ -195,6 +224,21 @@ def sanitize_inference_data(idata):
 
     _fix(group_attrs(idata, None))
     for name in group_names(idata):
+        group = get_group(idata, name)
         _fix(group_attrs(idata, name))
-        _coerce_object_datavars(get_group(idata, name))
+        # Variable- and coordinate-level attrs reach the NetCDF writer too; a
+        # dict on a DataArray still broke to_netcdf when only group attrs were
+        # swept.
+        for container in (
+            getattr(group, "data_vars", None),
+            getattr(group, "coords", None),
+        ):
+            if container is None:
+                continue
+            for var_name in list(container):
+                try:
+                    _fix(group[var_name].attrs)
+                except Exception:
+                    continue
+        _coerce_object_datavars(group)
     return idata

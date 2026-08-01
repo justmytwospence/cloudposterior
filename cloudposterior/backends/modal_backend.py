@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 import tempfile
+import threading
+import warnings
 from typing import Iterator
 
 import msgpack
@@ -21,6 +24,32 @@ from cloudposterior.serialize import SamplingPayload
 # Volume. Older payloads from past model edits are pruned on upload.
 _PAYLOAD_KEEP_PER_MODEL = 5
 
+# How long a stream read waits before re-checking that the drain thread is
+# still alive, and how long teardown waits for that thread to finish.
+_STREAM_POLL_SECONDS = 5.0
+_STREAM_JOIN_SECONDS = 30.0
+
+
+_BLOCKING_EXECUTOR = None
+_BLOCKING_EXECUTOR_LOCK = threading.Lock()
+
+
+def _blocking_executor():
+    """One long-lived worker thread, created on first use.
+
+    Building a ThreadPoolExecutor per call cost a thread create/join on every
+    dashboard progress tick (>=2 Hz).
+    """
+    global _BLOCKING_EXECUTOR
+    with _BLOCKING_EXECUTOR_LOCK:
+        if _BLOCKING_EXECUTOR is None:
+            import concurrent.futures
+
+            _BLOCKING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cloudposterior-modal"
+            )
+        return _BLOCKING_EXECUTOR
+
 
 def _run_blocking(fn, *args, **kwargs):
     """Run a blocking Modal call, off the event loop if one is active.
@@ -37,10 +66,20 @@ def _run_blocking(fn, *args, **kwargs):
     except RuntimeError:
         return fn(*args, **kwargs)
 
-    import concurrent.futures
+    if sys.is_finalizing():
+        # concurrent.futures installs its own atexit hook, and it runs before
+        # ours, so submitting here during interpreter shutdown raises
+        # "cannot schedule new futures after interpreter shutdown" -- which is
+        # exactly when the atexit teardown needs to tear down containers.
+        result: list = []
+        thread = threading.Thread(
+            target=lambda: result.append(fn(*args, **kwargs)), daemon=True
+        )
+        thread.start()
+        thread.join(timeout=30)
+        return result[0] if result else None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(fn, *args, **kwargs).result()
+    return _blocking_executor().submit(fn, *args, **kwargs).result()
 
 
 def _run_blocking_op(env, method_name: str, *args):
@@ -58,18 +97,49 @@ def _run_blocking_op(env, method_name: str, *args):
 _MODAL_SETUP_MSG = (
     "Modal is not authenticated. To set up cloud execution:\n"
     "\n"
-    "  uv add modal\n"
     "  uv run modal setup\n"
     "\n"
     "This opens a browser window to link your Modal account.\n"
     "See https://modal.com/docs/guide for details."
 )
 
+# Message anchors that actually indicate missing credentials. Deliberately
+# narrower than a bare "token" match: this codebase puts a stop_token in its
+# own error text, and rewriting those as "Modal is not authenticated" hid the
+# real cause.
+_AUTH_MESSAGE_ANCHORS = (
+    # Stem covers authenticate / authenticated / authentication / authenticating.
+    "authenticat",
+    "credential",
+    "token id",
+    "token secret",
+    "modal token",
+    "modal setup",
+)
+
 
 def _handle_modal_error(exc: Exception) -> Exception:
-    """Wrap Modal auth/connection errors with a friendly message."""
-    msg = str(exc).lower()
-    if "authenticate" in msg or "token" in msg or "credential" in msg or "setup" in msg:
+    """Wrap Modal auth errors with a friendly setup message."""
+    is_auth = False
+    try:
+        import modal.exception as _mexc
+
+        auth_types = tuple(
+            t for t in (
+                getattr(_mexc, "AuthError", None),
+                getattr(_mexc, "ConnectionError", None),
+            ) if isinstance(t, type)
+        )
+        if auth_types and isinstance(exc, auth_types):
+            is_auth = isinstance(exc, getattr(_mexc, "AuthError", ()))
+    except Exception:
+        pass
+
+    if not is_auth:
+        msg = str(exc).lower()
+        is_auth = any(anchor in msg for anchor in _AUTH_MESSAGE_ANCHORS)
+
+    if is_auth:
         err = RuntimeError(_MODAL_SETUP_MSG)
         err.__cause__ = exc
         return err
@@ -254,7 +324,6 @@ def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
     widget's trait writes need the main thread).
     """
     import queue
-    import threading
 
     chunk_q: queue.Queue = queue.Queue()
     _SENTINEL = object()
@@ -274,41 +343,54 @@ def _stream_events(gen, events_list) -> Iterator[ProgressEvent]:
 
     idata_bytes = None
     expecting_result = False
-    while True:
-        chunk = chunk_q.get()
-        if chunk is _SENTINEL:
-            break
-        if expecting_result:
-            idata_bytes = chunk
-            expecting_result = False
-            continue
-        try:
-            unpacker = msgpack.Unpacker(raw=False)
-            unpacker.feed(chunk)
-            decoded_any = False
-            for decoded in unpacker:
-                decoded_any = True
-                if isinstance(decoded, dict) and decoded.get("type") == "result":
-                    expecting_result = True
-                    continue
-                # A single undecodable event (e.g. malformed fields) must not
-                # make the whole chunk be mistaken for the result bytes below.
-                try:
-                    event = _decode_progress_event(decoded)
-                except Exception:
-                    continue
-                if event is not None:
-                    events_list.append(event)
-                    yield event
-            if not decoded_any:
+    # try/finally so abandoning this generator (caller break, or an exception
+    # in a display sink) still joins the drain thread and surfaces a worker
+    # error. Without it, GeneratorExit fired at the yield and the worker's
+    # exception was dropped while the thread kept consuming in the background.
+    try:
+        while True:
+            try:
+                chunk = chunk_q.get(timeout=_STREAM_POLL_SECONDS)
+            except queue.Empty:
+                # A wedged remote generator would otherwise block forever with
+                # no way out but Ctrl-C. If the drain thread is gone, so is the
+                # stream.
+                if not consumer.is_alive():
+                    break
+                continue
+            if chunk is _SENTINEL:
+                break
+            if expecting_result:
                 idata_bytes = chunk
-        except Exception:
-            # Non-msgpack chunk: the compressed InferenceData bytes.
-            idata_bytes = chunk
-
-    consumer.join()
-    if "exc" in err:
-        raise err["exc"]
+                expecting_result = False
+                continue
+            try:
+                unpacker = msgpack.Unpacker(raw=False)
+                unpacker.feed(chunk)
+                decoded_any = False
+                for decoded in unpacker:
+                    decoded_any = True
+                    if isinstance(decoded, dict) and decoded.get("type") == "result":
+                        expecting_result = True
+                        continue
+                    # A single undecodable event (e.g. malformed fields) must not
+                    # make the whole chunk be mistaken for the result bytes below.
+                    try:
+                        event = _decode_progress_event(decoded)
+                    except Exception:
+                        continue
+                    if event is not None:
+                        events_list.append(event)
+                        yield event
+                if not decoded_any:
+                    idata_bytes = chunk
+            except Exception:
+                # Non-msgpack chunk: the compressed InferenceData bytes.
+                idata_bytes = chunk
+    finally:
+        consumer.join(timeout=_STREAM_JOIN_SECONDS)
+        if "exc" in err:
+            raise err["exc"]
     return idata_bytes
 
 
@@ -617,12 +699,17 @@ class ModalEnvironment(RemoteEnvironment):
     def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
                  dashboard_dict=None, dashboard_dict_name: str | None = None,
                  dashboard_fn=None, progress_fn=None, stop_fn=None,
-                 stop_token: str | None = None, config=None):
+                 stop_token: str | None = None, config=None,
+                 nuts_sampler: str = "pymc"):
         # The config this env was sized/built with. Kept-warm envs are reused
         # across runs (and across cp.map -> cp.cloud), and callers read it back
         # to decide reusability and to report resize drift -- so it must be set
         # at construction, not patched on by one of the two provisioning paths.
         self.config = config
+        # The sampler the image was built for. jax/numpyro are only installed
+        # when the image is built for a JAX sampler (or for GPU), so this is
+        # what decides whether a warm env can serve a later JAX run.
+        self.nuts_sampler = nuts_sampler
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
@@ -678,12 +765,24 @@ class ModalEnvironment(RemoteEnvironment):
                 except Exception:
                     pass
 
-    def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
+    def forget_upload(self, model_bytes: bytes) -> None:
+        """Drop the memo that this payload is already on the Volume.
+
+        The memo is otherwise never invalidated, so an external prune (another
+        session's upload, or cleanup_volumes from a second kernel) leaves this
+        env confidently pointing at a file that no longer exists.
+        """
+        from cloudposterior.naming import payload_hash
+
+        self._uploaded_hashes.discard(payload_hash(model_bytes))
+
+    def _upload_if_needed(self, model_bytes: bytes, payload_path: str,
+                          force: bool = False) -> bool:
         """Upload model payload to Volume if not already there. Returns True if uploaded."""
         from cloudposterior.naming import payload_hash
 
         p_hash = payload_hash(model_bytes)
-        if p_hash in self._uploaded_hashes:
+        if p_hash in self._uploaded_hashes and not force:
             return False
 
         # Check Volume (off-loop: avoids async warnings in marimo/async hosts)
@@ -691,10 +790,9 @@ class ModalEnvironment(RemoteEnvironment):
             dir_path = "/".join(payload_path.split("/")[:-1])
             entries = _run_blocking(self._volume.listdir, f"/{dir_path}")
             filename = payload_path.split("/")[-1]
-            # TODO(e2e): confirm whether Volume.listdir entries carry bare
-            # filenames or dir-prefixed paths; comparing basenames is correct
-            # under either shape.
-            if any(e.path.split("/")[-1] == filename for e in entries):
+            # modal's FileEntry.path is the full path from the volume root, so
+            # compare basenames.
+            if not force and any(e.path.split("/")[-1] == filename for e in entries):
                 self._uploaded_hashes.add(p_hash)
                 return False
         except Exception:
@@ -872,6 +970,7 @@ class ModalBackend(ComputeBackend):
             stop_fn=stop_fn,
             stop_token=stop_token,
             config=config,
+            nuts_sampler=nuts_sampler,
         )
 
     @staticmethod
@@ -881,6 +980,14 @@ class ModalBackend(ComputeBackend):
 
         volume_name = f"cp-{project}"
         try:
-            modal.Volume.objects.delete(volume_name)
-        except Exception:
-            pass
+            # Off the event loop, like every other blocking Modal call here:
+            # called directly it warns and stalls inside marimo/async hosts.
+            _run_blocking(modal.Volume.objects.delete, volume_name)
+        except Exception as exc:
+            # A swallowed failure looked exactly like a successful cleanup.
+            if "not found" in str(exc).lower():
+                return
+            warnings.warn(
+                f"cloudposterior: could not delete volume {volume_name!r}: {exc}",
+                stacklevel=2,
+            )

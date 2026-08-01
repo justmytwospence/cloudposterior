@@ -29,6 +29,10 @@ from cloudposterior._idata import (
     to_inference_data as _to_inference_data,
 )
 
+# Consecutive nutpie is_finished failures tolerated before falling through to
+# handle.wait(). At the 0.5s poll interval this is ~5s of persistent failure.
+_MAX_POLL_FAILURES = 10
+
 
 def _open_dict(name):
     """Resolve a Modal Dict by name (stop control or dashboard progress), if any."""
@@ -111,6 +115,20 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
     # Adaptive: early-stop once every scalar param hits this convergence target.
     # cp-only kwarg (never passed to the sampler); applies to nutpie + pymc.
     until = sample_kwargs.pop("until", None)
+
+    # Convergence is evaluated over scalar (chain, draw) parameters only. On a
+    # purely vector-valued model there are none, so until= can never fire --
+    # say so rather than silently running to the draw cap.
+    if until and not _has_scalar_free_rvs(model):
+        until = None
+        yield msgpack.packb({
+            "type": "phase", "phase": "sampling", "status": "in_progress",
+            "message": (
+                "until= has no scalar parameters to evaluate on this model; "
+                "adaptive early-stop disabled, sampling the full draws"
+            ),
+            "elapsed": 0.0,
+        })
 
     # -- nutpie compile phase, with fallback to the pymc sampler --
     compiled = None
@@ -292,13 +310,21 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                 sampling_error = exc
 
         if handle is not None:
+            _poll_failures = {"n": 0}
+
             def _finished():
                 # nutpie's is_finished property raises (e.g. TimeoutError) while
-                # the sampler is still running, so treat any raise as "not done".
+                # the sampler is still running, so treat a raise as "not done" --
+                # but only up to a point. A property that raises persistently
+                # would otherwise spin at 0.5s until the container timeout kills
+                # the run with no result at all.
                 try:
-                    return bool(handle.is_finished)
+                    done = bool(handle.is_finished)
                 except Exception:
-                    return False
+                    _poll_failures["n"] += 1
+                    return _poll_failures["n"] >= _MAX_POLL_FAILURES
+                _poll_failures["n"] = 0
+                return done
 
             while not _finished():
                 time.sleep(0.5)
@@ -585,6 +611,26 @@ def _split_nutpie_kwargs(nutpie, sample_kwargs: dict) -> tuple[dict, dict]:
     forwarded = {k: v for k, v in sample_kwargs.items() if k in accepted}
     dropped = {k: v for k, v in sample_kwargs.items() if k not in accepted}
     return forwarded, dropped
+
+
+def _has_scalar_free_rvs(model) -> bool:
+    """Whether the model has at least one scalar free RV.
+
+    Convergence (and therefore ``until=``) is computed over (chain, draw)
+    variables only; a model whose every parameter is vector-valued yields no
+    convergence entries at all.
+    """
+    try:
+        shapes = model.eval_rv_shapes()
+    except Exception:
+        shapes = {}
+    for rv in getattr(model, "free_RVs", []):
+        shape = shapes.get(rv.name)
+        if shape is None:
+            shape = tuple(d for d in (rv.type.shape or ()) if d is not None)
+        if not shape:  # () -> scalar
+            return True
+    return False
 
 
 def _conv_meets_target(conv_bytes, until) -> bool:
@@ -913,6 +959,25 @@ def run_sampling_blocking(payload_path: str, sample_kwargs: dict,
                 idata_bytes = chunk
         except Exception:
             idata_bytes = chunk
+
+    # Mark the run complete for the dashboard. Completion is signalled by a
+    # terminal DOWNLOADING phase, which on single-model runs the *client*
+    # emits after the stream -- but a cp.map sink lives here in the worker, so
+    # without this the page never sees complete=true and polls a billed
+    # endpoint at 1 Hz forever.
+    if sink is not None:
+        try:
+            from cloudposterior.progress import JobPhase, PhaseUpdate
+
+            sink.show_phase(PhaseUpdate(
+                phase=JobPhase.DOWNLOADING,
+                status="done",
+                message="trace ready",
+                elapsed=0.0,
+            ))
+        except Exception:
+            pass
+
     if idata_bytes is None:
         raise RuntimeError("cp.map worker produced no result")
     return idata_bytes

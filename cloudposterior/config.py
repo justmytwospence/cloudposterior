@@ -3,6 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+# Per-draw budget for the auto-sized timeout, i.e. a floor of 10 draws/sec
+# across all chains. Deliberately pessimistic -- it only has to beat
+# pathological slowness, and over-estimating costs nothing (Modal bills for
+# time used, not for the timeout). Capped at Modal's own 24h ceiling.
+_SECONDS_PER_DRAW = 0.1
+_MAX_TIMEOUT = 86400
+
 
 @dataclass
 class RemoteConfig:
@@ -103,21 +110,51 @@ class RemoteConfig:
             for d in shape:
                 n *= int(d) if d is not None else 1
             n_param_scalars += n
-        trace_mb = chains * draws * n_param_scalars * 8 / (1024 * 1024)
+        # Tune draws are kept in the trace when warmup is retained.
+        tune = sample_kwargs.get("tune")
+        if tune is None:
+            tune = 400 if nuts_sampler == "nutpie" else 1000
+        retained = draws
+        if sample_kwargs.get("discard_tuned_samples") is False or sample_kwargs.get(
+            "save_warmup"
+        ):
+            retained += tune
+        trace_mb = chains * retained * n_param_scalars * 8 / (1024 * 1024)
 
-        # Base headroom + data (held by every chain) + posterior trace.
-        memory_mb = 2048 + int(obs_mb * chains * 1.5) + int(trace_mb * 1.5)
+        # The log_likelihood group is n_obs x chains x draws x 8 bytes and is
+        # routinely the largest single consumer -- the usual cause of an OOM.
+        n_obs = max(1, int(obs_bytes // 8))
+        loglik_mb = 0.0
+        if sample_kwargs.get("idata_kwargs", {}).get("log_likelihood") is not False:
+            loglik_mb = chains * retained * n_obs * 8 / (1024 * 1024)
 
-        # Round up to nearest power-of-2 GB (Modal-friendly sizes)
+        # Base headroom + data (held by every chain) + posterior + log-likelihood.
+        memory_mb = (
+            2048
+            + int(obs_mb * chains * 1.5)
+            + int(trace_mb * 1.5)
+            + int(loglik_mb * 1.5)
+        )
+
+        # Round *up* to a power-of-2 GB (Modal-friendly). Never below the
+        # estimate: rounding down would undo the headroom just added.
         memory_gb = max(4, 2 ** math.ceil(math.log2(max(1, memory_mb / 1024))))
-        memory_mb = min(65536, memory_gb * 1024)
+        memory_mb = min(65536, max(memory_mb, memory_gb * 1024))
 
-        # -- GPU: provision for JAX-based samplers --
+        # -- GPU: opt-in. A JAX sampler alone is not evidence the model is big
+        # enough to be worth GPU rates, and silently provisioning one billed
+        # users for a three-parameter model. Ask for it with instance="gpu" or
+        # RemoteConfig(gpu=...).
         gpu = None
-        if nuts_sampler in ("numpyro", "blackjax"):
-            gpu = "A10G"
 
-        return cls(cpu=cpu, memory=memory_mb, gpu=gpu, auto_sized=True)
+        # -- Timeout: scale with the work, keeping the one-hour floor. A long
+        # run was killed at 3600s with the partial trace lost.
+        total_draws = chains * (draws + tune)
+        timeout = min(_MAX_TIMEOUT, max(3600, int(total_draws * _SECONDS_PER_DRAW)))
+
+        return cls(
+            cpu=cpu, memory=memory_mb, gpu=gpu, timeout=timeout, auto_sized=True
+        )
 
     def describe(self) -> str:
         """Human-readable description for progress display."""

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from queue import Queue
+from queue import Empty, Queue
 from typing import Iterator
 
 
@@ -71,11 +71,30 @@ class ConvergenceUpdate:
 ProgressEvent = PhaseUpdate | SamplingProgress | ConvergenceUpdate
 
 
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def decode_progress_event(data: dict) -> ProgressEvent | None:
     """Convert a decoded msgpack dict into a typed ProgressEvent.
 
     Shared by the client streaming path and the cp.map worker (which writes
     progress server-side), so it lives here with no Modal/backend dependency.
+
+    Every field is read defensively and numerics are coerced: a partial or
+    stringly payload from a newer/older worker previously raised KeyError
+    mid-decode, and a null slipping through reached the dashboard where
+    ``.toFixed`` on it read as the run having gone offline.
     """
     msg_type = data.get("type")
 
@@ -89,43 +108,48 @@ def decode_progress_event(data: dict) -> ProgressEvent | None:
             return None
         return PhaseUpdate(
             phase=phase,
-            status=data["status"],
-            message=data["message"],
-            elapsed=data["elapsed"],
+            status=data.get("status", "in_progress"),
+            message=data.get("message", ""),
+            elapsed=_as_float(data.get("elapsed")),
         )
 
     if msg_type == "sampling":
         chains = {}
         for chain_id_str, cdata in data.get("chains", {}).items():
-            chain_id = int(chain_id_str) if isinstance(chain_id_str, str) else chain_id_str
+            try:
+                chain_id = int(chain_id_str)
+            except (TypeError, ValueError):
+                continue
             chains[chain_id] = ChainProgress(
-                draw=cdata["draw"],
-                total=cdata["total"],
-                phase=cdata["phase"],
-                draws_per_sec=cdata.get("draws_per_sec", 0.0),
-                eta_seconds=cdata.get("eta_seconds", 0.0),
-                divergences=cdata.get("divergences", 0),
-                mean_tree_depth=cdata.get("mean_tree_depth", 0.0),
-                step_size=cdata.get("step_size", 0.0),
-                tree_size=cdata.get("tree_size", 0),
+                draw=_as_int(cdata.get("draw")),
+                total=_as_int(cdata.get("total")),
+                phase=cdata.get("phase", "sampling"),
+                draws_per_sec=_as_float(cdata.get("draws_per_sec")),
+                eta_seconds=_as_float(cdata.get("eta_seconds")),
+                divergences=_as_int(cdata.get("divergences")),
+                mean_tree_depth=_as_float(cdata.get("mean_tree_depth")),
+                step_size=_as_float(cdata.get("step_size")),
+                tree_size=_as_int(cdata.get("tree_size")),
             )
         return SamplingProgress(
             chains=chains,
-            total_divergences=data.get("total_divergences", 0),
-            elapsed=data.get("elapsed", 0.0),
-            total_draws=data.get("total_draws", 0),
+            total_divergences=_as_int(data.get("total_divergences")),
+            elapsed=_as_float(data.get("elapsed")),
+            total_draws=_as_int(data.get("total_draws")),
         )
 
     if msg_type == "convergence":
         params = {}
         for name, pdata in data.get("params", {}).items():
             params[name] = ParamConvergence(
-                rhat=pdata["rhat"],
-                ess_bulk=pdata["ess_bulk"],
-                ess_tail=pdata["ess_tail"],
+                rhat=_as_float(pdata.get("rhat")),
+                ess_bulk=_as_float(pdata.get("ess_bulk")),
+                ess_tail=_as_float(pdata.get("ess_tail")),
             )
         traces = data.get("traces", {})
-        return ConvergenceUpdate(params=params, draws=data.get("draws", 0), traces=traces)
+        return ConvergenceUpdate(
+            params=params, draws=_as_int(data.get("draws")), traces=traces
+        )
 
     return None
 
@@ -234,25 +258,43 @@ class ProgressAggregator:
         """Yield aggregated snapshots at regular intervals."""
         while not self._stopped:
             deadline = time.time() + self._interval
-            # Drain queue
-            while time.time() < deadline:
+            # Drain the queue until the interval elapses. `continue` on an
+            # empty queue, not `break`: breaking out on the first timeout made
+            # an idle chain re-emit an identical snapshot every ~0.1s instead
+            # of once per interval -- ~5x the intended widget re-renders.
+            while time.time() < deadline and not self._stopped:
                 try:
                     chain, progress = self._queue.get(timeout=0.1)
                     self._chains[chain] = progress
+                except Empty:
+                    continue
                 except Exception:
                     break
 
-            if self._chains:
-                total_div = sum(c.divergences for c in self._chains.values())
-                warnings = []
-                if total_div > 0:
-                    warnings.append(f"{total_div} divergence(s) so far")
-                yield SamplingProgress(
-                    chains=dict(self._chains),
-                    total_divergences=total_div,
-                    elapsed=time.time() - self._start_time,
-                    warnings=warnings,
-                )
+            snapshot = self._snapshot()
+            if snapshot is not None:
+                yield snapshot
+
+        # One final snapshot after stop(): the last per-draw events can land
+        # between the previous emit and the stop, which left the display
+        # frozen just short of the total (e.g. 980/1000).
+        final = self._snapshot()
+        if final is not None:
+            yield final
+
+    def _snapshot(self) -> SamplingProgress | None:
+        if not self._chains:
+            return None
+        total_div = sum(c.divergences for c in self._chains.values())
+        warnings = []
+        if total_div > 0:
+            warnings.append(f"{total_div} divergence(s) so far")
+        return SamplingProgress(
+            chains=dict(self._chains),
+            total_divergences=total_div,
+            elapsed=time.time() - self._start_time,
+            warnings=warnings,
+        )
 
     def stop(self):
         self._stopped = True

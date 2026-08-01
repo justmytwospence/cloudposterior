@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 import weakref
 from typing import TYPE_CHECKING
 
@@ -241,17 +242,23 @@ class cloud:
         # cp.cleanup_volumes(), session.destroy(), or atexit on shutdown.
         return self.model.__exit__(*exc)
 
+    _JAX_SAMPLERS = ("numpyro", "blackjax")
+
     def _can_reuse_env(self, env, nuts_sampler: str) -> bool:
         """Whether a kept-warm env satisfies this run's image/feature needs."""
         # A run that wants the live dashboard can't reuse an env without one.
         if self.dashboard and env._dashboard_fn is None:
             return False
-        # External JAX samplers need a jax-equipped (GPU) image; a warm CPU image
-        # has no jax (it installs jax only when built with gpu), so re-provision.
-        # Be conservative when the warm env's config is unknown.
-        if nuts_sampler in ("numpyro", "blackjax"):
+        # jax/numpyro ship only in images built for a JAX sampler (or for GPU),
+        # so a warm image built for pymc/nutpie can't serve a JAX run. Be
+        # conservative when the warm env doesn't say what it was built for.
+        if nuts_sampler in self._JAX_SAMPLERS:
             cfg = getattr(env, "config", None)
-            if cfg is None or cfg.gpu is None:
+            built_for = getattr(env, "nuts_sampler", None)
+            has_jax = (cfg is not None and cfg.gpu is not None) or (
+                built_for in self._JAX_SAMPLERS
+            )
+            if not has_jax:
                 return False
         return True
 
@@ -294,22 +301,35 @@ class cloud:
         self._env.config = config
         _LIVE_ENVS[key] = self._env  # keep warm past the `with` block
 
-    def destroy(self):
-        """Tear down the environment and clean up the project volume.
+    def destroy(self, delete_volume: bool = False):
+        """Tear down this session's environment.
 
-        Call after the ``with`` block to immediately stop the container
-        and delete the project's volume::
+        Call after the ``with`` block to immediately stop the container::
 
             session = cp.cloud(model, remote=True)
             with session:
                 idata = pm.sample(draws=2000)
             session.destroy()
+
+        Only this session's model is affected. ``delete_volume=True`` also
+        deletes the *project-wide* Volume, discarding every model's uploaded
+        payload -- opt-in because the project is shared with other sessions.
         """
         from cloudposterior.backends.modal_backend import ModalBackend
 
-        _teardown_live_envs(self.project)  # stop the kept-warm session(s)
+        key = _env_key(self.project, self.model)
+        with _PATCH_LOCK:
+            env = _LIVE_ENVS.pop(key, None)
+        if env is not None:
+            try:
+                env.teardown()
+            except Exception:
+                pass
         self._env = None
-        ModalBackend.cleanup_volumes(project=self.project)
+        self._model_bytes = None
+        _forget_model_bytes(self.model)
+        if delete_volume:
+            ModalBackend.cleanup_volumes(project=self.project)
 
     def _make_intercepted_sample(self):
         ctx = self
@@ -534,6 +554,28 @@ class cloud:
             return get_group(out, "log_likelihood")
 
         return intercepted_cll
+
+
+_STREAM_DONE = object()
+
+
+def _prepend(first, rest):
+    """Re-attach an already-pulled first item to the front of an iterator."""
+    if first is not _STREAM_DONE:
+        yield first
+        yield from rest
+
+
+def _is_missing_payload_error(exc: Exception) -> bool:
+    """Whether a worker error means the Volume payload is gone.
+
+    The worker opens the payload path directly, so a pruned payload surfaces
+    as a plain file-not-found from inside the container.
+    """
+    msg = str(exc).lower()
+    return (
+        "payload" in msg and ("not found" in msg or "no such file" in msg)
+    ) or "filenotfounderror" in msg
 
 
 def _model_identity(model) -> str:
@@ -911,11 +953,20 @@ def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
                 _is_notebook,
             )
 
+            display = None
             if _is_marimo() or _is_notebook():
-                display = NotebookDisplay(
-                    instance_desc, stop_url=stop_url, stop_token=stop_token
-                )
-            else:
+                try:
+                    display = NotebookDisplay(
+                        instance_desc, stop_url=stop_url, stop_token=stop_token
+                    )
+                except Exception as exc:
+                    # A broken anywidget/traitlets must not take down sampling.
+                    warnings.warn(
+                        f"cloudposterior: falling back to terminal progress "
+                        f"display ({exc})",
+                        stacklevel=2,
+                    )
+            if display is None:
                 display = TerminalDisplay(instance_desc)
                 display.start()
             sinks.append(display)
@@ -1278,7 +1329,24 @@ def _run_sample_persistent(
         provision_start = time.time()
         first_event = True
         download_start = None
-        for event in job.stream_progress():
+        stream = job.stream_progress()
+        try:
+            first = next(stream, _STREAM_DONE)
+        except Exception as exc:
+            if not _is_missing_payload_error(exc):
+                raise
+            # The Volume no longer holds the payload our upload memo claims is
+            # there (another session pruned it, or cleanup_volumes ran from a
+            # second kernel). Re-upload once and retry rather than failing.
+            env.forget_upload(model_bytes)
+            env._upload_if_needed(model_bytes, payload_path, force=True)
+            job = env.submit(
+                model_bytes, sample_kwargs, nuts_sampler, payload_path=payload_path
+            )
+            stream = job.stream_progress()
+            first = next(stream, _STREAM_DONE)
+
+        for event in _prepend(first, stream):
             if first_event:
                 emit(PhaseUpdate(
                     phase=JobPhase.PROVISIONING,
@@ -1700,11 +1768,15 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         # spawn() is a blocking Modal call -- run it off the event loop so it
         # doesn't warn/stall inside an async host (marimo), mirroring how the
         # .get() result fetch below is already wrapped. with_options sizes each
-        # spawned container to its model (cpu/memory); the image/Volume/gpu are
-        # shared. Each worker writes its own progress and honors global/per-model stop.
+        # spawned container to its own model (cpu/memory/gpu) -- without the gpu
+        # override every fit in a mixed batch inherited the batch's GPU; the
+        # image and Volume stay shared. Each worker writes its own progress and
+        # honors global/per-model stop.
         calls[:] = [
             _run_blocking(
-                env._sampler_cls.with_options(cpu=cfg.cpu, memory=cfg.memory)()
+                env._sampler_cls.with_options(
+                    cpu=cfg.cpu, memory=cfg.memory, gpu=cfg.gpu
+                )()
                 .sample_blocking.spawn,
                 pp, kw, sp,
                 progress_dict_name=dash_name,

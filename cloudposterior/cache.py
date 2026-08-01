@@ -172,7 +172,9 @@ class DiskCache:
 
         path = self._path(key, sample_kwargs=sample_kwargs)
         path.parent.mkdir(parents=True, exist_ok=True)
-        sanitize_inference_data(idata)
+        # copy=True: caching must not change the type of the caller's
+        # idata.attrs as a side effect of being enabled.
+        idata = sanitize_inference_data(idata, copy=True)
         # Write to a temp file then atomically replace. A plain to_netcdf(path)
         # truncates in place, which fails ("unable to truncate a file which is
         # already open") when overwrite= re-saves an entry that an earlier load

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+# Module scope, not inside _write: a function-local import that failed in the
+# worker image would silently no-op every dashboard write (the bare except
+# below swallows it) for the entire run.
+from cloudposterior.backends.modal_backend import _run_blocking
 from cloudposterior.progress import (
     JobPhase,
     PhaseUpdate,
@@ -25,6 +29,9 @@ class DashboardSink:
         self._phases: list[dict] = []
         self._sampling: dict | None = None
         self._complete = False
+        self._convergence: dict = {}
+        self._convergence_draws: int = 0
+        self._traces: dict = {}
 
     def show_phase(self, update: PhaseUpdate):
         detail = update.message
@@ -40,7 +47,11 @@ class DashboardSink:
         if not found:
             self._phases.append({"status": update.status, "label": update.phase.value, "detail": detail})
 
-        if update.phase == JobPhase.DOWNLOADING and update.status == "done":
+        # Completion stops the dashboard polling a billed endpoint. An error
+        # is just as terminal as a finished download.
+        if (update.phase == JobPhase.DOWNLOADING and update.status == "done") or (
+            update.status == "error"
+        ):
             self._complete = True
 
         self._write()
@@ -82,18 +93,13 @@ class DashboardSink:
                 "sampling": self._sampling,
                 "complete": self._complete,
             }
-            if hasattr(self, "_convergence") and self._convergence:
+            if self._convergence:
                 data["convergence"] = {
                     "params": self._convergence,
                     "draws": self._convergence_draws,
                 }
-            if hasattr(self, "_traces") and self._traces:
+            if self._traces:
                 data["traces"] = self._traces
-            # Off the event loop: this per-event blocking Dict write would warn
-            # and stall the loop in async hosts (marimo). _run_blocking runs it
-            # in a worker thread when a loop is active.
-            from cloudposterior.backends.modal_backend import _run_blocking
-
             _run_blocking(self._dict.__setitem__, self._key, data)
         except Exception:
             pass  # best-effort

@@ -27,7 +27,7 @@ def _fake_modal(monkeypatch):
     api._LIVE_ENVS.clear()  # avoid warm-env leakage across tests
     state = {
         "captured": [], "spawned": [], "envs": [], "provision_kwargs": [],
-        "sizes": [], "cancelled": [], "fail_get": False,
+        "sizes": [], "gpus": [], "cancelled": [], "fail_get": False,
     }
     counter = {"i": 0}
 
@@ -68,8 +68,9 @@ def _fake_modal(monkeypatch):
             pass
 
         @classmethod
-        def with_options(cls, *, cpu=None, memory=None):
+        def with_options(cls, *, cpu=None, memory=None, gpu=None):
             state["sizes"].append((cpu, memory))   # per-spawn resource sizing
+            state["gpus"].append(gpu)
             return cls
 
     class FakeEnv:
