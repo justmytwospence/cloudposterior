@@ -21,8 +21,30 @@ jobs:
       - name: Install Python
         run: uv python install 3.12
 
+      # A release cut from the wrong commit would publish whatever version is in
+      # pyproject.toml under the release's tag -- and PyPI versions are immutable.
+      - name: Verify tag matches project version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "Release tag '$TAG' does not match pyproject version 'v$VERSION'"
+            exit 1
+          fi
+
+      # The Tests workflow gates merges, but a release can be cut from any commit;
+      # re-run the free suite so an untested tree never reaches PyPI.
+      - name: Run test suite
+        run: |
+          uv sync --locked
+          uv run pytest tests/ -v
+
       - name: Build package
         run: uv build --no-sources
+
+      - name: Check package metadata
+        run: uvx twine check --strict dist/*.whl dist/*.tar.gz
 
       # Catch a wheel/sdist that's missing bundled files (remote/worker.py, the
       # embedded dashboard HTML) before anything is uploaded -- versions on PyPI
