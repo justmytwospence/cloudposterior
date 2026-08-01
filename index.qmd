@@ -33,8 +33,8 @@ All three work independently --- use any combination, or just the caching.
 ## Install
 
 ```bash
-pip install cloudposterior        # pulls in PyMC + ArviZ
-pip install modal && modal setup  # optional, for cloud execution
+pip install cloudposterior  # pulls in PyMC, ArviZ, and the Modal client
+modal setup                 # one-time auth, for cloud execution
 ```
 
 ## Next steps

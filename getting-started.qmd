@@ -8,11 +8,10 @@ title: "Getting started"
 pip install cloudposterior
 ```
 
-This pulls in PyMC and ArviZ. For cloud execution you also need a (free) [Modal](https://modal.com)
-account:
+This pulls in PyMC, ArviZ, and the Modal client. For cloud execution you also
+need a (free) [Modal](https://modal.com) account --- authenticate once:
 
 ```bash
-pip install modal
 modal setup
 ```
 

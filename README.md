@@ -32,8 +32,8 @@ All three features work independently. Use any combination, or just the caching.
 ```bash
 uv add cloudposterior
 
-# For cloud execution (optional):
-uv add modal && uv run modal setup
+# The Modal client is installed for you; authenticate once for cloud execution:
+uv run modal setup
 ```
 
 ```python
@@ -275,9 +275,11 @@ with cp.cloud(model, remote=True, cache="disk", notify=True):  # everything
 
 Cloud execution currently uses [Modal](https://modal.com). Modal provides fast container spin-up, automatic dependency packaging, and a generous free tier.
 
+The Modal client ships as a dependency of cloudposterior, so it is already
+installed; all you need is one-time browser auth:
+
 ```bash
-uv add modal
-modal setup  # one-time browser auth
+modal setup
 ```
 
 The backend is abstracted behind a `ComputeBackend` interface. Support for additional providers (AWS, GCP, SSH to your own machines) is planned.
