@@ -52,6 +52,8 @@ _PATCH_LOCK = threading.Lock()
 _MODEL_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 # step -> ((id(model), observed_data_fingerprint), combined_model_step_bytes)
 _STEP_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+# model -> (observed_data_fingerprint, structural cache identity)
+_MODEL_DIGEST_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
 def _forget_model_bytes(model) -> None:
@@ -532,6 +534,24 @@ class cloud:
         return intercepted_cll
 
 
+def _model_identity(model) -> str:
+    """Cache identity for a model, memoized against its data fingerprint.
+
+    Structural, not a hash of the pickle bytes: rebuilding the same model in a
+    new session yields different bytes (fresh RNG state on every shared
+    variable), which made the persistent disk cache miss every time.
+    """
+    from cloudposterior.naming import model_digest
+
+    fp = _observed_data_fingerprint(model)
+    cached = _MODEL_DIGEST_CACHE.get(model)
+    if cached is not None and cached[0] == fp:
+        return cached[1]
+    digest = model_digest(model)
+    _MODEL_DIGEST_CACHE[model] = (fp, digest)
+    return digest
+
+
 def _call_targets_ctx_model(ctx, kwargs: dict, what: str) -> bool:
     """Whether an intercepted PyMC call actually targets the wrapped model.
 
@@ -681,21 +701,11 @@ def _observed_data_fingerprint(model):
     model is re-serialized so a ``pm.set_data`` mutation reaches the worker and
     produces a distinct cache key instead of silently reusing stale bytes.
     """
-    try:
-        import numpy as np
-        from pytensor.compile.sharedvalue import SharedVariable
+    from cloudposterior.naming import data_digest
 
-        fp = 0
-        for var in model.named_vars.values():
-            if isinstance(var, SharedVariable):
-                try:
-                    arr = np.asarray(var.get_value(borrow=True))
-                    fp ^= hash((var.name, arr.shape, str(arr.dtype), float(np.asarray(arr, dtype="float64").sum())))
-                except Exception:
-                    continue
-        return fp
-    except Exception:
-        return None
+    # Content hash, not a summary statistic: a summed fold was blind to a
+    # permutation or a sign-symmetric edit of the same array.
+    return data_digest(model) or None
 
 
 def _warn_if_resize_drift(ctx, nuts_sampler: str, sample_kwargs: dict) -> None:
@@ -754,6 +764,8 @@ def _cache_lookup(cache_arg, model, model_bytes: bytes, cache_kwargs: dict, *,
     Returns ``(backend, key, cached_or_None)``. ``overwrite=`` forces a re-run:
     the load is skipped but the key is still returned so the fresh result can
     replace the stored entry. Emits the "cached result" indicator on a hit.
+
+    ``model_bytes`` is unused for identity -- see ``_model_identity``.
     """
     from cloudposterior.cache import resolve_cache
     from cloudposterior.naming import cache_key as compute_cache_key
@@ -761,7 +773,7 @@ def _cache_lookup(cache_arg, model, model_bytes: bytes, cache_kwargs: dict, *,
     backend = resolve_cache(cache_arg, model=model)
     if backend is None:
         return None, None, None
-    key = compute_cache_key(model_bytes, cache_kwargs)
+    key = compute_cache_key(_model_identity(model), cache_kwargs)
     cached = None if overwrite else backend.load(key, sample_kwargs=cache_kwargs)
     if cached is not None and progress:
         _emit_cached_indicator()
@@ -1018,7 +1030,7 @@ def _run_smc(ctx, sample_kwargs: dict) -> az.InferenceData:
     cache_backend = resolve_cache(ctx.cache, model=ctx.model)
     cache_key = None
     if cache_backend is not None:
-        cache_key = compute_cache_key(ctx._model_bytes, cache_kwargs)
+        cache_key = compute_cache_key(_model_identity(ctx.model), cache_kwargs)
         # overwrite= forces a re-run: skip the load (still save below to replace).
         cached = None if ctx.overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
         if cached is not None:
@@ -1555,7 +1567,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         if cache_backends[i] is not None:
             # Still compute the key (so the fresh result is saved) but skip the
             # load when overwrite= forces a re-run.
-            ckey = compute_cache_key(mb, ck_kwargs)
+            ckey = compute_cache_key(_model_identity(m), ck_kwargs)
             if not overwrite:
                 hit = cache_backends[i].load(ckey, sample_kwargs=ck_kwargs)
                 if hit is not None:
