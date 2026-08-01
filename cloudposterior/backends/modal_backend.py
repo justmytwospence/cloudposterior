@@ -722,7 +722,6 @@ class ModalEnvironment(RemoteEnvironment):
         self._stop_fn = stop_fn
         self._stop_token = stop_token
         self._dashboard_url: str | None = None
-        self._progress_url: str | None = None
         self._stop_url: str | None = None
         self._exit_stack = contextlib.ExitStack()
         self._running = False
@@ -753,12 +752,6 @@ class ModalEnvironment(RemoteEnvironment):
                     self._dashboard_url = url
                 except Exception:
                     pass
-            if self._progress_fn is not None:
-                try:
-                    self._progress_url = _run_blocking(self._progress_fn.get_web_url)
-                except Exception:
-                    pass
-
             if self._stop_fn is not None:
                 try:
                     self._stop_url = _run_blocking(self._stop_fn.get_web_url)

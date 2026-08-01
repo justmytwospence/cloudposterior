@@ -44,17 +44,42 @@ Run that cell again and the cached result returns instantly --- no re-sampling.
 - `cache="disk"` --- persist results to `./.cloudposterior` (survives restarts).
   The default `cache=True` keeps results for the current session; `cache=False`
   disables it.
-- `notify=True` --- live progress on your phone (local) or a web dashboard (remote).
-- `instance="large"` --- override the auto-sized VM with a preset.
+- `dashboard=True` --- a live web dashboard (convergence, traces, a Stop
+  button). On by default for `remote=True`; pass `dashboard=False` to skip it.
+  The URL it prints carries an access token, so treat it as a secret.
+- `notify=True` --- push notifications to your phone via
+  [ntfy](https://ntfy.sh) on sampling start, completion, and errors. Pass a
+  string to choose the topic, or a dict for `{"topic", "server"}`. Auto-
+  generated topics are random, but ntfy topics are public to anyone who knows
+  them --- use your own server for anything sensitive.
+- `instance="large"` --- override the auto-sized VM with a preset (`small`,
+  `medium`, `large`, `xlarge`, `gpu`).
+- `until=True` --- stop early once every scalar parameter converges
+  (R-hat <= 1.01, ESS >= 400). Pass a dict to set your own thresholds. Remote
+  runs with the nutpie or pymc sampler only.
+- `overwrite=True` --- re-run and replace the cached entry instead of reading it.
+- `project="name"` --- namespace the remote volume and dashboard; defaults to
+  the working directory name.
+- `progress=False` --- silence the live progress display.
 
 See the [examples](examples/basics.ipynb) for each feature in depth.
 
+## Fitting many models at once
+
+`cp.map` fans a list of models out to one container each, sharing a dashboard:
+
+```python
+idatas = cp.map([pooled, hierarchical, county], {"draws": 2000}, until=True)
+```
+
 ## Cleanup
 
-Remote runs keep a small project-scoped volume warm. Tear it down when you're done:
+Remote runs keep a small project-scoped volume warm, and disk caching
+accumulates traces locally. Tear both down when you're done:
 
 ```python
 import cloudposterior as cp
 
 cp.cleanup_volumes(project="my-project")
+cp.cleanup_cache()
 ```

@@ -14,8 +14,23 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Refuse to move files carrying uncommitted work: the restore below falls back
+# to git, which can only recover what git already knows about.
+if ! git diff --quiet -- examples/*.py 2>/dev/null; then
+  echo "error: examples/*.py have uncommitted changes; commit or stash first." >&2
+  echo "       (this script moves them aside during the render)" >&2
+  exit 1
+fi
+
 stash="$(mktemp -d)"
-restore() { mv "$stash"/*.py examples/ 2>/dev/null || true; rm -rf "$stash"; }
+restore() {
+  mv "$stash"/*.py examples/ 2>/dev/null || true
+  rm -rf "$stash"
+  # Belt and braces: if the move back didn't happen (interrupted run, full
+  # disk), recover the tracked originals from git rather than leaving the
+  # working tree missing four files.
+  git checkout -- examples/ 2>/dev/null || true
+}
 trap restore EXIT
 mv examples/*.py "$stash"/
 

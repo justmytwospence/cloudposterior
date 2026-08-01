@@ -163,7 +163,7 @@ cloudposterior defaults to **nutpie** -- PyMC's recommended NUTS sampler, roughl
 with cp.cloud(model, remote=True):
     idata = pm.sample()                         # nutpie (default for continuous models)
     idata = pm.sample(nuts_sampler="pymc")      # PyMC's sampler (handles discrete vars)
-    idata = pm.sample(nuts_sampler="numpyro")   # JAX sampler (GPU auto-provisioned)
+    idata = pm.sample(nuts_sampler="numpyro")   # JAX sampler (CPU; add instance="gpu" for a GPU)
 ```
 
 Live per-chain progress, convergence diagnostics (rank-normalized R-hat and ESS), and the stop button work with **nutpie** and **pymc**. JAX samplers (`numpyro`, `blackjax`) run entirely inside a compiled graph with no per-draw hook, so they report phase-level progress only.
@@ -233,11 +233,14 @@ Two `pm.sample` details can't be matched exactly for remote execution and warn r
 
 | Feature | Default | Control |
 |---------|---------|---------|
-| Caching | **on** (in-memory) | `cache=True` / `False` / `"disk"` / `Path(...)` |
+| Caching | **on** (in-memory) | `cache=True` / `"memory"` / `False` / `"disk"` / `Path(...)` |
 | Cloud execution | off | `remote=True` / `False` |
 | Live dashboard | **on** (when remote) | `dashboard=True` / `False` |
 | Push notifications | off | `notify=True` / `"topic"` / `{"server": ..., "topic": ...}` |
 | Adaptive early-stop | off | `until=True` / `{"r_hat": ..., "ess": ...}` (remote) |
+| Re-run and replace the cache entry | off | `overwrite=True` |
+| Project namespace (volume + dashboard) | working directory name | `project="name"` |
+| Live progress display | **on** | `progress=True` / `False` |
 
 Mix and match:
 
@@ -325,7 +328,7 @@ If you prefer not to use the context manager, `cp.sample()` runs a single remote
 idata = cp.sample(model, draws=2000, chains=4)
 ```
 
-For repeated sampling with the same model, the `cp.cloud()` context manager is cheaper -- it keeps the container warm and only sends kwargs after the first call.
+For repeated sampling with the same model, the `cp.cloud()` context manager is cheaper -- it keeps the container warm and only sends kwargs after the first call. `cp.sample()` also takes a narrower set of options than `cp.cloud()`: no `dashboard=`, `until=`, `overwrite=` or `project=`.
 
 ---
 
@@ -360,7 +363,7 @@ Modal tests provision the smallest possible instance, sample 20 draws on a 2-RV 
 
 ## Status
 
-Early proof of concept. Works end-to-end with 75+ passing tests, but expect rough edges. Contributions and feedback welcome.
+Early proof of concept. Works end-to-end and is covered by a test suite on both the PyMC 5 and PyMC 6 stacks, but expect rough edges. Contributions and feedback welcome.
 
 ## License
 

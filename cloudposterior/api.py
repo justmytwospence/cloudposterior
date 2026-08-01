@@ -16,6 +16,8 @@ from cloudposterior.progress import JobPhase, PhaseUpdate, dispatch_event
 if TYPE_CHECKING:
     import pymc as pm
 
+    from cloudposterior.backends import RemoteEnvironment
+
 
 def _detect_project_name() -> str:
     """Detect a project name from the environment.
@@ -41,7 +43,7 @@ def _detect_project_name() -> str:
 # container (Modal's scaledown_window idles it out, ~20 min). Keyed by
 # (project, model_slug). Torn down by cp.cleanup_volumes(), cloud.destroy(), or
 # atexit on interpreter/kernel shutdown.
-_LIVE_ENVS: "dict[tuple[str, str], object]" = {}
+_LIVE_ENVS: "dict[tuple[str, str], RemoteEnvironment]" = {}
 
 # Guards _LIVE_ENVS and the pm.* monkeypatch, both of which are process-global.
 _PATCH_LOCK = threading.Lock()
@@ -258,7 +260,7 @@ class cloud:
 
     _JAX_SAMPLERS = ("numpyro", "blackjax")
 
-    def _can_reuse_env(self, env, nuts_sampler: str) -> bool:
+    def _can_reuse_env(self, env: "RemoteEnvironment", nuts_sampler: str) -> bool:
         """Whether a kept-warm env satisfies this run's image/feature needs."""
         # A run that wants the live dashboard can't reuse an env without one.
         if self.dashboard and env._dashboard_fn is None:
@@ -617,7 +619,7 @@ def _model_identity(model) -> str:
     return digest
 
 
-def _call_targets_ctx_model(ctx, kwargs: dict, what: str) -> bool:
+def _call_targets_ctx_model(ctx: "cloud", kwargs: dict, what: str) -> bool:
     """Whether an intercepted PyMC call actually targets the wrapped model.
 
     A call that names a *different* model (an explicit ``model=`` kwarg, or an
@@ -821,7 +823,7 @@ def _observed_data_fingerprint(model):
     return data_digest(model) or None
 
 
-def _warn_if_resize_drift(ctx, nuts_sampler: str, sample_kwargs: dict) -> None:
+def _warn_if_resize_drift(ctx: "cloud", nuts_sampler: str, sample_kwargs: dict) -> None:
     """If a later pm.sample() call would auto-size to a different VM than
     what was provisioned on the first call, warn the user.
 
@@ -1132,7 +1134,7 @@ def _stop_sinks(sinks: list):
                 pass
 
 
-def _run_predictive(ctx, kind: str, trace, sample_kwargs: dict):
+def _run_predictive(ctx: "cloud", kind: str, trace, sample_kwargs: dict):
     """Run prior/posterior predictive on the remote persistent environment.
 
     A blocking (non-streaming) call: uploads the model if needed, invokes the
@@ -1165,7 +1167,7 @@ def _run_predictive(ctx, kind: str, trace, sample_kwargs: dict):
     return deserialize_inference_data(idata_bytes)
 
 
-def _run_smc(ctx, sample_kwargs: dict) -> az.InferenceData:
+def _run_smc(ctx: "cloud", sample_kwargs: dict) -> az.InferenceData:
     """Run pm.sample_smc on the remote persistent environment (blocking).
 
     Caches the result like pm.sample, namespacing the key with the op so SMC
@@ -1203,7 +1205,7 @@ def _run_smc(ctx, sample_kwargs: dict) -> az.InferenceData:
     return idata
 
 
-def _run_idata_op(ctx, op: str, in_idata, sample_kwargs: dict):
+def _run_idata_op(ctx: "cloud", op: str, in_idata, sample_kwargs: dict):
     """Run an idata-in / idata-out op (e.g. compute_log_likelihood) remotely.
 
     Ships the input idata to the worker, invokes ``op``, and returns the

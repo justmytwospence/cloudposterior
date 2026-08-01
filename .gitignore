@@ -28,3 +28,5 @@ _site/
 /reference/
 /objects.json
 **/*.quarto_ipynb
+
+/.quarto/

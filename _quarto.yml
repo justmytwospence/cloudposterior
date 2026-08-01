@@ -54,6 +54,14 @@ website:
       - section: API reference
         contents:
           - reference/index.qmd
+          - reference/cloud.qmd
+          - reference/sample.qmd
+          - reference/map.qmd
+          - reference/cleanup_volumes.qmd
+          - reference/cleanup_cache.qmd
+          - reference/config.RemoteConfig.qmd
+          - reference/cache.MemoryCache.qmd
+          - reference/cache.DiskCache.qmd
   page-footer:
     center: "MIT licensed &middot; Built with [Quarto](https://quarto.org)"
     right:
@@ -87,6 +95,7 @@ quartodoc:
         - sample
         - map
         - cleanup_volumes
+        - cleanup_cache
     - title: Configuration
       desc: "Right-size the remote VM."
       contents:

@@ -21,7 +21,6 @@ class SamplingPayload:
     model_bytes: bytes  # cloudpickle'd pm.Model (includes observed data), lz4 compressed
     version_manifest: dict[str, str]
     sample_kwargs: dict
-    idata_bytes: bytes | None = None  # lz4 NetCDF trace, for posterior predictive
 
 
 def get_version_manifest() -> dict[str, str]:

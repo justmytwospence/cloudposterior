@@ -6,11 +6,10 @@ The notebook backend uses anywidget, which renders live in both Jupyter
 
 from __future__ import annotations
 
-from typing import Iterator
+import html
 
 from cloudposterior.progress import (
     PhaseUpdate,
-    ProgressEvent,
     SamplingProgress,
 )
 
@@ -86,7 +85,7 @@ def _sampling_table_html(progress: SamplingProgress) -> str:
         bar_color = "#d9534f" if cp.divergences > 0 else "#1764f4"
         bar = _bar_html(pct, width_px=180, color=bar_color)
 
-        phase_label = f'<span style="color:#888;">[{cp.phase}]</span>'
+        phase_label = f'<span style="color:#888;">[{html.escape(str(cp.phase))}]</span>'
         speed_str = f"{cp.draws_per_sec:.0f} draws/s" if cp.draws_per_sec > 0 else "--"
         elapsed = _format_time(cp.draw / cp.draws_per_sec if cp.draws_per_sec > 0 else 0)
         remaining = _format_time(cp.eta_seconds) if cp.eta_seconds > 0 else "--"
@@ -142,8 +141,6 @@ _CSS_SPINNER = (
 
 def _phase_html(phases: list[tuple[str, str, str]]) -> str:
     """Render phase checklist as HTML. Each tuple: (status, label, detail)."""
-    import html
-
     lines = []
     for status, label, detail in phases:
         if status == "done":
@@ -312,14 +309,12 @@ class NotebookDisplay:
         parts = [
             f'<div style="font-family:monospace;font-size:14px;font-weight:bold;'
             f'padding:8px 0 4px 0;">cloudposterior'
-            f'{" -- " + self._instance_desc if self._instance_desc else ""}</div>'
+            f'{" -- " + html.escape(self._instance_desc) if self._instance_desc else ""}</div>'
         ]
         if self._phases:
             parts.append(_phase_html(self._phases))
         if self._active_phase:
-            import html
-
-            parts.append(
+                    parts.append(
                 f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
                 f'  {_CSS_SPINNER}'
                 f'<span style="color:#888;">{html.escape(self._active_phase)}...</span>'
@@ -480,35 +475,3 @@ class TerminalDisplay:
             parts.append(table)
 
         self._live.update(Group(*parts))
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-def display_progress_stream(
-    events: Iterator[ProgressEvent],
-    instance_desc: str = "",
-):
-    """Consume a stream of progress events and display them.
-
-    Automatically selects notebook or terminal backend.
-    """
-    if _is_marimo() or _is_notebook():
-        display = NotebookDisplay(instance_desc)
-        for event in events:
-            if isinstance(event, PhaseUpdate):
-                display.show_phase(event)
-            elif isinstance(event, SamplingProgress):
-                display.show_sampling(event)
-    else:
-        display = TerminalDisplay(instance_desc)
-        display.start()
-        try:
-            for event in events:
-                if isinstance(event, PhaseUpdate):
-                    display.show_phase(event)
-                elif isinstance(event, SamplingProgress):
-                    display.show_sampling(event)
-        finally:
-            display.stop()
