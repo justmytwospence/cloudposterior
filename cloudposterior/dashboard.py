@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from cloudposterior.progress import (
     JobPhase,
     PhaseUpdate,
@@ -97,21 +99,52 @@ class DashboardSink:
             pass  # best-effort
 
 
-def render_dashboard_html(progress_label: str = "", stop_label: str = "",
-                          dashboard_label: str = "", stop_token: str = "") -> str:
+def render_dashboard_html(progress_label: str, stop_label: str,
+                          dashboard_label: str, stop_token: str) -> str:
     """Render dashboard HTML with endpoint labels baked in.
 
-    The JS constructs full URLs from the labels by deriving the Modal
-    workspace URL pattern from window.location. ``stop_token`` is a secret sent
-    with the stop request so a random caller who guesses the stop URL can't kill
-    the run.
+    The JS constructs full URLs from the labels by deriving the Modal workspace
+    URL pattern from window.location. ``stop_token`` is the secret sent with
+    every progress and stop request.
+
+    Every value is substituted as a JSON literal: a bare replace into a quoted
+    JS string breaks out of the literal on a single quote or backslash. All
+    four are required -- they previously defaulted to "", which made
+    ``origin.replace('', '')`` a silent no-op that pointed the progress URL at
+    the dashboard itself.
     """
-    return (DASHBOARD_HTML
-        .replace("__PROGRESS_LABEL__", progress_label)
-        .replace("__STOP_LABEL__", stop_label)
-        .replace("__DASHBOARD_LABEL__", dashboard_label)
-        .replace("__STOP_TOKEN__", stop_token)
+    import json
+
+    values = {
+        "__PROGRESS_LABEL__": progress_label,
+        "__STOP_LABEL__": stop_label,
+        "__DASHBOARD_LABEL__": dashboard_label,
+        "__STOP_TOKEN__": stop_token,
+    }
+    missing = [k for k, v in values.items() if not v]
+    if missing:
+        raise ValueError(f"render_dashboard_html requires: {', '.join(missing)}")
+
+    html = DASHBOARD_HTML
+    for placeholder, value in values.items():
+        html = html.replace(placeholder, json.dumps(value))
+    return (html
+        .replace("__UPLOT_CSS__", _static("uPlot.min.css"))
+        .replace("__UPLOT_JS__", _static("uPlot.iife.min.js"))
     )
+
+
+@lru_cache(maxsize=None)
+def _static(name: str) -> str:
+    """Read a vendored asset from cloudposterior/static.
+
+    uPlot is inlined rather than pulled from a CDN: this page holds the stop
+    token and polls posterior draws, so third-party script execution on its
+    origin would be enough to exfiltrate both.
+    """
+    from importlib.resources import files
+
+    return files("cloudposterior").joinpath("static", name).read_text(encoding="utf-8")
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -120,8 +153,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cloudposterior</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
-<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<style>__UPLOT_CSS__</style>
+<script>__UPLOT_JS__</script>
 <style>
   :root {
     --bg: #0f1117; --bg-card: #1a1d27; --bg-hover: #22262f;
@@ -246,13 +279,17 @@ let polling = true;
 // Construct sibling endpoint URLs from our own URL
 // Dashboard: https://workspace--{dash-label}-env.modal.run
 // Progress: https://workspace--{prog-label}-env.modal.run
-const dashLabel = '__DASHBOARD_LABEL__';
-const progLabel = '__PROGRESS_LABEL__';
-const stopLabel = '__STOP_LABEL__';
-const stopToken = '__STOP_TOKEN__';
+const dashLabel = __DASHBOARD_LABEL__;
+const progLabel = __PROGRESS_LABEL__;
+const stopLabel = __STOP_LABEL__;
+const stopToken = __STOP_TOKEN__;
 const origin = window.location.origin; // https://workspace--dash-label-env.modal.run
 const progressUrl = origin.replace(dashLabel, progLabel);
 const stopUrl = origin.replace(dashLabel, stopLabel);
+// /progress serves parameter names and posterior draws, so it is token-gated
+// like /stop.
+const progressFetchUrl = progressUrl
+  + (stopToken ? ('?token=' + encodeURIComponent(stopToken)) : '');
 
 const headerStop = document.getElementById('stopBtn');
 const backLink = document.getElementById('backLink');
@@ -426,21 +463,31 @@ function showOffline() {
 }
 async function poll() {
   if (!polling) return;
+  let data;
   try {
-    const r = await fetch(progressUrl);
-    const data = await r.json();
+    const r = await fetch(progressFetchUrl);
+    data = await r.json();
     failCount = 0;
-    const view = normalize(data);
-    render(view);
-    if (view.models.length && view.models.every(m => (view.runs[m.label] || {}).complete)) {
-      polling = false;
-    }
   } catch (e) {
     // The /progress endpoint becomes unreachable when the run ends and the
     // Modal app shuts down with the notebook cell. Tolerate a couple of
     // transient misses, then stop with a calm message (not a red error loop).
     failCount++;
     if (failCount >= 3) { showOffline(); polling = false; }
+    if (polling) setTimeout(poll, 1000);
+    return;
+  }
+  // Rendering is deliberately outside the fetch try: a render bug (say a
+  // missing field hitting .toFixed) is not the run going offline, and
+  // counting it as one told the user their live run had ended.
+  try {
+    const view = normalize(data);
+    render(view);
+    if (view.models.length && view.models.every(m => (view.runs[m.label] || {}).complete)) {
+      polling = false;
+    }
+  } catch (e) {
+    console.error('cloudposterior: dashboard render failed', e);
   }
   if (polling) setTimeout(poll, 1000);
 }

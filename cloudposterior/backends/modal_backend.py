@@ -423,10 +423,14 @@ def _create_persistent_app(
     stop_fn = None
     if dashboard_dict_name is not None:
         _dict_name = dashboard_dict_name
-        _uid = dashboard_dict_name.replace("cp-dash-", "")[:6]
-        _progress_label = f"{model_label}-{_uid}-progress"
-        _stop_label = f"{model_label}-{_uid}-stop"
-        _dash_label = f"{model_label}-{_uid}"
+        # Full uuid hex, not a 6-char slice. These labels become the public
+        # hostname, and the endpoints below serve posterior draws -- 24 bits
+        # behind a guessable model-name prefix is not a secret.
+        _uid = _endpoint_uid(dashboard_dict_name)
+        _label_stem = f"{_truncate_label(model_label)}-{_uid}"
+        _progress_label = f"{_label_stem}-progress"
+        _stop_label = f"{_label_stem}-stop"
+        _dash_label = _label_stem
         _stop_token = stop_token or ""
 
         # Stop endpoint backs both the dashboard's stop button and the
@@ -434,11 +438,13 @@ def _create_persistent_app(
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="POST", label=_stop_label)
         async def serve_stop(token: str = "", model: str = ""):
+            import hmac
+
             from fastapi.responses import JSONResponse
             import modal as _modal
             # Require the token baked into the page so a random caller who
-            # guesses the (short) stop URL can't kill someone's sampling run.
-            if _stop_token and token != _stop_token:
+            # finds the stop URL can't kill someone's sampling run.
+            if not _stop_token or not hmac.compare_digest(token, _stop_token):
                 return JSONResponse({"stopped": False, "error": "invalid token"}, status_code=403)
             try:
                 # from_name is a lazy reference (no I/O); only get/put have .aio.
@@ -446,8 +452,12 @@ def _create_persistent_app(
                 # cp.map's per-model Stop targets "stop:<label>"; the global
                 # "Stop all" (and single-model runs) use the bare "stop" key.
                 await d.put.aio(f"stop:{model}" if model else "stop", True)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Reporting success here made a failed stop (deleted Dict,
+                # network error) indistinguishable from a working one.
+                return JSONResponse(
+                    {"stopped": False, "error": str(exc)}, status_code=500
+                )
             return JSONResponse({"stopped": True})
 
         stop_fn = serve_stop
@@ -456,9 +466,13 @@ def _create_persistent_app(
         if dashboard:
             @app.function(serialized=True, image=image)
             @modal.fastapi_endpoint(method="GET", label=_dash_label)
-            def serve_dashboard():
-                from fastapi.responses import HTMLResponse
+            def serve_dashboard(token: str = ""):
+                import hmac
+
+                from fastapi.responses import HTMLResponse, JSONResponse
                 from cloudposterior.dashboard import render_dashboard_html
+                if not _stop_token or not hmac.compare_digest(token, _stop_token):
+                    return JSONResponse({"error": "invalid token"}, status_code=403)
                 return HTMLResponse(render_dashboard_html(
                     progress_label=_progress_label,
                     stop_label=_stop_label,
@@ -468,11 +482,17 @@ def _create_persistent_app(
 
             @app.function(serialized=True, image=image)
             @modal.fastapi_endpoint(method="GET", label=_progress_label)
-            async def serve_progress():
+            async def serve_progress(token: str = ""):
                 # Async handler + .aio() Modal calls: FastAPI runs this on an
                 # event loop, so blocking calls here would warn and stall it.
+                import hmac
+
                 from fastapi.responses import JSONResponse
                 import modal as _modal
+                # This returns parameter names and raw posterior draws, so it
+                # is gated on the same token as /stop.
+                if not _stop_token or not hmac.compare_digest(token, _stop_token):
+                    return JSONResponse({"error": "invalid token"}, status_code=403)
                 default = {"phases": [], "sampling": None, "complete": False}
                 try:
                     # from_name is a lazy reference (no I/O); only get/put have .aio.
@@ -554,6 +574,31 @@ class PersistentModalSamplingJob(SamplingJob):
         pass
 
 
+# Modal caps endpoint labels at 63 chars; a 32-char uid plus the "-progress"
+# suffix leaves this much for the model name.
+_MAX_MODEL_LABEL = 20
+
+
+def _truncate_label(model_label: str) -> str:
+    """Bound the model part of an endpoint label.
+
+    model_slug is unbounded (an unnamed model yields e.g.
+    "mu-tau-theta-sigma-plus3"); once the label exceeds Modal's limit the
+    endpoint is rejected or silently renamed at provision time.
+    """
+    return (model_label[:_MAX_MODEL_LABEL].rstrip("-")) or "model"
+
+
+def _endpoint_uid(dashboard_dict_name: str) -> str:
+    """Full-entropy suffix for public endpoint labels."""
+    import uuid
+
+    stem = dashboard_dict_name.replace("cp-dash-", "")
+    # from_name suffixes are already random; extend to a full uuid worth of
+    # entropy so the hostname itself is not guessable.
+    return f"{stem}{uuid.uuid4().hex}"[:32]
+
+
 def _compute_payload_path(m_slug: str, model_bytes: bytes) -> str:
     """Compute the Volume path for a model payload.
 
@@ -613,7 +658,12 @@ class ModalEnvironment(RemoteEnvironment):
             # Capture dashboard URLs after app starts (off-loop: avoids async warnings)
             if self._dashboard_fn is not None:
                 try:
-                    self._dashboard_url = _run_blocking(self._dashboard_fn.get_web_url)
+                    url = _run_blocking(self._dashboard_fn.get_web_url)
+                    # The page and its /progress feed are token-gated, so the
+                    # shareable URL has to carry the token.
+                    if url and self._stop_token:
+                        url = f"{url}?token={self._stop_token}"
+                    self._dashboard_url = url
                 except Exception:
                     pass
             if self._progress_fn is not None:
@@ -627,8 +677,6 @@ class ModalEnvironment(RemoteEnvironment):
                     self._stop_url = _run_blocking(self._stop_fn.get_web_url)
                 except Exception:
                     pass
-
-            # No need to store URLs in Dict -- dashboard constructs them from labels
 
     def _upload_if_needed(self, model_bytes: bytes, payload_path: str) -> bool:
         """Upload model payload to Volume if not already there. Returns True if uploaded."""

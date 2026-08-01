@@ -1,5 +1,7 @@
 """Tests for the live dashboard sink and HTML rendering."""
 
+import pytest
+
 from cloudposterior.dashboard import DashboardSink, render_dashboard_html
 from cloudposterior.progress import (
     ChainProgress,
@@ -56,11 +58,52 @@ def test_dashboard_sink_is_best_effort_on_write_failure():
 
 def test_render_dashboard_html_bakes_labels_and_vehtari_thresholds():
     html = render_dashboard_html(
-        progress_label="proj-abc-progress", stop_label="proj-abc-stop", dashboard_label="proj-abc",
+        progress_label="proj-abc-progress", stop_label="proj-abc-stop",
+        dashboard_label="proj-abc", stop_token="tok",
     )
     assert "proj-abc-progress" in html and "proj-abc-stop" in html
     assert "__PROGRESS_LABEL__" not in html  # placeholders substituted
     assert "1.01" in html and "400" in html  # rank-normalized R-hat / ESS thresholds
+
+
+def test_render_dashboard_html_requires_every_label():
+    """They previously defaulted to "", making origin.replace('', '') a silent
+    no-op that pointed the progress URL at the dashboard itself."""
+    with pytest.raises(ValueError, match="__STOP_TOKEN__"):
+        render_dashboard_html(
+            progress_label="p", stop_label="s", dashboard_label="d", stop_token="",
+        )
+
+
+def test_render_dashboard_html_escapes_js_string_breakout():
+    """A bare replace into a quoted JS literal breaks out on a quote or
+    backslash; substituting a JSON literal cannot."""
+    hostile = 'tok"; alert(1); //'
+    html = render_dashboard_html(
+        progress_label="p", stop_label="s", dashboard_label="d", stop_token=hostile,
+    )
+    # The raw (unescaped) form must not appear -- that would be live JS.
+    assert hostile not in html
+    # It appears only as an escaped JSON string literal.
+    assert 'const stopToken = "tok\\"; alert(1); //";' in html
+
+
+def test_dashboard_inlines_uplot_rather_than_using_a_cdn():
+    """The page holds the stop token and polls posterior draws, so third-party
+    script execution on its origin would be enough to exfiltrate both."""
+    html = render_dashboard_html(
+        progress_label="p", stop_label="s", dashboard_label="d", stop_token="tok",
+    )
+    assert "cdn.jsdelivr.net" not in html
+    assert "uPlot" in html
+
+
+def test_progress_fetch_carries_the_token():
+    html = render_dashboard_html(
+        progress_label="p", stop_label="s", dashboard_label="d", stop_token="tok",
+    )
+    assert "progressFetchUrl" in html
+    assert "fetch(progressFetchUrl)" in html
 
 
 def test_render_dashboard_html_bakes_stop_token():
