@@ -25,8 +25,18 @@ from pathlib import Path
 from typing import Protocol
 
 
+_MAX_LABEL_LEN = 80
+_DISK_KEEP_PER_MODEL = 20
+
+
 def _params_label(sample_kwargs: dict) -> str:
-    """Human-readable label from common MCMC sampling params."""
+    """Human-readable label from common MCMC sampling params.
+
+    Slugified: these values become a path component, and an unsanitized one
+    (``nuts_sampler="../../etc/x"``) would escape the cache root.
+    """
+    from cloudposterior.naming import slugify
+
     parts = []
     for key in ("draws", "tune", "chains", "cores", "nuts_sampler", "target_accept"):
         if key in sample_kwargs and sample_kwargs[key] is not None:
@@ -36,7 +46,7 @@ def _params_label(sample_kwargs: dict) -> str:
             parts.append(f"{key}{val}")
     if not parts:
         parts.append("default")
-    return "_".join(parts)
+    return slugify("_".join(parts))[:_MAX_LABEL_LEN] or "default"
 
 
 class CacheBackend(Protocol):
@@ -99,27 +109,64 @@ class DiskCache:
         # Pure path computation -- directories are created on save() only, so
         # a cache probe (load miss) doesn't litter empty directories.
         cache_dir = self._base / self._model_slug
-        # Use first 8 chars of cache key hash for uniqueness
-        key_prefix = key[:8] if len(key) >= 8 else key
+        # 16 chars (64 bits), matching payload_hash. At 8 chars two genuinely
+        # different runs sharing a params label could resolve to one file and
+        # silently return the wrong posterior.
+        key_prefix = key[:16]
         if sample_kwargs is not None:
             label = _params_label(sample_kwargs)
-            return cache_dir / f"{label}-{key_prefix}.nc"
-        return cache_dir / f"{key_prefix}.nc"
+            path = cache_dir / f"{label}-{key_prefix}.nc"
+        else:
+            path = cache_dir / f"{key_prefix}.nc"
+        # Defense in depth: _params_label is slugified, so nothing should be
+        # able to traverse out, but the cache root is a hard boundary.
+        resolved = path.resolve()
+        if not resolved.is_relative_to(self._base.resolve()):
+            raise ValueError(f"cache path escapes the cache root: {path}")
+        return path
+
+    @staticmethod
+    def _key_path(path: Path) -> Path:
+        """Sidecar holding the full cache key for the entry at ``path``."""
+        return path.with_name(path.name + ".key")
 
     def load(self, key: str, sample_kwargs: dict | None = None):
+        import warnings
+
         import arviz as az
 
         from cloudposterior._idata import load_all
 
         path = self._path(key, sample_kwargs=sample_kwargs)
-        if path.exists():
+        if not path.exists():
+            return None
+
+        # The filename only carries a prefix of the key; verify the whole thing
+        # so a prefix collision is a miss rather than the wrong posterior.
+        key_path = self._key_path(path)
+        if key_path.exists():
+            try:
+                if key_path.read_text().strip() != key:
+                    return None
+            except OSError:
+                return None
+
+        try:
             idata = az.from_netcdf(str(path))
             load_all(idata)
             return idata
-        return None
+        except Exception as exc:
+            # A truncated or unreadable entry (crash mid-write, half-synced
+            # network drive) should cost a re-run, not fail the user's sample.
+            warnings.warn(
+                f"cloudposterior: ignoring unreadable cache file {path} ({exc})",
+                stacklevel=2,
+            )
+            return None
 
     def save(self, key: str, idata, sample_kwargs: dict | None = None) -> None:
         import os
+        import uuid
 
         from cloudposterior.serialize import sanitize_inference_data
 
@@ -131,9 +178,41 @@ class DiskCache:
         # already open") when overwrite= re-saves an entry that an earlier load
         # left open via xarray's lazy file cache. os.replace also makes the write
         # atomic (no half-written cache on a crash).
-        tmp = path.with_name(path.name + ".tmp")
-        idata.to_netcdf(str(tmp))
-        os.replace(tmp, path)
+        #
+        # The temp name carries pid + random: a fixed ".tmp" let two processes
+        # saving the same key interleave writes into one file and publish the
+        # interleaved result.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            idata.to_netcdf(str(tmp))
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        self._key_path(path).write_text(key)
+        self._prune(path.parent)
+
+    def _prune(self, directory: Path, keep: int = _DISK_KEEP_PER_MODEL) -> None:
+        """Keep the N most recent entries per model.
+
+        The remote Volume already prunes its payloads; without this the local
+        cache grows a full NetCDF posterior per run, forever.
+        """
+        try:
+            entries = sorted(
+                directory.glob("*.nc"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+        except OSError:
+            return
+        for stale in entries[keep:]:
+            for victim in (stale, self._key_path(stale)):
+                try:
+                    victim.unlink()
+                except OSError:
+                    pass
 
 
 # Module-level default memory cache (shared across all calls in a session)
@@ -142,6 +221,21 @@ _default_memory_cache = MemoryCache()
 
 def get_default_cache() -> MemoryCache:
     return _default_memory_cache
+
+
+def cleanup_cache(base_dir: str | Path | None = None) -> int:
+    """Delete the local disk cache tree. Returns the number of entries removed.
+
+    The disk counterpart of ``cleanup_volumes``.
+    """
+    import shutil
+
+    base = Path(base_dir) if base_dir else Path(".cloudposterior")
+    if not base.exists():
+        return 0
+    removed = len(list(base.rglob("*.nc")))
+    shutil.rmtree(base)
+    return removed
 
 
 def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
@@ -161,7 +255,7 @@ def resolve_cache(cache_arg, model=None) -> CacheBackend | None:
         return None
     if cache_arg is True or cache_arg == "memory":
         return get_default_cache()
-    if isinstance(cache_arg, str) and cache_arg == "disk":
+    if cache_arg == "disk":
         return DiskCache(model=model)
     if isinstance(cache_arg, (str, Path)):
         return DiskCache(base_dir=cache_arg, model=model)

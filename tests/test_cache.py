@@ -157,3 +157,107 @@ def test_disk_cache_load_miss_creates_no_directories(tmp_path):
     cache = DiskCache(base_dir=tmp_path / "cp-cache")
     assert cache.load("a" * 64, sample_kwargs={"draws": 10}) is None
     assert not (tmp_path / "cp-cache").exists()
+
+
+# -- DiskCache hardening -----------------------------------------------------
+
+def _disk(tmp_path):
+    from cloudposterior.cache import DiskCache
+
+    return DiskCache(base_dir=tmp_path)
+
+
+def test_disk_cache_rejects_traversal_in_params(tmp_path):
+    """sample_kwargs values become a path component; an unsanitized one used
+    to escape the cache root."""
+    cache = _disk(tmp_path)
+    path = cache._path("a" * 64, {"nuts_sampler": "../../../etc/evil"})
+    assert path.resolve().is_relative_to(tmp_path.resolve())
+    assert ".." not in str(path)
+
+
+def test_disk_cache_uses_a_16_char_key_prefix(tmp_path):
+    cache = _disk(tmp_path)
+    key = "b" * 64
+    assert cache._path(key, {"draws": 10}).name.endswith(f"-{'b' * 16}.nc")
+
+
+def test_disk_cache_verifies_the_full_key(tmp_path):
+    """The filename holds only a prefix; a collision must be a miss, not the
+    wrong posterior."""
+    import arviz as az
+
+    from cloudposterior._idata import add_group
+
+    cache = _disk(tmp_path)
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"x": np.zeros((2, 5))}))
+
+    key_a = "c" * 64
+    cache.save(key_a, idata, sample_kwargs={"draws": 10})
+    assert cache.load(key_a, sample_kwargs={"draws": 10}) is not None
+
+    # Same 16-char prefix, different full key -> must not resolve to the entry.
+    key_b = "c" * 16 + "d" * 48
+    assert cache.load(key_b, sample_kwargs={"draws": 10}) is None
+
+
+def test_disk_cache_treats_a_corrupt_file_as_a_miss(tmp_path):
+    """A truncated entry should cost a re-run, not fail the user's sample."""
+    cache = _disk(tmp_path)
+    key = "e" * 64
+    path = cache._path(key, {"draws": 10})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a netcdf file")
+
+    with pytest.warns(UserWarning, match="unreadable cache file"):
+        assert cache.load(key, sample_kwargs={"draws": 10}) is None
+
+
+def test_disk_cache_leaves_no_temp_file_when_writing_fails(tmp_path):
+    from unittest.mock import patch
+
+    import arviz as az
+
+    from cloudposterior._idata import add_group
+
+    cache = _disk(tmp_path)
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"x": np.zeros((2, 5))}))
+
+    with patch.object(type(idata), "to_netcdf", side_effect=RuntimeError("disk full")):
+        with pytest.raises(RuntimeError, match="disk full"):
+            cache.save("f" * 64, idata, sample_kwargs={"draws": 10})
+
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_disk_cache_prunes_to_the_newest_entries(tmp_path):
+    import arviz as az
+
+    from cloudposterior._idata import add_group
+    from cloudposterior.cache import _DISK_KEEP_PER_MODEL
+
+    cache = _disk(tmp_path)
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"x": np.zeros((2, 5))}))
+
+    for i in range(_DISK_KEEP_PER_MODEL + 3):
+        cache.save(f"{i:064d}", idata, sample_kwargs={"draws": i})
+
+    assert len(list(tmp_path.rglob("*.nc"))) == _DISK_KEEP_PER_MODEL
+
+
+def test_cleanup_cache_removes_the_tree(tmp_path):
+    import arviz as az
+
+    from cloudposterior._idata import add_group
+    from cloudposterior.cache import cleanup_cache
+
+    cache = _disk(tmp_path)
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"x": np.zeros((2, 5))}))
+    cache.save("a" * 64, idata, sample_kwargs={"draws": 10})
+
+    assert cleanup_cache(tmp_path) == 1
+    assert not tmp_path.exists()
