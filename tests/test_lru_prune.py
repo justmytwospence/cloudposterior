@@ -141,3 +141,20 @@ def test_teardown_without_control_dict_skips_delete():
         env.teardown()
 
     fake_modal.Dict.objects.delete.assert_not_called()
+
+
+def test_prune_never_deletes_the_payload_just_uploaded():
+    """Volume mtimes have one-second granularity, so a tie could otherwise
+    sort the fresh payload into the stale tail -- deleting the file the next
+    submit is about to load."""
+    # Every payload shares an mtime, and the fresh one sorts last by name.
+    entries = [_entry(f"payload-{i:02x}.bin", 100.0) for i in range(8)]
+    entries.append(_entry("payload-zz.bin", 100.0))
+    env, volume = _env_with_fake_volume(entries)
+
+    env._prune_old_payloads("model_x/payload-zz.bin")
+
+    removed = [call.args[0] for call in volume.remove_file.call_args_list]
+    assert "/model_x/payload-zz.bin" not in removed
+    # The kept payload occupies one of the N slots.
+    assert len(entries) - len(removed) == _PAYLOAD_KEEP_PER_MODEL

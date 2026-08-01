@@ -172,9 +172,11 @@ class ModalSamplingJob(SamplingJob):
         self._nuts_sampler = nuts_sampler
         self._idata_bytes: bytes | None = None
         self._events: list[ProgressEvent] = []
+        self._streamed = False
 
     def stream_progress(self, output_widget=None) -> Iterator[ProgressEvent]:
         """Submit to Modal and yield progress events."""
+        self._streamed = True
 
         app, remote_sample = _create_modal_app(
             self._payload.version_manifest,
@@ -210,13 +212,18 @@ class ModalSamplingJob(SamplingJob):
         """Return the InferenceData. Must call stream_progress first."""
         from cloudposterior.serialize import deserialize_inference_data
 
-        if self._idata_bytes is None:
-            # If stream_progress wasn't called, run it now
+        if self._idata_bytes is None and not self._streamed:
+            # stream_progress was never called -- drive it once.
             for _ in self.stream_progress():
                 pass
 
         if self._idata_bytes is None:
-            raise RuntimeError("Sampling did not produce results")
+            # Streaming ran but yielded no trace. Re-streaming here would
+            # silently launch a second *paid* sampling run, so fail instead.
+            raise RuntimeError(
+                "the sampling stream finished without producing a trace; "
+                "refusing to re-run the remote job"
+            )
 
         return deserialize_inference_data(self._idata_bytes)
 
@@ -510,26 +517,36 @@ class PersistentModalSamplingJob(SamplingJob):
         self._stop_dict_name = stop_dict_name
         self._idata_bytes: bytes | None = None
         self._events: list[ProgressEvent] = []
+        self._streamed = False
 
     def stream_progress(self, output_widget=None) -> Iterator[ProgressEvent]:
-        sampler = self._sampler_cls()
-        gen = sampler.sample.remote_gen(
-            self._payload_path,
-            self._sample_kwargs,
-            self._nuts_sampler,
-            stop_dict_name=self._stop_dict_name,
-        )
+        self._streamed = True
+        try:
+            sampler = self._sampler_cls()
+            gen = sampler.sample.remote_gen(
+                self._payload_path,
+                self._sample_kwargs,
+                self._nuts_sampler,
+                stop_dict_name=self._stop_dict_name,
+            )
+        except Exception as exc:
+            raise _handle_modal_error(exc)
         self._idata_bytes = yield from _stream_events(gen, self._events)
 
     def result(self):
         from cloudposterior.serialize import deserialize_inference_data
 
-        if self._idata_bytes is None:
+        if self._idata_bytes is None and not self._streamed:
             for _ in self.stream_progress():
                 pass
 
         if self._idata_bytes is None:
-            raise RuntimeError("Sampling did not produce results")
+            # See ModalSamplingJob.result: re-streaming would start a second
+            # paid run.
+            raise RuntimeError(
+                "the sampling stream finished without producing a trace; "
+                "refusing to re-run the remote job"
+            )
 
         return deserialize_inference_data(self._idata_bytes)
 
@@ -555,7 +572,12 @@ class ModalEnvironment(RemoteEnvironment):
     def __init__(self, app, sampler_cls, volume, project: str, model_slug: str,
                  dashboard_dict=None, dashboard_dict_name: str | None = None,
                  dashboard_fn=None, progress_fn=None, stop_fn=None,
-                 stop_token: str | None = None):
+                 stop_token: str | None = None, config=None):
+        # The config this env was sized/built with. Kept-warm envs are reused
+        # across runs (and across cp.map -> cp.cloud), and callers read it back
+        # to decide reusability and to report resize drift -- so it must be set
+        # at construction, not patched on by one of the two provisioning paths.
+        self.config = config
         self._app = app
         self._sampler_cls = sampler_cls
         self._volume = volume
@@ -654,6 +676,11 @@ class ModalEnvironment(RemoteEnvironment):
         """Best-effort LRU prune: keep the N most recent payload-*.bin files
         in the same directory as ``payload_path``. Without this, every model
         edit accumulates a new payload until the user runs cleanup_volumes().
+
+        ``payload_path`` is the payload that was *just* uploaded and is never a
+        prune candidate: volume mtimes have one-second granularity, so a tie
+        could otherwise sort the fresh payload into the stale tail and delete
+        the file the next submit is about to load.
         """
         import logging
 
@@ -664,17 +691,21 @@ class ModalEnvironment(RemoteEnvironment):
             logging.getLogger(__name__).debug("listdir failed during prune: %s", exc)
             return
 
-        # Compare basenames: correct whether listdir entries are bare
-        # filenames or dir-prefixed paths (TODO(e2e): confirm which).
-        payloads = [
+        # Compare basenames: modal's FileEntry.path is the full path from the
+        # volume root, so strip the directory before matching.
+        keep_name = payload_path.split("/")[-1]
+        all_payloads = [
             e for e in entries
             if e.path.split("/")[-1].startswith("payload-") and e.path.endswith(".bin")
         ]
-        if len(payloads) <= _PAYLOAD_KEEP_PER_MODEL:
+        payloads = [e for e in all_payloads if e.path.split("/")[-1] != keep_name]
+        # When the kept payload is in the listing it occupies one of the N slots.
+        budget = _PAYLOAD_KEEP_PER_MODEL - (len(all_payloads) - len(payloads))
+        if len(payloads) <= budget:
             return
 
         payloads.sort(key=lambda e: getattr(e, "mtime", 0), reverse=True)
-        for stale in payloads[_PAYLOAD_KEEP_PER_MODEL:]:
+        for stale in payloads[budget:]:
             try:
                 name = stale.path.split("/")[-1]
                 _run_blocking(self._volume.remove_file, f"/{dir_path}/{name}")
@@ -747,12 +778,15 @@ class ModalBackend(ComputeBackend):
         endpoint for the in-notebook stop button even when the full ``dashboard``
         is off.
         """
+        import dataclasses
         import modal
         import uuid
 
         from cloudposterior.naming import model_slug as compute_model_slug
 
-        config.idle_timeout = idle_timeout
+        # Copy rather than mutate: the caller owns its RemoteConfig, and the
+        # copy is what gets stored on the env as the as-provisioned record.
+        config = dataclasses.replace(config, idle_timeout=idle_timeout)
         volume_name = f"cp-{project}"
         try:
             volume = _run_blocking(modal.Volume.from_name, volume_name, create_if_missing=True)
@@ -789,6 +823,7 @@ class ModalBackend(ComputeBackend):
             progress_fn=progress_fn,
             stop_fn=stop_fn,
             stop_token=stop_token,
+            config=config,
         )
 
     @staticmethod
