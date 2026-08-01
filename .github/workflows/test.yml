@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -13,8 +16,12 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # Run the locked dev-group ruff, not whatever `uvx` resolves today: an
+      # unpinned ruff turns a new upstream rule into a failure on an unrelated PR.
       - name: Lint with ruff
-        run: uvx ruff check cloudposterior/ tests/
+        run: |
+          uv sync --locked
+          uv run ruff check cloudposterior/ tests/
 
   test:
     runs-on: ubuntu-latest
@@ -46,7 +53,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --python ${{ matrix.python-version }}
+        run: uv sync --locked --python ${{ matrix.python-version }}
 
       # Pin pymc AND arviz per leg so each major is exercised deterministically
       # (an unpinned resolve drifts to the newest arviz for both legs).
