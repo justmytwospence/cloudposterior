@@ -50,10 +50,10 @@ jobs:
       # embedded dashboard HTML) before anything is uploaded -- versions on PyPI
       # are immutable, so a broken artifact would burn the version number.
       - name: Smoke test (wheel)
-        run: uv run --isolated --no-project --with dist/*.whl tests/smoke_test.py
+        run: uv run --isolated --no-project --with dist/*.whl scripts/smoke_test.py
 
       - name: Smoke test (source distribution)
-        run: uv run --isolated --no-project --with dist/*.tar.gz tests/smoke_test.py
+        run: uv run --isolated --no-project --with dist/*.tar.gz scripts/smoke_test.py
 
       # Trusted Publishing (OIDC) + automatic PEP 740 attestations. uv build does
       # not generate attestations, so the upload stays on the PyPA action (kept on

@@ -56,6 +56,16 @@ _STEP_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 # model -> (observed_data_fingerprint, structural cache identity)
 _MODEL_DIGEST_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
+# The real pm.* functions, captured the first time a block patches them.
+_TRUE_ORIGINALS: dict = {}
+
+
+def _true_original(name: str):
+    """The genuine PyMC function, even while a cp.cloud block has it patched."""
+    import pymc as pm
+
+    return _TRUE_ORIGINALS.get(name) or getattr(pm, name)
+
 
 def _forget_model_bytes(model) -> None:
     """Drop memoized serializations for a model (used when tearing down)."""
@@ -204,6 +214,10 @@ class cloud:
         with _PATCH_LOCK:
             for name in self._PATCHED_NAMES:
                 self._originals[name] = getattr(pm, name)
+                # Remember the genuine PyMC functions the first time we see
+                # them, so cp.sample() called from inside a block doesn't take
+                # an interceptor as its "original" and recurse.
+                _TRUE_ORIGINALS.setdefault(name, self._originals[name])
             pm.sample = self._make_intercepted_sample()
             pm.sample_prior_predictive = self._make_intercepted_predictive("prior")
             pm.sample_posterior_predictive = self._make_intercepted_predictive("posterior")
@@ -1062,11 +1076,11 @@ def _build_sinks(*, progress: bool, dashboard: bool = False, notify=False,
 
 def _show_link(url: str, label: str = "Link", show_qr: bool = False):
     """Display a URL with optional QR code."""
-    from cloudposterior.display import _emit_oneshot_html
-
     # HTML fragments for browser frontends (Jupyter + marimo). The SVG QR
     # renders in both; the terminal fallback prints an ASCII QR instead.
     import html as _html
+
+    from cloudposterior.display import _emit_oneshot_html
 
     safe_url = _html.escape(url, quote=True)
     parts = [
@@ -1555,8 +1569,6 @@ def sample(
     manager instead -- it keeps the container warm and only ships sample
     kwargs after the first call.
     """
-    import pymc as pm
-
     if nuts_sampler is None:
         nuts_sampler = _default_sampler(model, local=False)
 
@@ -1568,7 +1580,9 @@ def sample(
         instance=instance,
         nuts_sampler=nuts_sampler,
         progress=progress,
-        original_sample=pm.sample,
+        # Not pm.sample: inside a cp.cloud block that is the interceptor, and
+        # taking it as the "original" would recurse.
+        original_sample=_true_original("sample"),
         draws=draws,
         tune=tune,
         **({"chains": chains} if chains is not None else {}),
@@ -1643,8 +1657,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         _run_blocking,
     )
     from cloudposterior.cache import resolve_cache
-    from cloudposterior.naming import cache_key as compute_cache_key
-    from cloudposterior.naming import model_slug
+    from cloudposterior.naming import cache_key as compute_cache_key, model_slug
     from cloudposterior.serialize import (
         deserialize_inference_data,
         get_version_manifest,

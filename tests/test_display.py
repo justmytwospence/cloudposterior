@@ -28,9 +28,19 @@ def test_format_time_seconds_and_minutes():
     assert "m" in display._format_time(125.0)
 
 
+def _filled_px(html: str) -> int:
+    """Width of the inner (filled) bar."""
+    import re
+
+    return int(re.findall(r"width:(\d+)px", html)[-1])
+
+
 def test_bar_html_clamps_out_of_range_fractions():
-    for frac in (0.5, 2.0, -1.0):
-        assert "div" in display._bar_html(frac)
+    """Named for clamping but only asserted that a <div> came back, so it
+    passed for any implementation."""
+    assert _filled_px(display._bar_html(0.5, width_px=200)) == 100
+    assert _filled_px(display._bar_html(2.0, width_px=200)) == 200   # clamped high
+    assert _filled_px(display._bar_html(-1.0, width_px=200)) == 0    # clamped low
 
 
 def test_sampling_table_html_renders_rows():
@@ -47,21 +57,25 @@ def test_phase_html_status_icons():
     assert "&#10003;" in html and "&#10007;" in html
 
 
-def test_is_notebook_returns_bool():
-    assert isinstance(display._is_notebook(), bool)
-
-
-def test_is_marimo_returns_bool():
-    assert isinstance(display._is_marimo(), bool)
+def test_frontend_detection_is_false_under_plain_pytest():
+    """Tautological isinstance(..., bool) checks asserted nothing; under a
+    bare pytest run neither frontend is present."""
+    assert display._is_notebook() is False
+    assert display._is_marimo() is False
 
 
 # -- display backends -------------------------------------------------------
 
-def test_terminal_display_updates_without_error():
+def test_terminal_display_accumulates_phase_and_sampling_state():
     d = display.TerminalDisplay("Modal (auto-sized: 4 cores, 8GB)")
     d.show_phase(_phase("in_progress"))
     d.show_phase(_phase("done"))
-    d.show_sampling(_sampling(divergences=2))  # exercises table build + red coloring
+    d.show_sampling(_sampling(divergences=2))
+
+    assert d._sampling is not None
+    assert d._sampling.total_divergences == 2
+    # The phase is recorded once, updated in place rather than duplicated.
+    assert len([p for p in d._phases if p[1] == "sampling"]) == 1
 
 
 def test_notebook_display_updates_widget_html(monkeypatch):

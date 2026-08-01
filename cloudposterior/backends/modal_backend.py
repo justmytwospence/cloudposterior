@@ -19,7 +19,6 @@ from cloudposterior.progress import (
 )
 from cloudposterior.serialize import SamplingPayload
 
-
 # Keep the N most recent payload-*.bin files per model directory in the
 # Volume. Older payloads from past model edits are pruned on upload.
 _PAYLOAD_KEEP_PER_MODEL = 5
@@ -522,8 +521,8 @@ def _create_persistent_app(
         async def serve_stop(token: str = "", model: str = ""):
             import hmac
 
-            from fastapi.responses import JSONResponse
             import modal as _modal
+            from fastapi.responses import JSONResponse
             # Require the token baked into the page so a random caller who
             # finds the stop URL can't kill someone's sampling run.
             if not _stop_token or not hmac.compare_digest(token, _stop_token):
@@ -552,6 +551,7 @@ def _create_persistent_app(
                 import hmac
 
                 from fastapi.responses import HTMLResponse, JSONResponse
+
                 from cloudposterior.dashboard import render_dashboard_html
                 if not _stop_token or not hmac.compare_digest(token, _stop_token):
                     return JSONResponse({"error": "invalid token"}, status_code=403)
@@ -569,8 +569,8 @@ def _create_persistent_app(
                 # event loop, so blocking calls here would warn and stall it.
                 import hmac
 
-                from fastapi.responses import JSONResponse
                 import modal as _modal
+                from fastapi.responses import JSONResponse
                 # This returns parameter names and raw posterior draws, so it
                 # is gated on the same token as /stop.
                 if not _stop_token or not hmac.compare_digest(token, _stop_token):
@@ -925,8 +925,9 @@ class ModalBackend(ComputeBackend):
         is off.
         """
         import dataclasses
-        import modal
         import uuid
+
+        import modal
 
         from cloudposterior.naming import model_slug as compute_model_slug
 

@@ -2,10 +2,10 @@
 pipeline run locally (no Modal). These ops return InferenceData, so they ride
 the existing predictive blocking template."""
 
-import tempfile
-
 import numpy as np
 import pytest
+
+from cloudposterior._idata import group_names
 
 
 def _model():
@@ -74,21 +74,20 @@ def test_remote_compute_log_likelihood_requires_idata():
 
 # -- worker pipeline (no Modal) ---------------------------------------------
 
-def _serialize_model_to_file(model):
+def _serialize_model_to_file(model, tmp_path):
     from cloudposterior.serialize import serialize_model
 
-    f = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
-    f.write(serialize_model(model))
-    f.close()
-    return f.name
+    path = tmp_path / "payload.bin"
+    path.write_bytes(serialize_model(model))
+    return str(path)
 
 
-def test_run_smc_worker_pipeline():
+def test_run_smc_worker_pipeline(tmp_path):
     pytest.importorskip("pymc")
     from cloudposterior.remote.worker import run_smc
     from cloudposterior.serialize import deserialize_inference_data
 
-    path = _serialize_model_to_file(_model())
+    path = _serialize_model_to_file(_model(), tmp_path)
     idata = deserialize_inference_data(
         run_smc(path, {"draws": 60, "chains": 2, "progressbar": False, "random_seed": 0})
     )
@@ -97,7 +96,7 @@ def test_run_smc_worker_pipeline():
     assert "beta" in idata.sample_stats.data_vars
 
 
-def test_run_compute_log_likelihood_matches_native():
+def test_run_compute_log_likelihood_matches_native(tmp_path):
     pm = pytest.importorskip("pymc")
     from cloudposterior._idata import get_group
     from cloudposterior.remote.worker import run_compute_log_likelihood
@@ -107,7 +106,7 @@ def test_run_compute_log_likelihood_matches_native():
     )
 
     m = _model()
-    path = _serialize_model_to_file(m)
+    path = _serialize_model_to_file(m, tmp_path)
     with m:
         idata = pm.sample(draws=60, tune=60, chains=2, nuts_sampler="pymc",
                           progressbar=False, random_seed=0,
@@ -122,3 +121,40 @@ def test_run_compute_log_likelihood_matches_native():
     worker_ll = get_group(out, "log_likelihood")["y"].values
     native_ll = native["y"].values
     assert np.allclose(worker_ll, native_ll, atol=1e-8)
+
+
+def test_run_prior_predictive_worker_pipeline(tmp_path):
+    """Sibling of run_smc / run_compute_log_likelihood, previously untested."""
+    pytest.importorskip("pymc")
+    from cloudposterior.remote.worker import run_prior_predictive
+    from cloudposterior.serialize import deserialize_inference_data
+
+    path = _serialize_model_to_file(_model(), tmp_path)
+    idata = deserialize_inference_data(
+        run_prior_predictive(path, {"draws": 20, "random_seed": 0})
+    )
+    assert "prior" in group_names(idata)
+    assert {"mu", "sigma"} <= set(idata.prior.data_vars)
+
+
+def test_run_posterior_predictive_worker_pipeline(tmp_path):
+    pytest.importorskip("pymc")
+    import pymc as pm
+
+    from cloudposterior.remote.worker import run_posterior_predictive
+    from cloudposterior.serialize import (
+        deserialize_inference_data,
+        serialize_inference_data,
+    )
+
+    m = _model()
+    with m:
+        idata = pm.sample(draws=30, tune=30, chains=2, progressbar=False,
+                          random_seed=0, compute_convergence_checks=False)
+
+    path = _serialize_model_to_file(m, tmp_path)
+    out = deserialize_inference_data(run_posterior_predictive(
+        path, serialize_inference_data(idata), {"random_seed": 0},
+    ))
+    assert "posterior_predictive" in group_names(out)
+    assert "y" in out.posterior_predictive.data_vars

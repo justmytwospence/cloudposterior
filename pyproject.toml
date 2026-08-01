@@ -62,8 +62,45 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+# Only test_*.py: scripts/smoke_test.py is run against the built artifact by
+# the publish workflow, not collected here.
+python_files = ["test_*.py"]
 markers = [
     "modal: tests that hit Modal and incur cloud costs (skipped unless --run-modal)",
+]
+filterwarnings = [
+    "default",
+    # Our own deprecations should fail the suite rather than accumulate.
+    "error::DeprecationWarning:cloudposterior.*",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cloudposterior"]
+# Keep `from x import (a as b, c as d)` as one statement rather than splitting
+# it into one import per alias.
+combine-as-imports = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["cloudposterior"]
+
+# Hatchling's default sdist sweeps in examples/*.ipynb (~950 KB of embedded
+# outputs), uv.lock, .github/ and the docs sources.
+[tool.hatch.build.targets.sdist]
+include = [
+    "cloudposterior",
+    "tests",
+    "scripts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
 ]
 
 [dependency-groups]

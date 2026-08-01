@@ -15,7 +15,6 @@ from cloudposterior.progress import (
     decode_progress_event,
 )
 
-
 # -- progress decoding -------------------------------------------------------
 
 def test_partial_phase_payload_decodes_instead_of_raising():
@@ -167,8 +166,7 @@ def test_dashboard_sink_state_is_initialized_upfront():
 
 def test_build_sinks_falls_back_when_the_widget_cannot_be_built(monkeypatch):
     """anywidget is a hard dep, but a version skew must not take down the run."""
-    from cloudposterior import api
-    from cloudposterior import display as display_mod
+    from cloudposterior import api, display as display_mod
 
     monkeypatch.setattr(display_mod, "_is_notebook", lambda: True)
     monkeypatch.setattr(display_mod, "_is_marimo", lambda: False)

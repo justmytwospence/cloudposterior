@@ -20,11 +20,9 @@ def _posterior_idata(values):
 
 def _fake_modal(monkeypatch):
 
-    import cloudposterior.api as api
     from cloudposterior.backends import modal_backend as mb
     from cloudposterior.serialize import serialize_inference_data
 
-    api._LIVE_ENVS.clear()  # avoid warm-env leakage across tests
     state = {
         "captured": [], "spawned": [], "envs": [], "provision_kwargs": [],
         "sizes": [], "gpus": [], "cancelled": [], "fail_get": False,

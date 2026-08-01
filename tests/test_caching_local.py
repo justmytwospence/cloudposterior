@@ -7,7 +7,6 @@ few seconds each but cost nothing.
 
 import numpy as np
 import pymc as pm
-import pytest
 
 import cloudposterior as cp
 from cloudposterior.cache import _default_memory_cache
@@ -73,15 +72,6 @@ def _make_radon_slopes():
         sigma_y = pm.HalfNormal("sigma_y", 2)
         pm.Normal("obs", mu=mu, sigma=sigma_y, observed=log_radon)
     return model
-
-
-@pytest.fixture(autouse=True)
-def _clear_default_memory_cache():
-    """Each test starts with a clean in-memory cache so prior tests don't
-    accidentally serve cached idata."""
-    _default_memory_cache._store.clear()
-    yield
-    _default_memory_cache._store.clear()
 
 
 def _mu_a(idata):

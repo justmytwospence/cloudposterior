@@ -1,9 +1,10 @@
 """Test progress tracking with a real PyMC model."""
 
+from queue import Queue
+
 import numpy as np
 import pymc as pm
 
-from queue import Queue
 from cloudposterior.progress import make_sampling_callback
 
 
@@ -42,9 +43,7 @@ def test_progress_callback_captures_draws():
     assert chain_id == 0
     assert last_progress.draw > 0
     assert last_progress.draws_per_sec > 0
-    print(f"Captured {len(events)} progress events")
-    print(f"Final: draw={last_progress.draw}, phase={last_progress.phase}, "
-          f"dps={last_progress.draws_per_sec:.1f}")
+    assert last_progress.phase in ("tuning", "sampling")
 
 
 def test_decode_progress_event_round_trips_each_type():

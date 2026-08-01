@@ -24,7 +24,6 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Protocol
 
-
 _MAX_LABEL_LEN = 80
 _DISK_KEEP_PER_MODEL = 20
 

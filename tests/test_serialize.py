@@ -67,7 +67,6 @@ def test_create_payload():
 
     size = payload_size_mb(payload)
     assert size > 0
-    print(f"Payload size: {size:.2f} MB")
 
 
 def test_deserialized_model_can_sample():
@@ -91,6 +90,7 @@ def test_deserialize_inference_data_is_eagerly_loaded(tmp_path, monkeypatch):
     """The temp NetCDF file is deleted on return, so every group must be
     eagerly loaded -- a lazy idata would fail when xarray's file manager
     reopens the deleted path."""
+    import arviz as az
     import numpy as np
 
     from cloudposterior._idata import add_group, group_names
@@ -98,7 +98,6 @@ def test_deserialize_inference_data_is_eagerly_loaded(tmp_path, monkeypatch):
         deserialize_inference_data,
         serialize_inference_data,
     )
-    import arviz as az
 
     idata = az.InferenceData()
     add_group(idata, "posterior", az.dict_to_dataset({"mu": np.random.randn(2, 50)}))

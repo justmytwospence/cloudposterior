@@ -8,8 +8,8 @@ var_names became output-only, and a backend= kwarg appeared.
 import pymc as pm
 import pytest
 
-from cloudposterior.api import _validate_sample_kwargs, resolve_tune
 from cloudposterior._idata import pymc_major
+from cloudposterior.api import _validate_sample_kwargs, resolve_tune
 
 PYMC6 = pymc_major() >= 6
 

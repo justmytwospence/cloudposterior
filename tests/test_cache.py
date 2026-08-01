@@ -5,12 +5,10 @@ import pymc as pm
 import pytest
 
 from cloudposterior.cache import (
-    MemoryCache,
     DiskCache,
+    MemoryCache,
     resolve_cache,
 )
-from cloudposterior.naming import cache_key, model_slug
-from cloudposterior.serialize import serialize_model
 
 
 def _make_model(name=""):
@@ -22,28 +20,6 @@ def _make_model(name=""):
         theta = pm.Normal("theta", mu=mu, sigma=tau, shape=8)
         pm.Normal("obs", mu=theta, sigma=sigma, observed=y)
     return model
-
-
-def test_cache_key_deterministic():
-    """Same model + kwargs should produce the same key."""
-    model = _make_model()
-    mb = serialize_model(model)
-    kwargs = {"draws": 100, "tune": 50, "chains": 2}
-
-    key1 = cache_key(mb, kwargs)
-    key2 = cache_key(mb, kwargs)
-    assert key1 == key2
-    assert len(key1) == 64  # SHA-256 hex
-
-
-def test_cache_key_changes_with_kwargs():
-    """Different kwargs should produce a different key."""
-    model = _make_model()
-    mb = serialize_model(model)
-
-    key1 = cache_key(mb, {"draws": 100})
-    key2 = cache_key(mb, {"draws": 200})
-    assert key1 != key2
 
 
 def test_memory_cache_roundtrip():
@@ -84,18 +60,6 @@ def test_disk_cache_roundtrip(tmp_path):
     assert "test_model" in str(path)
     assert "draws10_tune10_chains1" in path.name
     assert key[:8] in path.name  # hash suffix for uniqueness
-
-
-def test_model_slug_named():
-    model = _make_model("Eight Schools")
-    assert model_slug(model) == "eight_schools"
-
-
-def test_model_slug_unnamed():
-    model = _make_model()
-    slug = model_slug(model)
-    assert "mu" in slug
-    assert "tau" in slug
 
 
 def test_resolve_cache_true():

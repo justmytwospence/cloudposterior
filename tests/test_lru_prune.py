@@ -9,8 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from cloudposterior.backends.modal_backend import (
-    ModalEnvironment,
     _PAYLOAD_KEEP_PER_MODEL,
+    ModalEnvironment,
 )
 
 

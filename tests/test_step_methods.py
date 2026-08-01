@@ -46,10 +46,10 @@ def test_combined_payload_samples_with_step_through_worker():
     and confirm it samples with the Metropolis step (no graph-identity error)."""
     pytest.importorskip("pymc")
     import msgpack
+    import pymc as pm
 
     from cloudposterior.remote.worker import run_sampling
     from cloudposterior.serialize import serialize_model_with_step
-    import pymc as pm
 
     m = _model()
     with m:

@@ -19,7 +19,6 @@ import pytest
 
 import cloudposterior as cp
 
-
 pytestmark = pytest.mark.modal
 
 
@@ -100,11 +99,10 @@ def test_remote_cache_hit_skips_modal_call(isolated_project):
 
 
 def test_persistent_container_reuses_warm_vm(isolated_project):
-    """Two pm.sample calls in the same cp.cloud block should reuse the same
-    warm container. The second call has no provisioning or upload cost, so
-    it should finish substantially faster than the first."""
+    """Two pm.sample calls in the same cp.cloud block reuse the same warm
+    container, so the second pays no provisioning or upload cost."""
     model = _tiny_model()
-    with cp.cloud(
+    session = cp.cloud(
         model,
         remote=True,
         cache=False,
@@ -112,16 +110,17 @@ def test_persistent_container_reuses_warm_vm(isolated_project):
         progress=False,
         dashboard=False,
         project=isolated_project,
-    ):
-        t0 = time.time()
+    )
+    with session:
         pm.sample(draws=20, tune=20, chains=2, random_seed=1, progressbar=False)
-        first = time.time() - t0
+        env_after_first = session._env
 
         t0 = time.time()
         pm.sample(draws=20, tune=20, chains=2, random_seed=2, progressbar=False)
         second = time.time() - t0
 
-    assert second < first, (
-        f"warm-container reuse should be faster than cold start: "
-        f"first={first:.1f}s, second={second:.1f}s"
-    )
+    # Assert reuse structurally rather than on wall-clock: network and
+    # scheduler variance can invert a timing comparison even when the
+    # container was genuinely reused.
+    assert session._env is env_after_first, "second run should reuse the warm env"
+    assert second < 120, f"warm re-run took {second:.1f}s; container was not warm"

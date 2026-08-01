@@ -20,12 +20,11 @@ def main() -> None:
 
     # The worker ships inside the wheel; Modal loads it remotely, so if the build
     # drops it, remote sampling breaks only in production. Fail here instead.
-    import cloudposterior.remote.worker  # noqa: F401
-
     # End-to-end local path: trivial model, a few draws, no cloud/progress UI.
     import numpy as np
     import pymc as pm
 
+    import cloudposterior.remote.worker  # noqa: F401
     from cloudposterior._idata import group_names
 
     rng = np.random.default_rng(0)
@@ -41,6 +40,15 @@ def main() -> None:
         )
 
     assert "posterior" in group_names(idata), "no posterior group in the result"
+
+    # Bundled non-Python files must actually ship in the artifact.
+    from importlib.resources import files
+
+    pkg = files("cloudposterior")
+    assert pkg.joinpath("py.typed").is_file(), "py.typed missing from the artifact"
+    assert pkg.joinpath("static", "uPlot.iife.min.js").is_file(), (
+        "vendored dashboard assets missing from the artifact"
+    )
     print("smoke test OK")
 
 

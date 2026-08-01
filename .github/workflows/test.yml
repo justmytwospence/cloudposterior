@@ -68,3 +68,9 @@ jobs:
               --with "pymc>=5,<6" --with "arviz>=0.18,<1.0" --with "nutpie>=0.13" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           fi
+
+      # Fail loudly on a coverage regression rather than printing a number
+      # into the log that nobody reads. Raise the floor as coverage improves.
+      - name: Enforce coverage floor
+        if: matrix.python-version == '3.13' && matrix.pymc == '6'
+        run: uv run coverage report --fail-under=70

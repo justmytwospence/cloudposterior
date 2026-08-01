@@ -1,6 +1,7 @@
 """Unit tests for the client-side worker-stream decoder (no Modal needed)."""
 
 import msgpack
+import pytest
 
 from cloudposterior.backends.modal_backend import _stream_events
 from cloudposterior.progress import PhaseUpdate
@@ -57,9 +58,5 @@ def test_stream_events_reraises_worker_error():
                              "elapsed": 0.0})
         raise RuntimeError("worker exploded")
 
-    try:
+    with pytest.raises(RuntimeError, match="worker exploded"):
         _drive(gen())
-    except RuntimeError as exc:
-        assert "worker exploded" in str(exc)
-    else:
-        raise AssertionError("expected the worker error to re-raise")

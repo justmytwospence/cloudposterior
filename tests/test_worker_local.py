@@ -5,8 +5,8 @@ import numpy as np
 import pymc as pm
 import pytest
 
-from cloudposterior.serialize import create_payload
 from cloudposterior.remote.worker import run_sampling
+from cloudposterior.serialize import create_payload
 
 
 def test_worker_end_to_end():
@@ -32,19 +32,24 @@ def test_worker_end_to_end():
         try:
             decoded = msgpack.unpackb(chunk, raw=False)
             events.append(decoded)
-            print(f"  Event: {decoded.get('type')} - {decoded.get('phase', decoded.get('elapsed', ''))}")
         except Exception:
             # Final chunk is compressed InferenceData
             idata_bytes = chunk
-            print(f"  InferenceData: {len(chunk)} bytes")
 
     # Verify we got phase events
     phase_events = [e for e in events if e.get("type") == "phase"]
     assert len(phase_events) >= 2, f"Expected phase events, got {len(phase_events)}"
 
-    # Verify we got sampling progress
+    # Verify per-draw progress actually streamed -- the point of the worker.
     sampling_events = [e for e in events if e.get("type") == "sampling"]
-    print(f"  Got {len(sampling_events)} sampling progress snapshots")
+    assert sampling_events, "expected per-draw sampling progress events"
+    draws_seen = [
+        max(int(c["draw"]) for c in e["chains"].values())
+        for e in sampling_events
+        if e.get("chains")
+    ]
+    assert draws_seen == sorted(draws_seen), "draw counts must not go backwards"
+    assert draws_seen[-1] > 0
 
     # Verify we got the result metadata
     result_events = [e for e in events if e.get("type") == "result"]
@@ -52,8 +57,9 @@ def test_worker_end_to_end():
 
     # Verify InferenceData can be deserialized
     assert idata_bytes is not None
-    import arviz as az
     import io
+
+    import arviz as az
     import lz4.frame
 
     raw = lz4.frame.decompress(idata_bytes)
@@ -62,7 +68,6 @@ def test_worker_end_to_end():
 
     assert "posterior" in group_names(idata)
     assert "mu" in idata.posterior.data_vars
-    print(f"  Posterior shape: {dict(idata.posterior.sizes)}")
 
 
 def test_run_sampling_blocking_writes_dashboard_progress(monkeypatch):
