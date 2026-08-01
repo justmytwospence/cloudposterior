@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from cloudposterior.backends.modal_backend import _build_pip_specs
 from cloudposterior.config import RemoteConfig
 
@@ -50,7 +52,7 @@ def test_create_modal_app_threads_nuts_sampler(monkeypatch):
         def uv_pip_install(self, specs):
             return self
 
-        def add_local_python_source(self, name):
+        def add_local_python_source(self, name, ignore=None):
             return self
 
     class FakeApp:
@@ -68,3 +70,33 @@ def test_create_modal_app_threads_nuts_sampler(monkeypatch):
         mb._create_modal_app(_manifest(), RemoteConfig(), "numpyro")
 
     assert captured["nuts_sampler"] == "numpyro"
+
+
+def test_image_includes_package_data_files():
+    """Modal's add_local_python_source ships only .py files by default, so the
+    dashboard's vendored uPlot assets never reached the container and rendering
+    the page 500'd. Both image builders must override that."""
+    import inspect
+
+    from cloudposterior.backends import modal_backend as mb
+
+    for fn in (mb._build_image, mb._create_modal_app):
+        src = inspect.getsource(fn)
+        assert "add_local_python_source" in src, fn.__name__
+        assert "ignore=[]" in src, (
+            f"{fn.__name__} must pass ignore=[] so cloudposterior/static/ ships"
+        )
+
+
+def test_static_assets_are_importable_as_package_data():
+    from cloudposterior.dashboard import _static
+
+    assert "uPlot" in _static("uPlot.iife.min.js")
+    assert "uplot" in _static("uPlot.min.css").lower()
+
+
+def test_missing_static_asset_reports_the_likely_cause():
+    from cloudposterior.dashboard import _static
+
+    with pytest.raises(RuntimeError, match="missing from this environment"):
+        _static("does-not-exist.js")

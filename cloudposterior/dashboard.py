@@ -150,7 +150,17 @@ def _static(name: str) -> str:
     """
     from importlib.resources import files
 
-    return files("cloudposterior").joinpath("static", name).read_text(encoding="utf-8")
+    asset = files("cloudposterior").joinpath("static", name)
+    try:
+        return asset.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError) as exc:
+        # Most likely cause is a container image built without the package's
+        # data files (Modal's add_local_python_source ships only .py by
+        # default), which is otherwise an opaque 500 from the endpoint.
+        raise RuntimeError(
+            f"vendored dashboard asset {name!r} is missing from this "
+            "environment; the image must include cloudposterior/static/"
+        ) from exc
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>

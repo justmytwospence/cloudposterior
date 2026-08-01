@@ -205,7 +205,10 @@ def _create_modal_app(manifest: dict[str, str], config: RemoteConfig,
     image = (
         modal.Image.debian_slim(python_version=py_major_minor)
         .uv_pip_install(pip_specs)
-        .add_local_python_source("cloudposterior")
+        # ignore=[] overrides the default "only .py files": the dashboard's
+        # vendored uPlot assets under cloudposterior/static/ must ship too, or
+        # rendering the page raises in the container.
+        .add_local_python_source("cloudposterior", ignore=[])
     )
 
     app = modal.App("cloudposterior")
@@ -405,7 +408,10 @@ def _build_image(manifest: dict[str, str], gpu: str | None = None,
     return (
         modal.Image.debian_slim(python_version=py_major_minor)
         .uv_pip_install(pip_specs)
-        .add_local_python_source("cloudposterior")
+        # ignore=[] overrides the default "only .py files": the dashboard's
+        # vendored uPlot assets under cloudposterior/static/ must ship too, or
+        # rendering the page raises in the container.
+        .add_local_python_source("cloudposterior", ignore=[])
     )
 
 
