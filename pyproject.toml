@@ -5,14 +5,16 @@ description = "Run PyMC MCMC sampling on cloud VMs with one line of code. Cachin
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Spencer Boucher" },
 ]
 keywords = ["pymc", "mcmc", "bayesian", "cloud", "modal", "sampling"]
+# No "License ::" classifier: PEP 639 makes it mutually exclusive with the
+# license expression above, and PyPI rejects uploads that carry both.
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
