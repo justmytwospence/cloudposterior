@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+import weakref
 from typing import TYPE_CHECKING
 
 import arviz as az
@@ -38,7 +40,25 @@ def _detect_project_name() -> str:
 # container (Modal's scaledown_window idles it out, ~20 min). Keyed by
 # (project, model_slug). Torn down by cp.cleanup_volumes(), cloud.destroy(), or
 # atexit on interpreter/kernel shutdown.
-_LIVE_ENVS: dict = {}
+_LIVE_ENVS: "dict[tuple[str, str], object]" = {}
+
+# Guards _LIVE_ENVS and the pm.* monkeypatch, both of which are process-global.
+_PATCH_LOCK = threading.Lock()
+
+# Serialized-model memos. Keyed weakly so a model the user drops is not pinned
+# in memory, and stored here rather than as attributes on the model itself --
+# see _ensure_model_bytes for why an attribute would be actively harmful.
+# model -> (observed_data_fingerprint, model_bytes)
+_MODEL_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+# step -> ((id(model), observed_data_fingerprint), combined_model_step_bytes)
+_STEP_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _forget_model_bytes(model) -> None:
+    """Drop memoized serializations for a model (used when tearing down)."""
+    _MODEL_BYTES_CACHE.pop(model, None)
+    for step in [s for s, v in _STEP_BYTES_CACHE.items() if v[0][0] == id(model)]:
+        _STEP_BYTES_CACHE.pop(step, None)
 
 
 def _env_key(project: str, model) -> tuple:
@@ -149,31 +169,71 @@ class cloud:
         self._originals: dict[str, object] = {}
         self._env = None
         self._model_bytes: bytes | None = None
+        self._entered = False
+        self._patched_sample = None
+
+    # The five pm.* functions this block swaps out. Patching is process-global,
+    # so entry/exit is guarded and strictly non-reentrant: re-entering the same
+    # instance would capture the interceptors as the "originals", leaving
+    # pm.sample patched after exit and recursing into itself forever.
+    _PATCHED_NAMES = (
+        "sample",
+        "sample_prior_predictive",
+        "sample_posterior_predictive",
+        "sample_smc",
+        "compute_log_likelihood",
+    )
+
+    def _restore(self, pm) -> None:
+        for name in self._PATCHED_NAMES:
+            if name in self._originals:
+                setattr(pm, name, self._originals[name])
 
     def __enter__(self):
         import pymc as pm
 
-        self._originals["sample"] = pm.sample
-        self._originals["sample_prior_predictive"] = pm.sample_prior_predictive
-        self._originals["sample_posterior_predictive"] = pm.sample_posterior_predictive
-        self._originals["sample_smc"] = pm.sample_smc
-        self._originals["compute_log_likelihood"] = pm.compute_log_likelihood
-        pm.sample = self._make_intercepted_sample()
-        pm.sample_prior_predictive = self._make_intercepted_predictive("prior")
-        pm.sample_posterior_predictive = self._make_intercepted_predictive("posterior")
-        pm.sample_smc = self._make_intercepted_smc()
-        pm.compute_log_likelihood = self._make_intercepted_cll()
-        self.model.__enter__()
+        if self._entered:
+            raise RuntimeError(
+                "cp.cloud(...) is not reentrant -- this block is already "
+                "active. Create a separate cp.cloud(...) instance instead."
+            )
+        self._entered = True
+        with _PATCH_LOCK:
+            for name in self._PATCHED_NAMES:
+                self._originals[name] = getattr(pm, name)
+            pm.sample = self._make_intercepted_sample()
+            pm.sample_prior_predictive = self._make_intercepted_predictive("prior")
+            pm.sample_posterior_predictive = self._make_intercepted_predictive("posterior")
+            pm.sample_smc = self._make_intercepted_smc()
+            pm.compute_log_likelihood = self._make_intercepted_cll()
+            # Identity marker so __exit__ can detect out-of-order teardown.
+            self._patched_sample = pm.sample
+        try:
+            self.model.__enter__()
+        except BaseException:
+            # Entering the model context failed, so __exit__ will never run --
+            # unpatch here or PyMC stays intercepted for the whole process.
+            with _PATCH_LOCK:
+                self._restore(pm)
+            self._entered = False
+            raise
         return self.model
 
     def __exit__(self, *exc):
         import pymc as pm
 
-        pm.sample = self._originals["sample"]
-        pm.sample_prior_predictive = self._originals["sample_prior_predictive"]
-        pm.sample_posterior_predictive = self._originals["sample_posterior_predictive"]
-        pm.sample_smc = self._originals["sample_smc"]
-        pm.compute_log_likelihood = self._originals["compute_log_likelihood"]
+        with _PATCH_LOCK:
+            if pm.sample is not self._patched_sample:
+                import warnings
+
+                warnings.warn(
+                    "cp.cloud(...) blocks were exited out of order; restoring "
+                    "the original PyMC functions anyway. Nested blocks must be "
+                    "exited innermost-first.",
+                    stacklevel=2,
+                )
+            self._restore(pm)
+        self._entered = False
         # Leave the remote env warm (kept in _LIVE_ENVS) so the dashboard stays
         # browsable and a repeat run reuses the container. Stopped by
         # cp.cleanup_volumes(), session.destroy(), or atexit on shutdown.
@@ -253,30 +313,7 @@ class cloud:
         ctx = self
 
         def intercepted_sample(**kwargs):
-            # A pm.sample() call that targets a *different* model than the one
-            # this cp.cloud(...) block wraps (an explicit model= kwarg, or an
-            # inner `with other_model:` context) must not be intercepted --
-            # we'd silently sample the wrapped model instead. Fall back to
-            # native PyMC for that call.
-            target_model = kwargs.get("model")
-            if target_model is None:
-                try:
-                    import pymc as pm
-
-                    target_model = pm.modelcontext(None)
-                except Exception:
-                    target_model = None
-            if target_model is not None and target_model is not ctx.model:
-                import warnings
-
-                warnings.warn(
-                    "pm.sample() inside cp.cloud(...) targets a different "
-                    "model than the one the block wraps; running it with "
-                    "native PyMC (no cloud execution or caching) for this "
-                    "call. Wrap that model in its own cp.cloud(...) block "
-                    "to run it remotely.",
-                    stacklevel=2,
-                )
+            if not _call_targets_ctx_model(ctx, kwargs, "pm.sample()"):
                 return ctx._originals["sample"](**kwargs)
             # The target is the wrapped model -- drop a redundant model= kwarg
             # so it doesn't leak into cache keys or the remote payload.
@@ -317,23 +354,16 @@ class cloud:
                     kwargs["until"] = ctx.until
 
             # Lazy first-touch serialization: pay the cloudpickle cost only
-            # when we actually need it. Memoize on the model so repeat calls
-            # in the same session don't re-serialize.
-            if ctx._model_bytes is None:
-                ctx._model_bytes = _ensure_model_bytes(ctx.model)
-            else:
-                _warn_if_model_data_changed(ctx)
+            # when we actually need it. Memoized, and re-done automatically if
+            # the observed data changed since the last call.
+            ctx._model_bytes = _ensure_model_bytes(ctx.model)
 
             # Remote step= rides as a combined {model, step} payload so the
             # step's value variables stay identity-linked to the model the
             # worker deserializes (a separately-pickled step would not match).
             call_model_bytes = ctx._model_bytes
             if ctx.remote and has_step:
-                from cloudposterior.serialize import serialize_model_with_step
-
-                call_model_bytes = serialize_model_with_step(
-                    ctx.model, kwargs.pop("step")
-                )
+                call_model_bytes = _ensure_step_bytes(ctx.model, kwargs.pop("step"))
 
             if ctx.remote:
                 # Check the cache BEFORE provisioning: a hit must not create
@@ -396,11 +426,13 @@ class cloud:
         )
 
         def intercepted_predictive(*args, **kwargs):
-            if not ctx.remote:
+            if not ctx.remote or not _call_targets_ctx_model(
+                ctx, kwargs, f"pm.{orig_key}()"
+            ):
                 return ctx._originals[orig_key](*args, **kwargs)
+            kwargs.pop("model", None)
 
-            if ctx._model_bytes is None:
-                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            ctx._model_bytes = _ensure_model_bytes(ctx.model)
             if ctx._env is None:
                 ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
 
@@ -442,13 +474,15 @@ class cloud:
         ctx = self
 
         def intercepted_smc(draws=2000, **kwargs):
-            if not ctx.remote:
+            if not ctx.remote or not _call_targets_ctx_model(
+                ctx, kwargs, "pm.sample_smc()"
+            ):
                 return ctx._originals["sample_smc"](draws, **kwargs)
+            kwargs.pop("model", None)
 
             kwargs["draws"] = draws
             _validate_sample_kwargs(kwargs)
-            if ctx._model_bytes is None:
-                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            ctx._model_bytes = _ensure_model_bytes(ctx.model)
             if ctx._env is None:
                 ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
             return _run_smc(ctx, kwargs)
@@ -466,14 +500,16 @@ class cloud:
         ctx = self
 
         def intercepted_cll(idata=None, **kwargs):
-            if not ctx.remote:
+            if not ctx.remote or not _call_targets_ctx_model(
+                ctx, kwargs, "pm.compute_log_likelihood()"
+            ):
                 return ctx._originals["compute_log_likelihood"](idata, **kwargs)
+            kwargs.pop("model", None)
             if idata is None:
                 raise TypeError(
                     "compute_log_likelihood() missing required argument: 'idata'"
                 )
-            if ctx._model_bytes is None:
-                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+            ctx._model_bytes = _ensure_model_bytes(ctx.model)
             if ctx._env is None:
                 ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
 
@@ -496,19 +532,79 @@ class cloud:
         return intercepted_cll
 
 
+def _call_targets_ctx_model(ctx, kwargs: dict, what: str) -> bool:
+    """Whether an intercepted PyMC call actually targets the wrapped model.
+
+    A call that names a *different* model (an explicit ``model=`` kwarg, or an
+    inner ``with other_model:`` context) must not be intercepted -- we would
+    silently run the wrapped model instead and hand back results for the wrong
+    model. Warn and let the caller fall back to native PyMC.
+    """
+    target_model = kwargs.get("model")
+    if target_model is None:
+        try:
+            import pymc as pm
+
+            target_model = pm.modelcontext(None)
+        except Exception:
+            target_model = None
+    if target_model is not None and target_model is not ctx.model:
+        import warnings
+
+        warnings.warn(
+            f"{what} inside cp.cloud(...) targets a different model than the "
+            "one the block wraps; running it with native PyMC (no cloud "
+            "execution or caching) for this call. Wrap that model in its own "
+            "cp.cloud(...) block to run it remotely.",
+            stacklevel=3,
+        )
+        return False
+    return True
+
+
 def _ensure_model_bytes(model) -> bytes:
-    """Serialize a model once and memoize the bytes on the model object.
+    """Serialize a model once and memoize the bytes, keyed by observed data.
 
     pm.sample() mutates the model in place (compiled functions, etc.), which
-    would change the cloudpickle output. Serializing once before the first
-    sample and reusing across calls keeps the cache key stable.
+    would change the cloudpickle output. Serializing once and reusing across
+    calls keeps the cache key stable.
+
+    The memo lives in a module-level WeakKeyDictionary rather than on the model
+    object: an attribute would be swept into the next cloudpickle (embedding the
+    previous payload inside the new one), and it would outlive the data it was
+    built from. Re-serializing when the observed-data fingerprint changes is
+    what makes a post-``pm.set_data`` run produce the right bytes -- and the
+    right cache key -- instead of silently reusing pre-mutation state.
     """
     from cloudposterior.serialize import serialize_model
 
-    if not hasattr(model, "_cp_model_bytes"):
-        model._cp_model_bytes = serialize_model(model)
-        model._cp_data_fp = _observed_data_fingerprint(model)
-    return model._cp_model_bytes
+    fp = _observed_data_fingerprint(model)
+    cached = _MODEL_BYTES_CACHE.get(model)
+    if cached is not None and cached[0] == fp:
+        return cached[1]
+    blob = serialize_model(model)
+    _MODEL_BYTES_CACHE[model] = (fp, blob)
+    return blob
+
+
+def _ensure_step_bytes(model, step) -> bytes:
+    """Serialize a combined ``{model, step}`` payload, memoized per step object.
+
+    A separately-pickled step resolves its value variables against a different
+    graph than the worker's model, so the two must ship in one blob (see
+    ``serialize_model_with_step``). Memoizing on the step instance keeps repeat
+    calls from re-pickling the whole model -- which would also mint a fresh
+    payload hash and churn the remote Volume's prune window on every call.
+    """
+    from cloudposterior.serialize import serialize_model_with_step
+
+    fp = _observed_data_fingerprint(model)
+    cached = _STEP_BYTES_CACHE.get(step)
+    if cached is not None and cached[0] == (id(model), fp):
+        return cached[1]
+    blob = serialize_model_with_step(model, step)
+    _STEP_BYTES_CACHE[step] = ((id(model), fp), blob)
+    return blob
 
 
 def _has_discrete_free_rvs(model) -> bool:
@@ -581,9 +677,9 @@ def _warn_remote_sample_fidelity(kwargs: dict) -> None:
 def _observed_data_fingerprint(model):
     """Best-effort fingerprint of the model's mutable (``pm.Data``) arrays.
 
-    The model is cloudpickled once on the first ``pm.sample`` call; if the user
-    mutates observed data (e.g. ``pm.set_data``) mid-block, the stale bytes are
-    reused. This lets us warn instead of silently returning the wrong cache hit.
+    Drives memo invalidation in ``_ensure_model_bytes``: when this changes, the
+    model is re-serialized so a ``pm.set_data`` mutation reaches the worker and
+    produces a distinct cache key instead of silently reusing stale bytes.
     """
     try:
         import numpy as np
@@ -600,24 +696,6 @@ def _observed_data_fingerprint(model):
         return fp
     except Exception:
         return None
-
-
-def _warn_if_model_data_changed(ctx) -> None:
-    """Warn if the model's mutable data changed after the model was serialized."""
-    stored = getattr(ctx.model, "_cp_data_fp", None)
-    if stored is None:
-        return
-    current = _observed_data_fingerprint(ctx.model)
-    if current is not None and current != stored:
-        import warnings
-
-        warnings.warn(
-            "The model's observed/mutable data changed after the first pm.sample() "
-            "call in this cp.cloud(...) block. The model is serialized once per block, "
-            "so this change is ignored remotely and the cache key is unchanged. Start a "
-            "new cp.cloud(...) block to sample the updated data.",
-            stacklevel=3,
-        )
 
 
 def _warn_if_resize_drift(ctx, nuts_sampler: str, sample_kwargs: dict) -> None:
@@ -1067,7 +1145,7 @@ def _run_sample_persistent(
 
     # Read the actually-provisioned config from the env so the
     # displayed instance description matches what's running (no recomputation drift).
-    config = env.config
+    config = getattr(env, "config", None) or RemoteConfig()
     instance_desc = f"Modal ({config.describe()})"
 
     # Start the app early when control infra (dashboard or stop button) exists,
@@ -1256,15 +1334,19 @@ def _run_local(
         progress_thread = thread_cls(target=stream_progress, daemon=True)
         progress_thread.start()
 
-        with model:
-            idata = original_sample(
-                callback=callback,
-                **sampler_kwargs,
-                **sample_kwargs,
-            )
-
-        aggregator.stop()
-        progress_thread.join(timeout=2)
+        try:
+            with model:
+                idata = original_sample(
+                    callback=callback,
+                    **sampler_kwargs,
+                    **sample_kwargs,
+                )
+        finally:
+            # On a sampling error these would otherwise never run, leaving the
+            # aggregator blocked on its queue and the thread alive for the
+            # rest of the session.
+            aggregator.stop()
+            progress_thread.join(timeout=2)
     else:
         with model:
             idata = original_sample(**sampler_kwargs, **sample_kwargs)
@@ -1531,6 +1613,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
             pass
 
     teardown = True
+    calls: list = []
     try:
         env._ensure_running()
 
@@ -1572,7 +1655,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         # .get() result fetch below is already wrapped. with_options sizes each
         # spawned container to its model (cpu/memory); the image/Volume/gpu are
         # shared. Each worker writes its own progress and honors global/per-model stop.
-        calls = [
+        calls[:] = [
             _run_blocking(
                 env._sampler_cls.with_options(cpu=cfg.cpu, memory=cfg.memory)()
                 .sample_blocking.spawn,
@@ -1604,9 +1687,23 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
                     previous.teardown()
                 except Exception:
                     pass
-            _LIVE_ENVS[key] = env
+            # A later cp.cloud run reusing this env reads env.config back (for
+            # reuse checks and resize-drift reporting), so it must be recorded
+            # here too -- not only on the cp.cloud provisioning path.
+            if getattr(env, "config", None) is None:
+                env.config = base_config
+            with _PATCH_LOCK:
+                _LIVE_ENVS[key] = env
             teardown = False
         return results
+    except BaseException:
+        # Don't leave the other spawned containers billing after a failure.
+        for call in calls:
+            try:
+                call.cancel()
+            except Exception:
+                pass
+        raise
     finally:
         if teardown:
             env.teardown()

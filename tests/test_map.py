@@ -25,7 +25,10 @@ def _fake_modal(monkeypatch):
     from cloudposterior.serialize import serialize_inference_data
 
     api._LIVE_ENVS.clear()  # avoid warm-env leakage across tests
-    state = {"captured": [], "spawned": [], "envs": [], "provision_kwargs": [], "sizes": []}
+    state = {
+        "captured": [], "spawned": [], "envs": [], "provision_kwargs": [],
+        "sizes": [], "cancelled": [], "fail_get": False,
+    }
     counter = {"i": 0}
 
     class FakeCall:
@@ -33,11 +36,16 @@ def _fake_modal(monkeypatch):
             self._tag = tag
 
         def get(self):
+            if state["fail_get"]:
+                raise RuntimeError("worker died")
             state["captured"].append(self._tag)
             # tag each result by spawn order so the caller can verify ordering
             return serialize_inference_data(
                 _posterior_idata({"x": np.full((2, 5), float(self._tag))})
             )
+
+        def cancel(self):
+            state["cancelled"].append(self._tag)
 
     class FakeMethod:
         def spawn(self, payload_path, kw, sampler, progress_dict_name=None,
@@ -163,6 +171,37 @@ def test_cp_map_dashboard_on_by_default(monkeypatch):
     # kept warm (not torn down) so the dashboard stays browsable
     assert env.torn_down is False
     assert env in api._LIVE_ENVS.values()
+
+
+def test_cp_map_kept_warm_env_carries_its_config(monkeypatch):
+    """A cp.map env is reused by a later cp.cloud run, which reads env.config
+    back to size its display and check reusability -- so the map path has to
+    record it too, not just the cp.cloud provisioning path."""
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+    import cloudposterior.api as api
+    from cloudposterior.config import RemoteConfig
+
+    _fake_modal(monkeypatch)
+    cp.map(_models(2), {"draws": 10}, cache=False)
+
+    envs = list(api._LIVE_ENVS.values())
+    assert envs, "cp.map should keep its dashboard env warm"
+    assert isinstance(envs[0].config, RemoteConfig)
+
+
+def test_cp_map_cancels_siblings_when_a_result_fails(monkeypatch):
+    """A failure mid-fan-out must not leave the other containers billing."""
+    pytest.importorskip("pymc")
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    state["fail_get"] = True
+
+    with pytest.raises(RuntimeError, match="worker died"):
+        cp.map(_models(3), {"draws": 10}, cache=False)
+
+    assert sorted(state["cancelled"]) == [0, 1, 2]
 
 
 def test_cp_map_dashboard_false_opts_out(monkeypatch):
