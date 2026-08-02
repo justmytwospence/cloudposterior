@@ -153,5 +153,22 @@ def _(az, idata_2):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Cleanup
+
+    Model payloads are stored in a project-scoped volume. Delete it when you're
+    done so it doesn't sit there accruing storage costs.
+    """)
+    return
+
+
+@app.cell
+def _(cp):
+    cp.cleanup_volumes()
+    return
+
+
 if __name__ == "__main__":
     app.run()
