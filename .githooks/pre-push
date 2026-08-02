@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Catch the one mistake that keeps reaching CI: a non-portable uv.lock.
+#
+# Any incidental `uv run` re-locks using ~/.config/uv/uv.toml, baking
+# exclude-newer settings into uv.lock that CI cannot reproduce. Every
+# `uv sync --locked` job then fails. It is easy to do by accident and the
+# failure only shows up minutes later in Actions, so check before pushing.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+if [ -f uv.lock ] && grep -q "exclude-newer" uv.lock; then
+  cat >&2 <<'MSG'
+pre-push: uv.lock carries exclude-newer settings and CI will reject it.
+
+  Fix:  ./scripts/lock.sh && git add uv.lock && git commit --amend --no-edit
+
+  (An incidental `uv run` re-locked using your user-level uv config. See the
+  re-locking note in CLAUDE.md.)
+
+  Bypass with --no-verify if you really mean it.
+MSG
+  exit 1
+fi

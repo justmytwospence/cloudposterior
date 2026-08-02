@@ -25,7 +25,9 @@ clean checkout. Plain `uv lock` bakes user-level settings from
 job then fails with "the lockfile needs to be updated". A project-level setting
 cannot undo this: uv *merges* the user-level `exclude-newer-package` table into
 the project's rather than replacing it. The script passes `--no-config` and
-then verifies the result is clean.
+then verifies the result is clean. A `.githooks/pre-push` hook blocks a push
+carrying a poisoned lockfile; enable it once per clone with
+`git config core.hooksPath .githooks`.
 
 Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`) hit real Modal infrastructure and incur cloud costs. They are skipped unless `--run-modal` is passed. See `tests/conftest.py` for the marker plumbing.
 
