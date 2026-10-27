@@ -4,8 +4,8 @@ version = "0.7.0"
 description = "Run PyMC MCMC sampling on cloud VMs with one line of code. Caching, live progress, and phone notifications included."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "FSL-1.1-ALv2"
+license-files = ["LICENSE.md"]
 authors = [
     { name = "Spencer Boucher" },
 ]
@@ -96,7 +96,7 @@ include = [
     "tests",
     "scripts",
     "README.md",
-    "LICENSE",
+    "LICENSE.md",
     "CHANGELOG.md",
     "pyproject.toml",
 ]
