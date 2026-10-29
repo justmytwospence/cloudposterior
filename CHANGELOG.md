@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Convergence layer** (`cloudposterior.convergence`) behind `until=`. It
+  draws on Vehtari et al. (2021), Margossian et al. (2024, nested R-hat),
+  Margossian & Gelman (2024) and Vats & Knudson (2021).
+  - Checks every element of every free variable, not just scalars. It uses
+    vectorized rank-normalized R-hat, bulk/tail ESS and MCSE that match ArviZ
+    0.x and behave the same under ArviZ 1.x.
+  - Checks at geometrically spaced checkpoints and needs the target to hold at
+    two in a row before stopping, so it doesn't stop on noise.
+  - HMC gates: post-warmup divergences and E-BFMI.
+  - The R-hat threshold scales with the chain count.
+  - Stops when the target is unreachable (divergences, stalled R-hat or ESS)
+    and names the likely cause: warmup too short, chains disagreeing,
+    divergences or slow mixing. It reports the projected draws, with an ETA,
+    to reach the target.
+  - Presets `until="final"` (= `True`) and `until="draft"`; new targets
+    `mcse`, `quantiles`, `var_names`, `patience`, `growth`, `futility`.
+  - `until={"escalate": n}`: automatic re-runs with adjusted settings
+    (`target_accept`, `tune`, nutpie low-rank adaptation, a larger draw cap),
+    chosen by the diagnosed cause, inside the same container call.
+  - `until={"superchains": K}`: chains start in K groups that share a starting
+    point, and nested R-hat is checked (nutpie and pymc).
+- Every remote result carries a convergence report in
+  `posterior.attrs["cloudposterior_convergence"]`. A remote run whose report
+  flags a problem warns with the cause and a hint, as PyMC does locally.
+- `cp.check_convergence(idata, until=...)` produces the same report for any
+  trace.
+- `init="prior"` on `cp.cloud` / `cp.map` starts each chain from a prior draw.
+- The dashboard shows the verdict, the run's own thresholds, the projected
+  draws to reach the target, and the hint.
+
+### Changed
+
+- `until=` dicts are validated: unknown keys raise instead of being ignored.
+  Normalized targets now carry every key, so cache keys of `until=` runs
+  change.
+- A model whose free variables are all vectors no longer disables `until=`.
+- Remote runs resolve the chain count the way `pm.sample` does
+  (`max(2, min(4, cores))`) rather than taking nutpie's default of 6.
+
+### Fixed
+
+- A nutpie run aborted early (Stop or `until=`) no longer returns NaN-padded
+  draws for the chains that were ahead; every chain is cut to the shortest
+  complete one.
+- Stopping a multi-process pymc run on its convergence target no longer lets
+  PyMC drop the chains that were behind.
+
 ## [0.7.0] -- 2026-08-01
 
 ### Breaking

@@ -54,9 +54,15 @@ Run that cell again and the cached result returns instantly --- no re-sampling.
   them --- use your own server for anything sensitive.
 - `instance="large"` --- override the auto-sized VM with a preset (`small`,
   `medium`, `large`, `xlarge`, `gpu`).
-- `until=True` --- stop early once every scalar parameter converges
-  (R-hat <= 1.01, ESS >= 400). Pass a dict to set your own thresholds. Remote
-  runs with the nutpie or pymc sampler only.
+- `until=True` --- stop once every element of every free variable converges:
+  R-hat <= 1.01, bulk and tail ESS >= 400, no divergences, E-BFMI >= 0.3. It
+  also stops when more draws can't help, and says why. `until="draft"` is a
+  looser development preset. A dict sets your own targets (`ess`, `mcse`,
+  `var_names`, `escalate`, `superchains`, ...). Remote runs with the nutpie or
+  pymc sampler only. `cp.check_convergence(idata)` gives the same report for
+  any trace.
+- `init="prior"` --- start each chain from a prior draw (dispersed starts make
+  R-hat trustworthy).
 - `overwrite=True` --- re-run and replace the cached entry instead of reading it.
 - `project="name"` --- namespace the remote volume and dashboard; defaults to
   the working directory name.

@@ -108,6 +108,23 @@ Besides streaming sampling, the worker has **blocking (non-streaming) entries** 
 
 **Custom `step=` over the wire**: a step instance pickled separately from the model has value variables in a different graph than the worker's Volume-loaded model (PyMC raises -- 5.28 words it "the following variables are not random variables in the model"). So `intercepted_sample` ships a combined `{model, step}` blob via `serialize_model_with_step`; `_unpack_model_payload` on the worker detects the dict, re-injects the step, and forces the pymc sampler (so the per-draw callback / live progress still work).
 
+### Convergence layer (`convergence.py`, `until=`)
+
+`convergence.py` is shared by the worker and the client. It holds four things:
+
+- **Targets:** `normalize_target` handles the presets `final` and `draft` and dict overrides, and rejects unknown keys.
+- **Diagnostics:** vectorized numpy ports of ArviZ 0.x rank-normalized R-hat, bulk/tail/mean ESS and quantile MCSE, plus nested R-hat. They are tested against ArviZ and are identical across arviz majors, so don't swap in `az.rhat`.
+- **`assess`:** checks every element of every monitored variable, plus divergences and E-BFMI. `diagnose` names the cause (early_drift / chains_disagree / slow_mixing / divergences / low_bfmi) from how R-hat changes over the late half of the draws.
+- **`Controller`:** checks only at geometric checkpoints, needs `patience` consecutive passes, and detects futility.
+
+In the worker:
+
+- `_sample_and_stream` loops over `_sample_once` attempts. With `escalate`, it re-runs with settings from `_LADDER`, chosen by the diagnosed cause.
+- Every result gets a report in `posterior.attrs["cloudposterior_convergence"]`. The client warns from it (`_report_verdict`).
+- Superchains run as K nutpie samplers that share a compiled model, with its `initial_point_func` replaced by a fixed point. On the pymc path they use per-chain `initvals` with `init="adapt_diag"`.
+- A convergence stop on the pymc path waits until every chain reaches the leader's draw count (`stop_at`). Interrupting at once lets PyMC's `_choose_chains` drop the chains that are behind.
+- Aborted nutpie traces are NaN-padded, so they are trimmed with `_idata.trim_incomplete_draws`.
+
 ### Samplers and arviz compatibility
 
 - **Default sampler**: `api._default_sampler()` picks nutpie for fully continuous models (PyMC's own default, ~2x faster) and the pymc sampler when there are discrete free RVs; locally it falls back to pymc when nutpie isn't installed. nutpie is always installed in CPU remote images (`_build_pip_specs`).

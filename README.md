@@ -174,14 +174,60 @@ Works with both **PyMC 5 and PyMC 6** (PyMC 6 ships arviz 1.x's DataTree); the v
 
 ### Adaptive sampling
 
-Stop as soon as the chains converge instead of guessing a draw count -- `draws` becomes the cap:
+Stop when the chains have converged instead of guessing a draw count. `draws` becomes the cap:
 
 ```python
-with cp.cloud(model, remote=True, until={"r_hat": 1.01, "ess": 400}):
-    idata = pm.sample(draws=20000)   # stops early once every parameter clears the target
+with cp.cloud(model, remote=True, until=True):
+    idata = pm.sample(draws=20000)   # stops once the convergence target holds
 ```
 
-`until=True` uses the Vehtari (2021) defaults shown above. Works with **nutpie** and **pymc** (the samplers with a per-draw hook).
+The worker checks **every element of every free variable** (vectors included). It checks at geometrically spaced checkpoints and stops once the target has held at two in a row. A run that can't meet the target stops early too, with the likely cause:
+
+- `until=True` (or `"final"`):
+  - rank-normalized R-hat <= 1.01 (Vehtari et al. 2021),
+  - bulk and tail ESS >= 400,
+  - zero post-warmup divergences,
+  - E-BFMI >= 0.3.
+
+  With more than about 4 chains the R-hat threshold scales as `sqrt(1 + 2m/ESS)` (Vats & Knudson 2021). Otherwise extra chains would force more draws than the ESS target needs.
+- `until="draft"`: R-hat <= 1.05 and ESS >= 100, with divergences reported but not gating. Use it for model development.
+- A dict overrides any preset key:
+
+  ```python
+  until={
+      "ess": 1000,                 # bulk + tail ESS
+      "mcse": 0.05,                # Monte Carlo SE <= 5% of the posterior sd
+      "quantiles": True,           # ... for the 5%/95% quantiles too
+      "var_names": ["beta", "sigma"],
+      "escalate": 2,               # re-run up to twice with adjusted settings
+      "superchains": 8,            # nested R-hat for many chains
+  }
+  ```
+
+When the target can't be met, the result says why instead of silently using up the draw cap:
+
+| Cause | What it means | What `escalate` tries |
+|-------|---------------|------------------------|
+| `divergences` | the sampler can't reach part of the posterior | `target_accept` 0.95, then 0.99 |
+| `early_drift` | chains still drifting at the start of sampling: warmup too short | `tune` x2, twice |
+| `chains_disagree` | chains stay apart late in sampling (modes, a stuck chain, a funnel) | `tune` x2, `target_accept` 0.95 |
+| `slow_mixing` | chains agree but need more draws (the projected number is reported) | raise the draw cap to the projection |
+| `ess_stalled` / `low_bfmi` | ESS isn't growing / energy poorly explored: reparameterize | nutpie `adaptation="low_rank"`, `tune` x2 |
+
+The verdict is stored on the result and warns if it isn't met. Check any trace, local or remote, the same way:
+
+```python
+cp.check_convergence(idata)                  # report dict for any InferenceData
+idata.posterior.attrs["cloudposterior_convergence"]   # the stored report (JSON)
+```
+
+The dashboard shows the verdict and the projected draws to reach the target. With `notify=`, it is also pushed to your phone.
+
+**Starting points.** `cp.cloud(..., init="prior")` starts each chain from a prior draw instead of a jittered default point. Dispersed starts are what let R-hat detect non-convergence (Gelman & Rubin 1992; Margossian et al. 2024).
+
+**Many chains.** A big VM can run 16-32 chains with fewer draws each. Classic R-hat then needs far more draws than the ESS target. `until={"superchains": K}` starts the chains in K groups, each group sharing one starting point, and switches to **nested R-hat** (Margossian et al. 2024), which works for many short chains. `chains` must be a multiple of K.
+
+Works with **nutpie** and **pymc** (the samplers with a per-draw hook).
 
 ### Parallel fitting
 
@@ -237,7 +283,8 @@ Two `pm.sample` details can't be matched exactly for remote execution and warn r
 | Cloud execution | off | `remote=True` / `False` |
 | Live dashboard | **on** (when remote) | `dashboard=True` / `False` |
 | Push notifications | off | `notify=True` / `"topic"` / `{"server": ..., "topic": ...}` |
-| Adaptive early-stop | off | `until=True` / `{"r_hat": ..., "ess": ...}` (remote) |
+| Adaptive stopping + convergence verdict | off | `until=True` / `"draft"` / `{"ess": ..., "mcse": ..., ...}` (remote) |
+| Chain initialization | sampler default | `init="prior"` |
 | Re-run and replace the cache entry | off | `overwrite=True` |
 | Project namespace (volume + dashboard) | working directory name | `project="name"` |
 | Live progress display | **on** | `progress=True` / `False` |
