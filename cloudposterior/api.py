@@ -83,18 +83,67 @@ def _env_key(project: str, model) -> tuple:
 
 
 def _normalize_until(until) -> dict | None:
-    """Resolve an adaptive-stop target into a dict (or None).
+    """Resolve an adaptive-stop target into a complete dict (or None).
 
-    ``True`` -> Vehtari defaults; a dict overrides ``r_hat`` / ``ess`` over
-    those defaults; anything else (None / False) -> None. Shared by
-    ``cp.cloud(until=...)`` and ``cp.map(until=...)`` so the worker always
-    receives a dict (it calls ``until.get(...)``), never a bare ``True``.
+    ``True`` -> the ``"final"`` preset (Vehtari et al. 2021 thresholds plus
+    HMC gates), ``"draft"`` / ``"final"`` -> that preset, a dict -> overrides on
+    top of a preset. Shared by ``cp.cloud(until=...)`` and ``cp.map(until=...)``
+    so the worker always receives a complete dict, never a bare ``True``. See
+    ``cloudposterior.convergence.normalize_target``.
     """
-    if until is True:
-        return {"r_hat": 1.01, "ess": 400}
-    if isinstance(until, dict):
-        return {"r_hat": 1.01, "ess": 400, **until}
-    return None
+    from cloudposterior.convergence import normalize_target
+
+    return normalize_target(until)
+
+
+_INIT_STRATEGIES = (None, "prior")
+
+
+def _validate_init(init) -> None:
+    if init not in _INIT_STRATEGIES:
+        raise ValueError(
+            f"init={init!r} is not supported; use None (the sampler's default "
+            "jittered start) or 'prior' (one prior draw per chain)"
+        )
+
+
+def _check_superchains(until: dict | None, sample_kwargs: dict) -> None:
+    """Fail before provisioning when superchains can't split the chains, and
+    warn when too few chains make R-hat unreliable."""
+    k = (until or {}).get("superchains")
+    chains = sample_kwargs.get("chains")
+    if until and chains is not None and int(chains) < 4:
+        warnings.warn(
+            f"until= with chains={chains}: R-hat needs several chains to detect "
+            "non-convergence; Vehtari et al. (2021) recommend at least 4.",
+            stacklevel=3,
+        )
+    if k and chains is not None and int(chains) % k:
+        raise ValueError(
+            f"until superchains={k} must divide chains={chains} evenly "
+            "(each superchain holds the same number of chains)"
+        )
+
+
+def _report_verdict(idata, *, label: str | None = None) -> None:
+    """Warn when a remote run's convergence report flags a problem.
+
+    Remote runs bypass PyMC's own post-sampling warnings (divergences, R-hat),
+    so surface the worker's verdict instead -- with the likely cause and what
+    to try.
+    """
+    from cloudposterior.convergence import read_report, verdict_message
+
+    report = read_report(idata)
+    if not report or report.get("met") is not False:
+        return
+    if report.get("status") == "stopped":
+        return
+    prefix = f"{label}: " if label else ""
+    warnings.warn(
+        f"cloudposterior: {prefix}{verdict_message(report)}",
+        UserWarning, stacklevel=3,
+    )
 
 
 def _teardown_live_envs(project: str | None = None) -> None:
@@ -140,6 +189,14 @@ class cloud:
         with cp.cloud(model, remote=True, dashboard=False): # cloud, no dashboard
         with cp.cloud(model, cache="disk"):               # local + disk cache
         with cp.cloud(model, notify=True):                # local + ntfy notifications
+        with cp.cloud(model, remote=True, until=True):    # stop once converged
+        with cp.cloud(model, remote=True, until={"ess": 1000, "escalate": 2},
+                      init="prior"):                       # custom target, dispersed starts
+
+    ``until`` (remote; nutpie/pymc) runs the convergence layer: every element
+    of every free variable is checked at geometric checkpoints and sampling
+    stops once the target holds, or once more draws can't meet it, with the
+    likely cause. See ``cloudposterior.convergence`` and the README.
     """
 
     def __init__(
@@ -153,9 +210,11 @@ class cloud:
         instance: str | None = None,
         progress: bool = True,
         project: str | None = None,
-        until: dict | bool | None = None,
+        until: dict | bool | str | None = None,
+        init: str | None = None,
         overwrite: bool = False,
     ):
+        _validate_init(init)
         # dashboard=None means "default": on for remote, off for local with no
         # warning. dashboard=True with remote=False is a user mistake -- warn.
         if dashboard is True and not remote:
@@ -178,9 +237,12 @@ class cloud:
         self.instance = instance
         self.progress = progress
         self.project = project or _detect_project_name()
-        # Adaptive convergence target (remote only). The worker early-stops once
-        # every scalar param clears it (draws= is the cap).
+        # Adaptive convergence target (remote only). The worker checks every
+        # element of every free RV at geometric checkpoints and stops once the
+        # target holds (draws= is the cap), or once more draws can't meet it.
         self.until = _normalize_until(until)
+        # Initialization strategy: None (sampler default) or "prior".
+        self.init = init
         self._originals: dict[str, object] = {}
         self._env = None
         self._model_bytes: bytes | None = None
@@ -395,7 +457,22 @@ class cloud:
                         f"for nuts_sampler={nuts_sampler!r}.", stacklevel=2,
                     )
                 else:
+                    _check_superchains(ctx.until, kwargs)
                     kwargs["until"] = ctx.until
+
+            if ctx.init is not None:
+                if ctx.remote:
+                    kwargs["cp_init"] = ctx.init
+                elif nuts_sampler == "pymc" and "initvals" not in kwargs:
+                    kwargs["initvals"] = {rv.name: "prior" for rv in ctx.model.free_RVs}
+                else:
+                    import warnings
+
+                    warnings.warn(
+                        f"init={ctx.init!r} is applied to remote runs and to the "
+                        f"local pymc sampler; ignored for local {nuts_sampler}.",
+                        stacklevel=2,
+                    )
 
             # Lazy first-touch serialization: pay the cloudpickle cost only
             # when we actually need it. Memoized, and re-done automatically if
@@ -968,6 +1045,8 @@ def _run_sample(
         # -- Cache store --
         if cache_backend is not None and cache_key:
             cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+        if remote:
+            _report_verdict(idata)
         return idata
     finally:
         _stop_sinks(sinks)
@@ -1450,6 +1529,7 @@ def _run_sample_persistent(
         if cache_backend is not None and cache_key:
             cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
 
+        _report_verdict(idata)
         return idata
     finally:
         _stop_sinks(sinks)
@@ -1616,8 +1696,8 @@ def cleanup_volumes(project: str | None = None) -> None:
 def map(models, sample_kwargs=None, *, cache: bool | str = True,
         project: str | None = None, nuts_sampler: str | None = None,
         instance: str | None = None, progress: bool = True,
-        dashboard: bool | None = None, until: dict | bool | None = None,
-        overwrite: bool = False) -> list:
+        dashboard: bool | None = None, until: dict | bool | str | None = None,
+        init: str | None = None, overwrite: bool = False) -> list:
     """Fit many models in parallel on the cloud.
 
     ``models`` is a list of ``pm.Model`` -- vary priors, structure, or data for
@@ -1628,11 +1708,13 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     each fit is sized to *its own* model via ``Cls.with_options`` (cpu/memory)
     rather than to the first. Returns InferenceData in input order.
 
-    ``until`` enables adaptive early-stop (``True`` -> Vehtari defaults, or a
-    dict overriding ``r_hat`` / ``ess``): each fit stops once every scalar param
-    clears the target, with ``draws=`` as the cap. Applies to the whole batch
-    (nutpie / pymc samplers only); per-model targets are still possible by
-    putting ``until`` in each model's ``sample_kwargs`` dict.
+    ``until`` enables adaptive stopping, exactly as for ``cp.cloud`` (``True``
+    / ``"final"``, ``"draft"``, or a dict of targets): each fit stops once its
+    target holds (``draws=`` is the cap) or once more draws can't meet it, and
+    carries a convergence report. Applies to the whole batch (nutpie / pymc
+    samplers only); per-model targets are still possible by putting ``until``
+    in each model's ``sample_kwargs`` dict. ``init="prior"`` starts each chain
+    from a prior draw.
 
     ``overwrite=True`` ignores any cached result, re-runs every model, and
     replaces the stored entry (``cache=False`` instead skips the cache entirely,
@@ -1691,6 +1773,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     project = project or _detect_project_name()
     dashboard_on = True if dashboard is None else bool(dashboard)
     until_param = _normalize_until(until)
+    _validate_init(init)
     _until_warned = False
 
     # Unique per-model dashboard key (slugs collide for identical/unnamed models)
@@ -1731,7 +1814,10 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
                     )
                     _until_warned = True
             else:
+                _check_superchains(eff_until, kwargs_list[i])
                 kwargs_list[i]["until"] = eff_until
+        if init is not None:
+            kwargs_list[i]["cp_init"] = init
 
         mb = model_bytes_list[i]
         payload_path = _compute_payload_path(model_slug(m), mb)
@@ -1858,7 +1944,12 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         for j, i in enumerate(run_idx):
             idata = deserialize_inference_data(_run_blocking(calls[j].get))
             results[i] = idata
-            _log(f"[{j + 1}/{len(run_idx)}] done")
+            from cloudposterior.convergence import read_report
+
+            report = read_report(idata)
+            status = f" -- {report['status']}: {report['summary']}" if report else ""
+            _log(f"[{j + 1}/{len(run_idx)}] {names[i]} done{status}")
+            _report_verdict(idata, label=names[i])
             _mb, _pp, _kw, _sp, ckey, ck_kwargs, _lbl, _cfg = run_meta[j]
             if cache_backends[i] is not None and ckey is not None:
                 cache_backends[i].save(ckey, idata, sample_kwargs=ck_kwargs)

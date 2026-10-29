@@ -65,6 +65,11 @@ class ConvergenceUpdate:
     params: dict[str, ParamConvergence]
     draws: int = 0
     traces: dict[str, list[list[float]]] = field(default_factory=dict)  # param -> [[chain0_vals], [chain1_vals], ...]
+    # The convergence layer's verdict at this checkpoint: met, decision
+    # (continue/met/futile/complete), per-check value/threshold/ok/worst,
+    # projected_draws, cause and hint. None from older workers.
+    verdict: dict | None = None
+    final: bool = False
 
 
 # Union type for progress events streamed from remote
@@ -147,8 +152,11 @@ def decode_progress_event(data: dict) -> ProgressEvent | None:
                 ess_tail=_as_float(pdata.get("ess_tail")),
             )
         traces = data.get("traces", {})
+        verdict = data.get("verdict")
         return ConvergenceUpdate(
-            params=params, draws=_as_int(data.get("draws")), traces=traces
+            params=params, draws=_as_int(data.get("draws")), traces=traces,
+            verdict=verdict if isinstance(verdict, dict) else None,
+            final=data.get("partial") is False,
         )
 
     return None

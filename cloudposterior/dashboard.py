@@ -31,6 +31,7 @@ class DashboardSink:
         self._complete = False
         self._convergence: dict = {}
         self._convergence_draws: int = 0
+        self._verdict: dict | None = None
         self._traces: dict = {}
 
     def show_phase(self, update: PhaseUpdate):
@@ -83,6 +84,9 @@ class DashboardSink:
             for name, p in update.params.items()
         }
         self._convergence_draws = update.draws
+        verdict = getattr(update, "verdict", None)
+        if verdict:
+            self._verdict = {**verdict, "final": bool(getattr(update, "final", False))}
         self._traces = update.traces if update.traces else {}
         self._write()
 
@@ -98,6 +102,8 @@ class DashboardSink:
                     "params": self._convergence,
                     "draws": self._convergence_draws,
                 }
+                if self._verdict:
+                    data["convergence"]["verdict"] = self._verdict
             if self._traces:
                 data["traces"] = self._traces
             _run_blocking(self._dict.__setitem__, self._key, data)
@@ -229,6 +235,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
              font-size: 13px; text-align: center; font-weight: 600; }
   .verdict-good { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
   .verdict-warn { background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow); }
+  .conv-meta { font-size: 12px; color: var(--muted, #888); text-align: center; margin-bottom: var(--sp-2); }
+  .conv-hint { font-size: 12px; margin-bottom: var(--sp-3); padding: var(--sp-2) var(--sp-3);
+               border-left: 3px solid var(--yellow); }
   .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border);
              border-top-color: var(--yellow); border-radius: 50%; animation: spin 0.8s linear infinite;
              vertical-align: middle; }
@@ -724,34 +733,66 @@ function renderConvergence(el, conv, compact) {
   const names = Object.keys(params).sort();
   if (names.length === 0) { el.innerHTML = ''; return; }
 
-  let allGood = true;
-  for (const name of names) {
-    const p = params[name];
-    if (p.rhat >= 1.01 || p.ess_bulk < 400 || p.ess_tail < 400) allGood = false;
+  // Thresholds come from the run's target (the convergence layer's verdict);
+  // older workers send none, so fall back to Vehtari et al. (2021).
+  const v = conv.verdict || null;
+  const checks = (v && v.checks) || {};
+  const rhatMax = (checks.r_hat && checks.r_hat.threshold) || 1.01;
+  const essMin = (checks.ess_bulk && checks.ess_bulk.threshold) || 400;
+
+  let allGood;
+  if (v && typeof v.met === 'boolean') {
+    allGood = v.met;
+  } else {
+    allGood = true;
+    for (const name of names) {
+      const p = params[name];
+      if (p.rhat > rhatMax || p.ess_bulk < essMin || p.ess_tail < essMin) allGood = false;
+    }
   }
   const vClass = allGood ? 'verdict-good' : 'verdict-warn';
-  const vText = allGood ? 'Converged (' + conv.draws + ' draws)' : 'Not yet converged (' + conv.draws + ' draws)';
+  let vText;
+  if (v && v.decision === 'met') vText = 'Targets met (' + conv.draws + ' draws/chain)';
+  else if (v && v.decision === 'futile') vText = 'Stopped: target unreachable (' + conv.draws + ' draws/chain)';
+  else if (allGood) vText = (v && v.final ? 'Converged (' : 'Targets met so far (') + conv.draws + ' draws/chain)';
+  else vText = 'Not yet converged (' + conv.draws + ' draws/chain)';
+  if (v && !allGood && v.projected_draws && v.decision !== 'futile') {
+    vText += ' -- projected to meet target at ~' + v.projected_draws + ' draws/chain';
+    if (v.eta_seconds) vText += ' (~' + Math.round(v.eta_seconds) + 's)';
+  }
   if (compact) {
     // Overview: verdict badge only.
-    el.innerHTML = '<div class="verdict ' + vClass + '">' + vText + '</div>';
+    el.innerHTML = '<div class="verdict ' + vClass + '">' + esc(vText) + '</div>';
     return;
   }
 
-  function rhatClass(v) { return v < 1.01 ? 'conv-good' : v < 1.05 ? 'conv-warn' : 'conv-bad'; }
-  function essClass(v) { return v >= 400 ? 'conv-good' : v >= 100 ? 'conv-warn' : 'conv-bad'; }
-  let tableHtml = '<table><tr><th>Parameter</th><th>R-hat</th><th>Bulk ESS</th><th>Tail ESS</th></tr>';
+  let extra = '';
+  if (v) {
+    const bits = [];
+    if (checks.divergences && checks.divergences.value) bits.push(checks.divergences.value + ' divergences');
+    if (checks.bfmi && checks.bfmi.value != null) bits.push('min E-BFMI ' + Number(checks.bfmi.value).toFixed(2));
+    if (checks.mcse && checks.mcse.value != null) bits.push('max MCSE/sd ' + Number(checks.mcse.value).toFixed(3));
+    if (bits.length) extra += '<div class="conv-meta">' + esc(bits.join(' | ')) + '</div>';
+    if (v.hint && !allGood) extra += '<div class="conv-hint">' + esc(v.hint) + '</div>';
+  }
+
+  function rhatClass(x) { return x <= rhatMax ? 'conv-good' : x < 1.05 ? 'conv-warn' : 'conv-bad'; }
+  function essClass(x) { return x >= essMin ? 'conv-good' : x >= essMin / 4 ? 'conv-warn' : 'conv-bad'; }
+  const nested = checks.r_hat && checks.r_hat.nested;
+  let tableHtml = '<table><tr><th>Parameter</th><th>' + (nested ? 'Nested R-hat' : 'R-hat')
+    + ' (worst)</th><th>Bulk ESS (min)</th><th>Tail ESS (min)</th></tr>';
   for (const name of names) {
     const p = params[name];
     tableHtml += '<tr>'
       + '<td style="font-family:monospace;font-size:12px;">' + esc(cleanName(name)) + '</td>'
-      + '<td class="' + rhatClass(p.rhat) + '">' + p.rhat.toFixed(3) + '</td>'
+      + '<td class="' + rhatClass(p.rhat) + '">' + Number(p.rhat).toFixed(3) + '</td>'
       + '<td class="' + essClass(p.ess_bulk) + '">' + p.ess_bulk + '</td>'
       + '<td class="' + essClass(p.ess_tail) + '">' + p.ess_tail + '</td>'
       + '</tr>';
   }
   tableHtml += '</table>';
   el.innerHTML = '<div class="section"><div class="section-title">Convergence</div>'
-    + '<div class="verdict ' + vClass + '">' + vText + '</div>' + tableHtml + '</div>';
+    + '<div class="verdict ' + vClass + '">' + esc(vText) + '</div>' + extra + tableHtml + '</div>';
 }
 poll();
 </script>

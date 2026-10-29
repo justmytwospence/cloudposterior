@@ -150,6 +150,13 @@ class RemoteConfig:
         # -- Timeout: scale with the work, keeping the one-hour floor. A long
         # run was killed at 3600s with the partial trace lost.
         total_draws = chains * (draws + tune)
+        # until=escalate re-runs the fit with longer warmup / a larger draw cap
+        # (each step at most doubles tune or quadruples draws), all inside the
+        # same container call -- budget for every attempt.
+        until = sample_kwargs.get("until")
+        escalate = int((until or {}).get("escalate", 0) or 0) if isinstance(until, dict) else 0
+        if escalate:
+            total_draws *= 1 + 3 * escalate
         timeout = min(_MAX_TIMEOUT, max(3600, int(total_draws * _SECONDS_PER_DRAW)))
 
         return cls(

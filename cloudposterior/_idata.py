@@ -152,6 +152,78 @@ def to_inference_data(trace):
     return trace
 
 
+def trim_incomplete_draws(idata):
+    """Drop the NaN-padded tail an aborted nutpie run leaves on faster chains.
+
+    nutpie's ``abort()`` returns arrays sized to the longest chain and pads the
+    others with NaN; every chain is cut to the shortest complete one so the
+    returned trace has no NaN draws. Returns the (possibly new) object.
+    """
+    import numpy as np
+
+    post = get_group(idata, "posterior")
+    if post is None or "draw" not in getattr(post, "dims", {}):
+        return idata
+    n_total = int(post.sizes["draw"])
+    n = n_total
+    for name in post.data_vars:
+        da = post[name]
+        if "chain" not in da.dims or not np.issubdtype(da.dtype, np.floating):
+            continue
+        vals = np.asarray(da.transpose("chain", "draw", ...).values)
+        flat = vals.reshape(vals.shape[0], vals.shape[1], -1)
+        for ch in range(flat.shape[0]):
+            bad = ~np.isfinite(flat[ch]).any(axis=1)
+            if bad.any():
+                n = min(n, int(np.argmax(bad)))
+        break
+    if n >= n_total:
+        return idata
+    isel = getattr(idata, "isel")
+    try:
+        return isel(draw=slice(0, n))  # arviz 0.x: groups lacking `draw` skipped
+    except Exception:
+        return isel(draw=slice(0, n), missing_dims="ignore")
+
+
+def concat_chains(parts):
+    """Join traces sampled separately (e.g. one per superchain) along ``chain``.
+
+    Each group is trimmed to the shortest ``draw`` length among the parts (an
+    aborted sampler stops a few draws early), chains are renumbered 0..C-1,
+    and the result has the same type as the inputs on both arviz majors.
+    """
+    import xarray as xr
+
+    first = parts[0]
+    groups = {}
+    for name in group_names(first):
+        datasets = []
+        for part in parts:
+            g = get_group(part, name)
+            if g is None:
+                break
+            to_ds = getattr(g, "to_dataset", None)
+            ds = to_ds() if callable(to_ds) and not isinstance(g, xr.Dataset) else g
+            datasets.append(ds)
+        if len(datasets) != len(parts):
+            continue
+        if not all("chain" in ds.dims for ds in datasets):
+            groups[name] = datasets[0]
+            continue
+        if all("draw" in ds.dims for ds in datasets):
+            n = min(ds.sizes["draw"] for ds in datasets)
+            datasets = [ds.isel(draw=slice(0, n)) for ds in datasets]
+        merged = xr.concat(datasets, dim="chain", combine_attrs="override")
+        merged = merged.assign_coords(chain=list(range(merged.sizes["chain"])))
+        groups[name] = merged
+
+    datatree = getattr(xr, "DataTree", None)
+    if datatree is not None and isinstance(first, datatree):
+        return datatree.from_dict({f"/{k}": v for k, v in groups.items()})
+    return type(first)(**groups)  # arviz 0.x InferenceData
+
+
 _ess_tail_fallback_warned = False
 
 

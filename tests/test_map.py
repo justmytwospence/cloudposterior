@@ -292,8 +292,10 @@ def test_cp_map_until_true_injects_normalized_target(monkeypatch):
     state = _fake_modal(monkeypatch)
     cp.map(_models(2), {"draws": 10}, cache=False, until=True)
     assert len(state["spawned"]) == 2
+    from cloudposterior.convergence import normalize_target
+
     for s in state["spawned"]:
-        assert s["kw"]["until"] == {"r_hat": 1.01, "ess": 400}
+        assert s["kw"]["until"] == normalize_target(True)
 
 
 def test_cp_map_until_dict_merges_over_defaults(monkeypatch):
@@ -302,7 +304,8 @@ def test_cp_map_until_dict_merges_over_defaults(monkeypatch):
 
     state = _fake_modal(monkeypatch)
     cp.map(_models(1), {"draws": 10}, cache=False, until={"ess": 1000})
-    assert state["spawned"][0]["kw"]["until"] == {"r_hat": 1.01, "ess": 1000}
+    until = state["spawned"][0]["kw"]["until"]
+    assert until["ess"] == 1000 and until["r_hat"] == "auto"
 
 
 def test_cp_map_until_warns_and_skips_for_jax_samplers(monkeypatch):
@@ -322,8 +325,10 @@ def test_cp_map_until_in_sample_kwargs_is_normalized(monkeypatch):
     import cloudposterior as cp
 
     state = _fake_modal(monkeypatch)
+    from cloudposterior.convergence import normalize_target
+
     cp.map(_models(1), {"draws": 10, "until": True}, cache=False)
-    assert state["spawned"][0]["kw"]["until"] == {"r_hat": 1.01, "ess": 400}
+    assert state["spawned"][0]["kw"]["until"] == normalize_target(True)
 
 
 def test_cp_map_overwrite_forces_rerun_and_saves(monkeypatch):

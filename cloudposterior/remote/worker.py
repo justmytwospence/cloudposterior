@@ -24,10 +24,11 @@ from threading import Thread
 
 from cloudposterior._idata import (
     add_group as _add_group,
-    ess_tail as _ess_tail,
+    concat_chains as _concat_chains,
     get_group as _get_group,
     sanitize_inference_data as _sanitize_idata_attrs,
     to_inference_data as _to_inference_data,
+    trim_incomplete_draws as _trim_incomplete,
 )
 
 # Consecutive nutpie is_finished failures tolerated before falling through to
@@ -64,17 +65,182 @@ def _stop_requested(stop_dict, stop_key=None) -> bool:
         return False
 
 
+def _resolve_chains(chains, cores) -> int:
+    """The chain count pm.sample would use (it defaults to max(2, cores<=4)).
+
+    Resolved here rather than left to the sampler so the convergence layer
+    knows how many chains to wait for, and so nutpie (whose own default is 6)
+    matches a local pm.sample run.
+    """
+    if chains is not None:
+        return int(chains)
+    import os
+
+    c = cores if cores is not None else min(4, os.cpu_count() or 4)
+    return max(2, int(c))
+
+
+def _sub_seeds(random_seed, n: int) -> list:
+    """n derived integer seeds (None when the run is unseeded)."""
+    import numpy as np
+
+    if random_seed is None or not isinstance(random_seed, (int, np.integer)):
+        rng = np.random.default_rng()
+    else:
+        rng = np.random.default_rng(int(random_seed))
+    return [int(s) for s in rng.integers(0, 2**31 - 1, size=n)]
+
+
+def _monitored_names(model, until) -> list[str]:
+    names = (until or {}).get("var_names")
+    if names:
+        return list(names)
+    return [rv.name for rv in getattr(model, "free_RVs", [])]
+
+
+def _scalar_traces(draws, max_points: int = 500) -> dict:
+    """Downsampled per-chain traces of the scalar variables, for the dashboard."""
+    counts: dict[str, int] = {}
+    for name in draws.var_of:
+        counts[name] = counts.get(name, 0) + 1
+    traces = {}
+    for i, name in enumerate(draws.var_of):
+        if counts[name] != 1:
+            continue
+        vals = draws.values[:, :, i]
+        if vals.shape[1] > max_points:
+            step = max(1, vals.shape[1] // max_points)
+            vals = vals[:, ::step][:, :max_points]
+        traces[name] = [[float(v) for v in row] for row in vals]
+    return traces
+
+
+def _convergence_event(assessment: dict, draws, *, total_draws: int, final: bool) -> bytes:
+    import msgpack
+
+    from cloudposterior.convergence import _jsonable
+
+    verdict = {
+        k: assessment.get(k)
+        for k in ("met", "decision", "consecutive", "projected_draws", "eta_seconds",
+                  "cause", "hint", "next_check", "checks")
+    }
+    return msgpack.packb(_jsonable({
+        "type": "convergence",
+        "params": assessment.get("params", {}),
+        "draws": assessment.get("draws", 0),
+        "total_draws": total_draws,
+        "traces": _scalar_traces(draws),
+        "partial": not final,
+        "verdict": verdict,
+    }))
+
+
+def _parts_to_draws(parts, names, superchain_ids):
+    """Draws from one or more partial traces (superchains run as separate
+    nutpie samplers), padding shorter parts with NaN so the convergence layer
+    trims every chain to the shortest complete one."""
+    import numpy as np
+
+    from cloudposterior import convergence as cv
+
+    if len(parts) == 1:
+        return cv.draws_from_idata(parts[0], var_names=names, superchain_ids=superchain_ids)
+    pieces = [cv.draws_from_idata(p, var_names=names) for p in parts]
+    n = min(p.n_draws for p in pieces)
+    values = np.concatenate([p.values[:, :n] for p in pieces], axis=0)
+    first = pieces[0]
+    out = cv.Draws(
+        values=values, labels=list(first.labels), var_of=list(first.var_of),
+        superchain_ids=list(superchain_ids) if superchain_ids is not None else None,
+    )
+    # Stats: re-trim each part to n so the counts cover the same draws.
+    divs, energies, mds = [], [], []
+    for p in parts:
+        st = _get_group(p, "sample_stats")
+        if st is None:
+            continue
+        if "diverging" in st.data_vars:
+            divs.append(np.asarray(st["diverging"].values)[:, :n])
+        if "energy" in st.data_vars:
+            energies.append(np.asarray(st["energy"].values, dtype=float)[:, :n])
+        for key in ("maxdepth_reached", "reached_max_treedepth"):
+            if key in st.data_vars:
+                mds.append(np.asarray(st[key].values)[:, :n])
+                break
+    if len(divs) == len(parts):
+        out.diverging = int(np.nansum(np.concatenate(divs, axis=0).astype(float)))
+    if len(energies) == len(parts):
+        out.energy = np.concatenate(energies, axis=0)
+    if len(mds) == len(parts):
+        out.maxdepth_frac = float(np.nanmean(np.concatenate(mds, axis=0).astype(float)))
+    return out
+
+
+# Escalation ladder: what to change on a re-run, by the likely cause of failure.
+# Each step is tried once, in order; steps a sampler can't apply are skipped.
+_LADDER = {
+    "early_drift": [("tune", 2.0), ("tune", 2.0)],
+    "divergences": [("target_accept", 0.95), ("target_accept", 0.99)],
+    "low_bfmi": [("tune", 2.0), ("adaptation", "low_rank")],
+    "chains_disagree": [("tune", 2.0), ("target_accept", 0.95)],
+    "slow_mixing": [("draws", "projected")],
+    "ess_stalled": [("adaptation", "low_rank"), ("tune", 2.0)],
+}
+
+
+def _next_rung(report: dict, settings: dict, nuts_sampler: str, applied: dict):
+    """Pick and apply the next escalation step. Returns a description or None."""
+    import math
+
+    cause = report.get("cause")
+    steps = _LADDER.get(cause or "", [])
+    i = applied.get(cause, 0)
+    extra = settings["extra"]
+    while i < len(steps):
+        key, value = steps[i]
+        i += 1
+        applied[cause] = i
+        if key == "tune":
+            old = settings["tune"]
+            settings["tune"] = int(math.ceil(old * value))
+            return f"tune {old} -> {settings['tune']}"
+        if key == "target_accept":
+            old = extra.get("target_accept", 0.8)
+            if float(old) >= value:
+                continue
+            extra["target_accept"] = value
+            return f"target_accept {old} -> {value}"
+        if key == "adaptation":
+            if nuts_sampler != "nutpie" or extra.get("adaptation") == value:
+                continue
+            extra["adaptation"] = value
+            if settings["tune"] < 800:
+                settings["tune"] = 800  # nutpie's low-rank default warmup
+            return f"nutpie adaptation -> {value}"
+        if key == "draws":
+            proj = report.get("projected_draws")
+            old = settings["draws"]
+            if not proj or proj <= old:
+                continue
+            settings["draws"] = int(min(4 * old, math.ceil(proj * 1.2)))
+            return f"draws cap {old} -> {settings['draws']} (projected need ~{proj})"
+    return None
+
+
 def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_name=None,
                        stop_key=None):
     """Run MCMC sampling and yield msgpack-encoded progress + results.
 
     Shared core logic used by both one-shot and persistent paths. The caller
-    loads the model; this function handles compilation, sampling, progress
-    streaming, and result serialization.
+    loads the model; this function handles compilation, sampling (with the
+    convergence layer's adaptive stopping and escalation), progress streaming,
+    and result serialization.
     """
     import lz4.frame
     import msgpack
-    import pymc as pm
+
+    from cloudposterior import convergence as cv
 
     # -- Check JAX device for GPU samplers --
     if nuts_sampler in ("numpyro", "blackjax"):
@@ -101,35 +267,32 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
         })
 
     # -- Pop the kwargs the worker controls; the rest pass through to pm.sample --
+    sample_kwargs = dict(sample_kwargs)
     draws = sample_kwargs.pop("draws", 1000)
     user_tune = sample_kwargs.pop("tune", None)
     tune = user_tune if user_tune is not None else 1000
     chains = sample_kwargs.pop("chains", None)
     cores = sample_kwargs.pop("cores", None)
-    random_seed = sample_kwargs.get("random_seed", None)
+    random_seed = sample_kwargs.pop("random_seed", None)
     sample_kwargs.pop("progressbar", None)
     sample_kwargs.pop("callback", None)
     # The client warns that return_inferencedata=False is unsupported remotely
     # (a MultiTrace can't be transported back); drop it here so the pymc path
     # doesn't produce a MultiTrace that crashes serialization after sampling.
     sample_kwargs.pop("return_inferencedata", None)
-    # Adaptive: early-stop once every scalar param hits this convergence target.
-    # cp-only kwarg (never passed to the sampler); applies to nutpie + pymc.
-    until = sample_kwargs.pop("until", None)
+    # cp-only kwargs (never passed to the sampler): the convergence target and
+    # the initialization strategy.
+    until = cv.normalize_target(sample_kwargs.pop("until", None))
+    init = sample_kwargs.pop("cp_init", None)
+    if nuts_sampler in ("numpyro", "blackjax"):
+        until = None  # no per-draw hook: the client already warned
+    chains = _resolve_chains(chains, cores)
 
-    # Convergence is evaluated over scalar (chain, draw) parameters only. On a
-    # purely vector-valued model there are none, so until= can never fire --
-    # say so rather than silently running to the draw cap.
-    if until and not _has_scalar_free_rvs(model):
-        until = None
-        yield msgpack.packb({
-            "type": "phase", "phase": "sampling", "status": "in_progress",
-            "message": (
-                "until= has no scalar parameters to evaluate on this model; "
-                "adaptive early-stop disabled, sampling the full draws"
-            ),
-            "elapsed": 0.0,
-        })
+    superchains = (until or {}).get("superchains")
+    if superchains and chains % superchains:
+        raise ValueError(
+            f"until superchains={superchains} must divide chains={chains} evenly"
+        )
 
     # -- nutpie compile phase, with fallback to the pymc sampler --
     compiled = None
@@ -142,7 +305,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
         try:
             import nutpie
 
-            compiled = nutpie.compile_pymc_model(model)
+            compile_kwargs = {}
+            if init == "prior":
+                compile_kwargs["default_initialization_strategy"] = "prior"
+            compiled = nutpie.compile_pymc_model(model, **compile_kwargs)
             yield msgpack.packb({
                 "type": "phase", "phase": "compiling", "status": "done",
                 "message": "nutpie compilation complete",
@@ -156,23 +322,132 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                 "elapsed": time.time() - compile_start,
             })
 
-    # -- Sampling phase --
+    settings = {"draws": draws, "tune": tune, "seed": random_seed, "extra": sample_kwargs}
+    attempts: list = []
+    applied: dict = {}
+    tried: list[str] = []
+    max_escalations = int((until or {}).get("escalate", 0))
+    attempt = 0
+    total_start = time.time()
+    while True:
+        outcome = yield from _sample_once(
+            model, compiled, nuts_sampler, settings, chains, cores, until, init,
+            stop_dict_name, stop_key, attempt,
+        )
+        idata, report = outcome["idata"], outcome["report"]
+        if report is not None:
+            attempts.append({
+                "attempt": attempt + 1,
+                "draws": settings["draws"], "tune": settings["tune"],
+                "target_accept": settings["extra"].get("target_accept"),
+                "adaptation": settings["extra"].get("adaptation"),
+                "status": report["status"], "summary": report["summary"],
+                "cause": report.get("cause"),
+            })
+        description = None
+        if report is not None and tried:
+            report["hint"] = (report.get("hint") or "").rstrip() + (
+                " Already re-ran with: " + "; ".join(tried) + "."
+            )
+        if (
+            until and report is not None and attempt < max_escalations
+            and report["status"] in ("futile", "cap") and not report["met"]
+        ):
+            description = _next_rung(report, settings, nuts_sampler, applied)
+        if description is None:
+            break
+        tried.append(description)
+        attempt += 1
+        if isinstance(settings["seed"], int):
+            settings["seed"] = settings["seed"] + 1000
+        yield msgpack.packb({
+            "type": "phase", "phase": "sampling", "status": "in_progress",
+            "message": (
+                f"re-running ({attempt}/{max_escalations}): {description} -- "
+                f"{report.get('cause', '').replace('_', ' ')}"
+            ),
+            "elapsed": round(time.time() - total_start, 1),
+        })
+
+    if report is not None:
+        if len(attempts) > 1:
+            report["attempts"] = attempts
+        cv.attach_report(idata, report)
+        message = cv.verdict_message(report)
+    else:
+        message = outcome.get("message", "sampling complete")
     yield msgpack.packb({
-        "type": "phase", "phase": "sampling", "status": "in_progress",
-        "message": "MCMC sampling started", "elapsed": 0.0,
+        "type": "phase", "phase": "sampling", "status": "done",
+        "message": message,
+        "elapsed": round(time.time() - total_start, 1),
     })
 
+    # -- Serialize and return InferenceData --
+    _sanitize_idata_attrs(idata)
+
+    import os
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        idata.to_netcdf(tmp_path)
+        with open(tmp_path, "rb") as f:
+            idata_compressed = lz4.frame.compress(f.read())
+    finally:
+        os.unlink(tmp_path)
+
+    yield msgpack.packb({
+        "type": "result",
+        "size_mb": round(len(idata_compressed) / (1024 * 1024), 2),
+    })
+
+    yield idata_compressed
+
+
+def _sample_once(model, compiled, nuts_sampler, settings, chains, cores, until, init,
+                 stop_dict_name, stop_key, attempt):
+    """One sampling run. Yields progress; returns {"idata", "report"}.
+
+    Raises (after emitting an error phase) when the sampler fails, and when a
+    stop left no recoverable draws.
+    """
+    import msgpack
+    import pymc as pm
+
+    from cloudposterior import convergence as cv
+
+    draws = settings["draws"]
+    tune = settings["tune"]
+    random_seed = settings["seed"]
+    sample_kwargs = dict(settings["extra"])
+
+    yield msgpack.packb({
+        "type": "phase", "phase": "sampling", "status": "in_progress",
+        "message": "MCMC sampling started" if attempt == 0 else f"MCMC sampling (attempt {attempt + 1})",
+        "elapsed": 0.0,
+    })
+
+    names = _monitored_names(model, until)
+    target = until or cv.normalize_target(True)
+    controller = cv.Controller(target, n_chains=chains, draws_cap=draws, stop=bool(until))
+    superchains = (until or {}).get("superchains")
+    per_super = chains // superchains if superchains else None
+    sc_ids = [c // per_super for c in range(chains)] if superchains else None
+    if sc_ids is not None and nuts_sampler in ("numpyro", "blackjax"):
+        sc_ids = None
+
     progress_queue: Queue = Queue()
-    chain_traces: dict[int, dict[str, list]] = {}  # pymc path: chain -> {param: [post-warmup values]}
     all_chain_states: dict[str, dict] = {}
-    counters = {"total_draws": 0, "last_conv_draws": 0}
+    counters = {"total_draws": 0}
     sample_start = time.time()
     stop_dict = _open_dict(stop_dict_name)
 
     sampling_error = None
     idata = None
-    stopped_early = False
-    converged = False
+    stopped_by_user = False
+    decision = None  # "met" | "futile" once the controller stops the run
+    last_step = None
 
     def _drain_and_yield():
         """Collapse queued per-chain updates into a single 'sampling' event."""
@@ -195,122 +470,137 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             })
         return None
 
-    def _convergence_from_idata(partial, *, every_draws=50):
-        """Compute rank-normalized R-hat / bulk+tail ESS on the post-warmup
-        partial trace (scalar params only). Used by both nutpie (via inspect())
-        and as the shared formatter. Vehtari 2021 thresholds (1.01 / 400) are
-        applied in the display, not here."""
-        import arviz as az
+    def _checkpoint(make_draws):
+        """Assess at a due checkpoint; returns (event_bytes, assessment) or (None, None)."""
+        try:
+            d = make_draws()
+            a = controller.step(d)
+            # Time to the target at the current per-chain draw rate.
+            rates = [c.get("draws_per_sec", 0.0) for c in all_chain_states.values()
+                     if c.get("phase") == "sampling"]
+            proj = a.get("projected_draws")
+            if rates and proj and proj > d.n_draws and min(rates) > 0:
+                a["eta_seconds"] = round((proj - d.n_draws) / min(rates), 1)
+            return _convergence_event(a, d, total_draws=counters["total_draws"], final=False), a
+        except Exception:
+            # A diagnostic failure must never take down sampling; push the next
+            # checkpoint out so a persistent failure isn't retried every poll.
+            controller.next_at = max(controller.next_at, 1) * 2
+            return None, None
 
-        post = _get_group(partial, "posterior")
-        if post is None:
-            return None
-        ndraw = int(post.sizes.get("draw", 0))
-        nchain = int(post.sizes.get("chain", 0))
-        if ndraw < every_draws or nchain < 2:
-            return None
-        convergence = {}
-        traces = {}
-        max_trace_points = 500
-        for name in post.data_vars:
-            da = post[name]
-            if da.ndim != 2:  # (chain, draw) scalar params only
-                continue
-            try:
-                convergence[name] = {
-                    "rhat": round(float(az.rhat(da)), 4),
-                    "ess_bulk": round(float(az.ess(da))),
-                    "ess_tail": round(_ess_tail(da)),
-                }
-            except Exception:
-                continue
-            vals = da.values  # (chain, draw)
-            if vals.shape[1] > max_trace_points:
-                step = max(1, vals.shape[1] // max_trace_points)
-                vals = vals[:, ::step][:, :max_trace_points]
-            traces[name] = [row.tolist() for row in vals]
-        if convergence:
-            return msgpack.packb({
-                "type": "convergence",
-                "params": convergence,
-                "draws": ndraw,
-                "total_draws": counters["total_draws"],
-                "traces": traces,
-                "partial": True,
-            })
-        return None
-
-    # ===================== nutpie: native progress + background sampler =====================
+    # ===================== nutpie: native progress + background sampler(s) =====================
     if nuts_sampler == "nutpie":
-        def nutpie_cb(progress_list):
-            total = 0
-            for i, p in enumerate(progress_list):
-                total_draws = int(p.total_draws or 0)
-                finished = int(p.finished_draws or 0)
-                tune_used = max(0, total_draws - draws)
-                if p.tuning:
-                    cur, tot, phase = finished, tune_used, "tuning"
-                else:
-                    cur, tot, phase = max(0, finished - tune_used), draws, "sampling"
-                total += finished
-                elapsed = float(p.runtime_ms or 0) / 1000.0
-                dps = finished / elapsed if elapsed > 0 else 0.0
-                remaining = max(0, total_draws - finished)
-                eta = remaining / dps if dps > 0 else 0.0
-                progress_queue.put({
-                    "chain": i,
-                    "draw": cur,
-                    "total": tot,
-                    "phase": phase,
-                    "draws_per_sec": round(dps, 1),
-                    "eta_seconds": round(eta, 1),
-                    "divergences": int(p.divergences or 0),
-                    "mean_tree_depth": 0.0,
-                    "step_size": round(float(p.step_size or 0.0), 4),
-                    "tree_size": int(p.num_steps or 0),
-                })
-            counters["total_draws"] = total
+        import nutpie
 
-        handle = None
-        nutpie_kwargs = dict(
-            draws=draws,
-            # Match pm.sample's tune default (1000); nutpie's own default (~300)
-            # would silently diverge from an equivalent local run.
-            tune=tune,
-            chains=chains,
-            cores=cores,
-            seed=random_seed,
-            save_warmup=False,
-            progress_bar=False,
-            blocking=False,
-        )
+        post_counts: dict[int, int] = {}
+        handle_totals: dict[int, int] = {}
+
+        def make_cb(offset: int, part: int):
+            def nutpie_cb(progress_list):
+                total = 0
+                for i, p in enumerate(progress_list):
+                    total_draws = int(p.total_draws or 0)
+                    finished = int(p.finished_draws or 0)
+                    tune_used = max(0, total_draws - draws)
+                    if p.tuning:
+                        cur, tot, phase = finished, tune_used, "tuning"
+                    else:
+                        cur, tot, phase = max(0, finished - tune_used), draws, "sampling"
+                    post_counts[offset + i] = 0 if p.tuning else cur
+                    total += finished
+                    elapsed = float(p.runtime_ms or 0) / 1000.0
+                    dps = finished / elapsed if elapsed > 0 else 0.0
+                    remaining = max(0, total_draws - finished)
+                    eta = remaining / dps if dps > 0 else 0.0
+                    progress_queue.put({
+                        "chain": offset + i,
+                        "draw": cur,
+                        "total": tot,
+                        "phase": phase,
+                        "draws_per_sec": round(dps, 1),
+                        "eta_seconds": round(eta, 1),
+                        "divergences": int(p.divergences or 0),
+                        "mean_tree_depth": 0.0,
+                        "step_size": round(float(p.step_size or 0.0), 4),
+                        "tree_size": int(p.num_steps or 0),
+                    })
+                handle_totals[part] = total
+                counters["total_draws"] = sum(handle_totals.values())
+            return nutpie_cb
+
         # Forward the remaining pm.sample kwargs nutpie understands (e.g.
-        # target_accept, maxdepth) instead of silently dropping them; report
-        # whatever nutpie can't accept so the user knows it was ignored.
+        # target_accept, maxdepth, adaptation) instead of silently dropping
+        # them; report whatever nutpie can't accept so the user knows.
         forwarded, dropped = _split_nutpie_kwargs(nutpie, sample_kwargs)
-        forwarded.pop("random_seed", None)  # already mapped to seed=
+        forwarded.pop("random_seed", None)
         dropped.pop("random_seed", None)
-        nutpie_kwargs.update(forwarded)
-        if dropped:
+        if dropped and attempt == 0:
             yield msgpack.packb({
                 "type": "phase", "phase": "sampling", "status": "in_progress",
                 "message": "ignoring kwargs unsupported by nutpie: "
                            + ", ".join(sorted(dropped)),
                 "elapsed": 0.0,
             })
-        try:
-            handle = nutpie.sample(compiled, progress_callback=nutpie_cb, **nutpie_kwargs)
-        except Exception:
-            # Some nutpie builds (e.g. 0.16.8) accept progress_callback but fail to
-            # wire it ("'PyNutsSettings' object has no attribute
-            # 'progress_callback'"). Fall back to sampling without live per-draw
-            # progress rather than aborting the whole run.
-            try:
-                handle = nutpie.sample(compiled, **nutpie_kwargs)
-            except Exception as exc:
-                sampling_error = exc
 
-        if handle is not None:
+        # One sampler, or one per superchain: every chain in a superchain
+        # starts from the same point (Margossian et al. 2024).
+        if superchains:
+            import dataclasses
+
+            seeds = _sub_seeds(random_seed, 2 * superchains)
+            jobs = []
+            for k in range(superchains):
+                start = compiled.initial_point_func(seeds[k])
+                try:
+                    part_model = dataclasses.replace(
+                        compiled, initial_point_func=_fixed_point(start)
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        "superchains need nutpie's default (numba) PyMC backend"
+                    ) from exc
+                jobs.append((part_model, per_super, seeds[superchains + k], k * per_super))
+        else:
+            seed = random_seed if random_seed is None or isinstance(random_seed, int) else None
+            jobs = [(compiled, chains, seed, 0)]
+
+        handles = []
+        for part, (part_model, n_ch, seed, offset) in enumerate(jobs):
+            kw = dict(
+                draws=draws,
+                # Match pm.sample's tune default (1000); nutpie's own default
+                # (~300) would silently diverge from an equivalent local run.
+                tune=tune,
+                chains=n_ch,
+                cores=(min(cores, n_ch) if cores else n_ch) if superchains else cores,
+                seed=seed,
+                save_warmup=False,
+                progress_bar=False,
+                blocking=False,
+                **forwarded,
+            )
+            try:
+                handles.append(nutpie.sample(part_model, progress_callback=make_cb(offset, part), **kw))
+            except Exception:
+                # Some nutpie builds (e.g. 0.16.8) accept progress_callback but
+                # fail to wire it. Fall back to sampling without live progress
+                # (and so without adaptive stopping) rather than aborting.
+                try:
+                    handles.append(nutpie.sample(part_model, **kw))
+                except Exception as exc:
+                    sampling_error = exc
+                    break
+
+        def _abort_all():
+            parts = []
+            for h in handles:
+                try:
+                    parts.append(_trim_incomplete(_to_inference_data(h.abort())))
+                except Exception:
+                    pass
+            return parts
+
+        if handles and sampling_error is None:
             _poll_failures = {"n": 0}
 
             def _finished():
@@ -320,45 +610,46 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                 # would otherwise spin at 0.5s until the container timeout kills
                 # the run with no result at all.
                 try:
-                    done = bool(handle.is_finished)
+                    done = all(bool(h.is_finished) for h in handles)
                 except Exception:
                     _poll_failures["n"] += 1
                     return _poll_failures["n"] >= _MAX_POLL_FAILURES
                 _poll_failures["n"] = 0
                 return done
 
+            parts = None
             while not _finished():
                 time.sleep(0.5)
                 snap = _drain_and_yield()
                 if snap:
                     yield snap
-                if counters["total_draws"] - counters["last_conv_draws"] >= 100:
-                    counters["last_conv_draws"] = counters["total_draws"]
-                    try:
-                        conv = _convergence_from_idata(_to_inference_data(handle.inspect()))
-                        if conv:
-                            yield conv
-                            if until and _conv_meets_target(conv, until):
-                                idata = _to_inference_data(handle.abort())
-                                stopped_early = True
-                                converged = True
-                    except Exception:
-                        pass
-                    if converged:
-                        break
+                post_min = min(post_counts.values()) if len(post_counts) == chains else 0
+                if controller.due(post_min):
+                    event, a = _checkpoint(lambda: _parts_to_draws(
+                        [_to_inference_data(h.inspect()) for h in handles], names, sc_ids,
+                    ))
+                    if event:
+                        yield event
+                        last_step = a
+                        if a["decision"] in ("met", "futile"):
+                            decision = a["decision"]
+                            parts = _abort_all()
+                            break
                 if _stop_requested(stop_dict, stop_key):
-                    try:
-                        idata = _to_inference_data(handle.abort())  # returns partial trace
-                        stopped_early = True
-                    except Exception:
-                        pass
+                    stopped_by_user = True
+                    parts = _abort_all()
                     break
 
-            if idata is None:
-                try:
-                    idata = _to_inference_data(handle.wait())
-                except Exception as exc:
-                    sampling_error = exc
+            if parts is None:
+                parts = []
+                for h in handles:
+                    try:
+                        parts.append(_to_inference_data(h.wait()))
+                    except Exception as exc:
+                        sampling_error = exc
+                        break
+            if sampling_error is None and parts:
+                idata = parts[0] if len(parts) == 1 else _concat_chains(parts)
             snap = _drain_and_yield()
             if snap:
                 yield snap
@@ -370,6 +661,8 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             "message": f"sampling on {nuts_sampler} (JAX) -- live per-chain progress unavailable",
             "elapsed": round(time.time() - sample_start, 1),
         })
+        if init == "prior" and "initvals" not in sample_kwargs:
+            sample_kwargs["initvals"] = {rv.name: "prior" for rv in model.free_RVs}
 
         def do_sample_jax():
             nonlocal idata, sampling_error
@@ -377,7 +670,8 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                 with model:
                     idata = pm.sample(
                         draws=draws, tune=tune, chains=chains,
-                        nuts_sampler=nuts_sampler, progressbar=False, **sample_kwargs,
+                        nuts_sampler=nuts_sampler, progressbar=False,
+                        random_seed=random_seed, **sample_kwargs,
                     )
             except Exception as exc:
                 sampling_error = exc
@@ -402,12 +696,50 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
 
     # ===================== pymc: per-draw callback (only sampler that supports it) =====================
     else:
+        import numpy as _np
+
         chain_draw_counts: dict[int, int] = {}
         chain_start_times: dict[int, float] = {}
         chain_divergences: dict[int, int] = {}
         chain_tree_depths: dict[int, list[float]] = {}
         chain_phase: dict[int, bool] = {}
+        # Post-warmup values of the monitored variables and HMC stats, per chain.
+        value_to_rv = {}
+        for rv in getattr(model, "free_RVs", []):
+            try:
+                value_to_rv[model.rvs_to_values[rv].name] = rv.name
+            except Exception:
+                pass
+        wanted = {v for v, r in value_to_rv.items() if r in set(names)}
+        chain_values: dict[int, dict[str, list]] = {}
+        chain_stats: dict[int, dict[str, list]] = {}
         should_stop = {"v": False}
+        # Set when the convergence layer decides: interrupt once every chain has
+        # this many post-warmup draws. Interrupting at once would let PyMC's
+        # _choose_chains drop the chains that were behind (it maximizes total
+        # draws), changing the chain count and breaking superchain groups.
+        stop_at = {"n": None}
+
+        # Initialization: per-chain starting points from the prior, and/or one
+        # shared start per superchain (jitter off so the chains really share it).
+        if superchains or init == "prior":
+            if sc_ids is not None:
+                from pymc.initial_point import make_initial_point_fn
+
+                strategy = "prior" if init == "prior" else "support_point"
+                jitter = set() if init == "prior" else set(model.free_RVs)
+                fn = make_initial_point_fn(
+                    model=model, default_strategy=strategy, jitter_rvs=jitter,
+                    return_transformed=False,
+                )
+                seeds = _sub_seeds(random_seed, superchains)
+                starts = [fn(s) for s in seeds]
+                sample_kwargs["initvals"] = [starts[k] for k in sc_ids]
+                user_init = sample_kwargs.get("init", "jitter+adapt_diag")
+                plain = str(user_init).replace("jitter+", "")
+                sample_kwargs["init"] = "adapt_diag" if plain == "auto" else plain
+            elif "initvals" not in sample_kwargs:
+                sample_kwargs["initvals"] = {rv.name: "prior" for rv in model.free_RVs}
 
         def progress_callback(trace, draw):
             # NOTE: the draw counting / phase reset / windowed tree-depth logic
@@ -416,6 +748,10 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             # Cheap local flag only -- the network poll lives in the generator loop (D3).
             if should_stop["v"]:
                 raise KeyboardInterrupt("early stop requested")
+            if stop_at["n"] is not None and len(chain_stats) == chains and min(
+                len(cs["diverging"]) for cs in chain_stats.values()
+            ) >= stop_at["n"]:
+                raise KeyboardInterrupt("convergence target decided")
             counters["total_draws"] += 1
             chain = draw.chain
             is_tuning = draw.tuning
@@ -452,15 +788,17 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             eta = remaining / dps if dps > 0 else 0.0
             mean_td = sum(chain_tree_depths[chain][-100:]) / min(len(chain_tree_depths[chain]), 100)
 
-            # Accumulate POST-WARMUP scalar params for live convergence (C3).
-            if not is_tuning and hasattr(draw, "point") and draw.point:
-                import numpy as _np
-
-                ct = chain_traces.setdefault(chain, {})
-                for param_name, value in draw.point.items():
-                    val = _np.asarray(value)
-                    if val.ndim == 0:
-                        ct.setdefault(param_name, []).append(float(val))
+            # Accumulate POST-WARMUP monitored values + stats for the
+            # convergence layer (vectors included, not just scalars).
+            if not is_tuning and getattr(draw, "point", None):
+                cv_ = chain_values.setdefault(chain, {})
+                for vname in wanted:
+                    if vname in draw.point:
+                        cv_.setdefault(vname, []).append(_np.array(draw.point[vname], dtype=float))
+                cs = chain_stats.setdefault(chain, {"diverging": [], "energy": [], "maxdepth": []})
+                cs["diverging"].append(bool(diverging))
+                cs["energy"].append(float(stats.get("energy", _np.nan)))
+                cs["maxdepth"].append(bool(stats.get("reached_max_treedepth", False)))
 
             progress_queue.put({
                 "chain": chain,
@@ -475,18 +813,39 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
                 "tree_size": tree_size,
             })
 
+        def _pymc_draws():
+            n = min(len(chain_stats[c]["diverging"]) for c in range(chains))
+            arrays = {}
+            for vname in sorted(wanted):
+                rows = []
+                for c in range(chains):
+                    vals = chain_values.get(c, {}).get(vname, [])[:n]
+                    if len(vals) < n:
+                        raise ValueError("incomplete chain")
+                    rows.append(_np.stack(vals))
+                arrays[value_to_rv[vname]] = _np.stack(rows)
+            stat = {
+                key: _np.array([chain_stats[c][key][:n] for c in range(chains)])
+                for key in ("diverging", "energy", "maxdepth")
+            }
+            return cv.draws_from_arrays(
+                arrays, diverging=stat["diverging"],
+                energy=stat["energy"] if _np.isfinite(stat["energy"]).all() else None,
+                maxdepth=stat["maxdepth"], superchain_ids=sc_ids,
+            )
+
         def do_sample_pymc():
-            nonlocal idata, sampling_error, stopped_early
+            nonlocal idata, sampling_error
             try:
                 with model:
                     idata = pm.sample(
                         draws=draws, tune=tune, chains=chains, cores=cores,
                         nuts_sampler="pymc",  # force the pure-pymc sampler: only it
                         callback=progress_callback,  # supports the per-draw callback
-                        progressbar=False, **sample_kwargs,
+                        progressbar=False, random_seed=random_seed, **sample_kwargs,
                     )
             except KeyboardInterrupt:
-                stopped_early = True  # PyMC preserves the partial trace in idata
+                pass  # PyMC keeps the partial trace when the callback interrupts
             except Exception as exc:
                 sampling_error = exc
 
@@ -497,20 +856,27 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
             snap = _drain_and_yield()
             if snap:
                 yield snap
-            conv = _pymc_convergence(chain_traces, counters, msgpack)
-            if conv:
-                yield conv
-                if until and _conv_meets_target(conv, until):
-                    converged = True
-                    should_stop["v"] = True  # callback raises -> keeps partial trace
+            post_min = (
+                min(len(chain_stats[c]["diverging"]) for c in range(chains))
+                if wanted and all(c in chain_stats for c in range(chains)) else 0
+            )
+            if stop_at["n"] is None and not should_stop["v"] and controller.due(post_min):
+                event, a = _checkpoint(_pymc_draws)
+                if event:
+                    yield event
+                    last_step = a
+                    if a["decision"] in ("met", "futile"):
+                        decision = a["decision"]
+                        stop_at["n"] = max(len(cs["diverging"]) for cs in chain_stats.values())
             if not should_stop["v"] and _stop_requested(stop_dict, stop_key):
+                stopped_by_user = True
                 should_stop["v"] = True  # callback raises KeyboardInterrupt on its next draw
         sample_thread.join()
         snap = _drain_and_yield()
         if snap:
             yield snap
 
-    # -- Error / stop / completion phase --
+    # -- Error / stop phase --
     if sampling_error is not None:
         import traceback
 
@@ -522,57 +888,64 @@ def _sample_and_stream(model, sample_kwargs, nuts_sampler="nutpie", stop_dict_na
         })
         raise sampling_error
 
-    if not stopped_early and stop_dict is not None:
-        stopped_early = _stop_requested(stop_dict, stop_key)
+    if not stopped_by_user and decision is None and stop_dict is not None:
+        stopped_by_user = _stop_requested(stop_dict, stop_key)
 
-    if converged:
-        yield msgpack.packb({
-            "type": "phase", "phase": "sampling", "status": "done",
-            "message": f"converged ({counters['total_draws']} draws, target met)",
-            "elapsed": round(time.time() - sample_start, 1),
-        })
-    elif stopped_early:
-        yield msgpack.packb({
-            "type": "phase", "phase": "sampling", "status": "done",
-            "message": f"stopped early ({counters['total_draws']} draws)",
-            "elapsed": round(time.time() - sample_start, 1),
-        })
-    else:
-        yield msgpack.packb({
-            "type": "phase", "phase": "sampling", "status": "done",
-            "message": "sampling complete",
-            "elapsed": round(time.time() - sample_start, 1),
-        })
-
-    # -- Serialize and return InferenceData --
     if idata is None:
-        if stopped_early:
+        if stopped_by_user or decision:
             raise RuntimeError(
                 "sampling was stopped before any draws could be returned "
                 "(the partial trace was not recoverable)"
             )
         raise RuntimeError("Sampling produced no results")
 
-    _sanitize_idata_attrs(idata)
-
-    import os
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-        tmp_path = tmp.name
     try:
-        idata.to_netcdf(tmp_path)
-        with open(tmp_path, "rb") as f:
-            idata_compressed = lz4.frame.compress(f.read())
-    finally:
-        os.unlink(tmp_path)
+        n_chains_out = int(_get_group(idata, "posterior").sizes["chain"])
+    except Exception:
+        n_chains_out = chains
+    if sc_ids is not None and n_chains_out != len(sc_ids):
+        sc_ids = None  # a stop dropped chains; the superchain groups are gone
+    if sc_ids is not None:
+        try:
+            _get_group(idata, "posterior").attrs[cv.SUPERCHAIN_ATTR] = list(sc_ids)
+        except Exception:
+            pass
 
-    yield msgpack.packb({
-        "type": "result",
-        "size_mb": round(len(idata_compressed) / (1024 * 1024), 2),
-    })
+    # -- Final verdict on the complete trace --
+    if decision == "met":
+        status = "met"
+    elif decision == "futile":
+        status = "futile"
+    elif stopped_by_user:
+        status = "stopped"
+    elif until:
+        status = "cap"
+    else:
+        status = "complete"
+    report = None
+    try:
+        d = cv.draws_from_idata(idata, var_names=names, superchain_ids=sc_ids)
+        a = cv.assess(d, target)
+        if status == "futile" and last_step is not None:
+            a["cause"], a["hint"] = last_step.get("cause"), last_step.get("hint")
+        elif not a["met"]:
+            a["cause"], a["hint"] = cv.diagnose(d, a)
+        a["projected_draws"] = cv.projected_draws(a)
+        a["decision"] = decision or "complete"
+        yield _convergence_event(a, d, total_draws=counters["total_draws"], final=True)
+        report = cv.make_report(a, status=status, target=until)
+    except Exception:
+        report = None
+    return {"idata": idata, "report": report,
+            "message": "stopped early" if stopped_by_user else "sampling complete"}
 
-    yield idata_compressed
+
+def _fixed_point(start):
+    """An initial-point function that always returns ``start`` (a superchain's
+    shared starting point), whatever seed nutpie passes."""
+    def initial_point(_seed):
+        return start.copy()
+    return initial_point
 
 
 # Sampler settings nutpie accepts through ``nutpie.sample(**kwargs)``. Its
@@ -612,116 +985,6 @@ def _split_nutpie_kwargs(nutpie, sample_kwargs: dict) -> tuple[dict, dict]:
     forwarded = {k: v for k, v in sample_kwargs.items() if k in accepted}
     dropped = {k: v for k, v in sample_kwargs.items() if k not in accepted}
     return forwarded, dropped
-
-
-def _has_scalar_free_rvs(model) -> bool:
-    """Whether the model has at least one scalar free RV.
-
-    Convergence (and therefore ``until=``) is computed over (chain, draw)
-    variables only; a model whose every parameter is vector-valued yields no
-    convergence entries at all.
-    """
-    try:
-        shapes = model.eval_rv_shapes()
-    except Exception:
-        shapes = {}
-    for rv in getattr(model, "free_RVs", []):
-        shape = shapes.get(rv.name)
-        if shape is None:
-            shape = tuple(d for d in (rv.type.shape or ()) if d is not None)
-        if not shape:  # () -> scalar
-            return True
-    return False
-
-
-def _conv_meets_target(conv_bytes, until) -> bool:
-    """Whether a packed convergence event clears the adaptive target for EVERY
-    scalar param: rhat <= until['r_hat'] and bulk/tail ESS >= until['ess']."""
-    import msgpack
-
-    try:
-        d = msgpack.unpackb(conv_bytes, raw=False)
-    except Exception:
-        return False
-    params = d.get("params") or {}
-    if not params:
-        return False
-    rhat_max = float(until.get("r_hat", 1.01))
-    ess_min = float(until.get("ess", 400))
-    for p in params.values():
-        if float(p.get("rhat", 1e9)) > rhat_max:
-            return False
-        if float(p.get("ess_bulk", 0)) < ess_min or float(p.get("ess_tail", 0)) < ess_min:
-            return False
-    return True
-
-
-def _pymc_convergence(chain_traces, counters, msgpack):
-    """Compute live R-hat / ESS from the pymc path's accumulated post-warmup
-    scalar traces. Throttled to every 50 total draws; needs >=2 chains."""
-    import numpy as _np
-
-    if len(chain_traces) < 2:
-        return None
-    all_lens = [len(v) for ct in chain_traces.values() for v in ct.values()]
-    min_draws = min(all_lens) if all_lens else 0
-    if min_draws < 20:
-        return None
-    if counters["total_draws"] - counters["last_conv_draws"] < 50:
-        return None
-    counters["last_conv_draws"] = counters["total_draws"]
-
-    try:
-        import arviz as az
-
-        param_names = set()
-        for ct in chain_traces.values():
-            param_names.update(ct.keys())
-
-        convergence = {}
-        traces = {}
-        max_trace_points = 500
-        for param in sorted(param_names):
-            chain_values = [
-                chain_traces[cid][param]
-                for cid in sorted(chain_traces.keys())
-                if param in chain_traces[cid]
-            ]
-            if len(chain_values) < 2:
-                continue
-            min_len = min(len(cv) for cv in chain_values)
-            if min_len < 50:
-                continue
-            arr = _np.array([cv[:min_len] for cv in chain_values])  # (chains, draws)
-            try:
-                convergence[param] = {
-                    "rhat": round(float(az.rhat(arr)), 4),
-                    "ess_bulk": round(float(az.ess(arr))),
-                    "ess_tail": round(_ess_tail(arr)),
-                }
-            except Exception:
-                continue
-            sub = []
-            for cv in chain_values:
-                vals = cv
-                if len(vals) > max_trace_points:
-                    step = max(1, len(vals) // max_trace_points)
-                    vals = vals[::step][:max_trace_points]
-                sub.append(list(vals))
-            traces[param] = sub
-
-        if convergence:
-            return msgpack.packb({
-                "type": "convergence",
-                "params": convergence,
-                "draws": min_draws,
-                "total_draws": counters["total_draws"],
-                "traces": traces,
-                "partial": True,
-            })
-    except Exception:
-        return None
-    return None
 
 
 def _unpack_model_payload(obj, sample_kwargs: dict, nuts_sampler: str):

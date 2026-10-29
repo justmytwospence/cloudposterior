@@ -216,21 +216,17 @@ def test_build_sinks_stops_the_display_when_a_later_step_raises(monkeypatch):
 
 # -- worker adaptive-stop guard ---------------------------------------------
 
-def test_until_detects_a_model_with_no_scalar_parameters():
-    """Convergence is computed over (chain, draw) variables only, so until=
-    could never fire on a purely vector-valued model."""
+def test_until_monitors_vector_only_models():
+    """until= used to evaluate scalar parameters only and silently gave up on a
+    purely vector-valued model; every element of every free RV is monitored now."""
     import pymc as pm
 
-    from cloudposterior.remote.worker import _has_scalar_free_rvs
+    from cloudposterior.remote.worker import _monitored_names
 
     with pm.Model() as vector_only:
         pm.Normal("beta", 0, 1, shape=5)
-    assert _has_scalar_free_rvs(vector_only) is False
-
-    with pm.Model() as has_scalar:
-        pm.Normal("beta", 0, 1, shape=5)
-        pm.HalfNormal("sigma", 1)
-    assert _has_scalar_free_rvs(has_scalar) is True
+    assert _monitored_names(vector_only, {"var_names": None}) == ["beta"]
+    assert _monitored_names(vector_only, {"var_names": ["beta"]}) == ["beta"]
 
 
 def test_sampling_progress_defaults_are_sane():
