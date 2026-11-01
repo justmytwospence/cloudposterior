@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -11,6 +11,15 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+]
+
+[[package]]
+name = "agent-plugins"
+version = "0.2.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/a7/f0a0f42623958323c466f8208793d500642e3653440cc43676a021f97c94/agent_plugins-0.2.4.tar.gz", hash = "sha256:cde29a40ba26dfa0fe7a978d18abb2cb724168efefb03423fcae93b06258c4bf", size = 40913, upload-time = "2026-09-20T18:59:06.636Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8b/e0/fce035140da2730aaf0816dd49b6660d9feb91c6fe5cad7485517c80affd/agent_plugins-0.2.4-py3-none-any.whl", hash = "sha256:67f5255df2229823f22f2b0eb5e16f7f5828c6d72968eadebb6b3d1099a0ebc8", size = 61017, upload-time = "2026-09-20T18:59:05.125Z" },
 ]
 
 [[package]]
@@ -607,6 +616,7 @@ dev = [
     { name = "graphviz" },
     { name = "ipykernel" },
     { name = "marimo" },
+    { name = "marimo-lens" },
     { name = "nbformat" },
     { name = "nutpie", version = "0.16.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "nutpie", version = "0.16.10", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -643,7 +653,8 @@ provides-extras = ["nutpie"]
 dev = [
     { name = "graphviz", specifier = ">=0.20" },
     { name = "ipykernel", specifier = ">=6.0" },
-    { name = "marimo", specifier = ">=0.13" },
+    { name = "marimo", specifier = ">=0.25.0" },
+    { name = "marimo-lens", specifier = ">=0.2.3" },
     { name = "nbformat", specifier = ">=5.0" },
     { name = "nutpie", specifier = ">=0.13" },
     { name = "pandas", specifier = ">=2.0" },
@@ -1825,32 +1836,50 @@ wheels = [
 
 [[package]]
 name = "marimo"
-version = "0.23.8"
+version = "0.25.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
     { name = "docutils" },
     { name = "itsdangerous" },
     { name = "jedi" },
-    { name = "loro" },
+    { name = "loro", marker = "sys_platform != 'android' and sys_platform != 'emscripten'" },
     { name = "markdown" },
     { name = "msgspec" },
     { name = "narwhals" },
     { name = "packaging" },
-    { name = "psutil" },
+    { name = "psutil", marker = "sys_platform != 'android' and sys_platform != 'emscripten'" },
     { name = "pygments" },
     { name = "pymdown-extensions" },
     { name = "python-multipart" },
     { name = "pyyaml" },
-    { name = "pyzmq", marker = "python_full_version < '3.15'" },
-    { name = "starlette" },
+    { name = "pyzmq", marker = "python_full_version < '3.15' and sys_platform != 'emscripten'" },
+    { name = "starlette", marker = "sys_platform != 'emscripten'" },
     { name = "tomlkit" },
-    { name = "uvicorn" },
-    { name = "websockets" },
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
+    { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
+    { name = "websockets", marker = "sys_platform != 'emscripten'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f2/fe/a1dec6111a660ee3bd26521c24788e7aef519a31c60cf37f767f29313454/marimo-0.23.8.tar.gz", hash = "sha256:8049df4ad263e7126e959d7d910b014e6181dffe49f540a89c3174e61a446a99", size = 38505767, upload-time = "2026-05-22T16:24:19.881Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/a7/4f0cc52e7c875997e7026e737f7a20f75786d2d65e572a1a0ef9cd5204ce/marimo-0.25.0.tar.gz", hash = "sha256:0005827578027cf9ea2cce039e099c029a9323a3467cb15100228918c1608ad1", size = 50236089, upload-time = "2026-09-23T21:48:33.867Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/76/51b57a2e521b9110f25ec935f2774412e2f3d678b3fdea7841987244fb2c/marimo-0.23.8-py3-none-any.whl", hash = "sha256:99a4035d035fb320c8f2dcefc2213e0d64e9de13e989bc3f2a973b19dc40542a", size = 38938839, upload-time = "2026-05-22T16:24:16.102Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/0d/055b436b509ffd6e7f9307dacd95f58c7fbb6c75a1eafca3c6047e7f13a6/marimo-0.25.0-py3-none-any.whl", hash = "sha256:43bb4d82d713f44fc064e77668e59a9fbb6172a6cf7c3abe25c15ef2cb1cce31", size = 50902999, upload-time = "2026-09-23T21:48:29.047Z" },
+]
+
+[[package]]
+name = "marimo-lens"
+version = "0.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "agent-plugins" },
+    { name = "anywidget" },
+    { name = "marimo" },
+    { name = "pydantic" },
+    { name = "traitlets" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/46/18cd9d7e107016e0c13e49d82633a1c362e00344e6ce246101015a9af3e0/marimo_lens-0.2.3.tar.gz", hash = "sha256:21d96d39571d6f2e89715bd0d44909cdbdb77e70142e611a72a188dcdf002ef6", size = 225173, upload-time = "2026-09-29T11:16:18.822Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/f4/5c805817a155c39c98a8225dc70c8ddae64d6b22577600e715f9fc5a9111/marimo_lens-0.2.3-py3-none-any.whl", hash = "sha256:2df4279bf382f9cf8e0d53a208badefd1bd3ed1a3908d52fc8a244a31bac6ae1", size = 242148, upload-time = "2026-09-29T11:16:17.735Z" },
 ]
 
 [[package]]
