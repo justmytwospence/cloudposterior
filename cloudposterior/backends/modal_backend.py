@@ -10,6 +10,7 @@ import warnings
 from typing import Iterator
 
 import msgpack
+from fastapi import Header, Request
 
 from cloudposterior.backends import ComputeBackend, RemoteEnvironment, SamplingJob
 from cloudposterior.config import DEFAULT_PACKAGES, OPTIONAL_PACKAGES, RemoteConfig
@@ -167,7 +168,7 @@ def _build_pip_specs(
     # default works even if the user doesn't have nutpie locally. It is NOT
     # pinned to the local version: nutpie recompiles the model remotely, so only
     # the model pickle (pymc/pytensor/numpy) must version-match. The >=0.13 floor
-    # guarantees the progress_callback API used for live monitoring.
+    # supports background inspect/abort/wait; older releases use trace polling.
     if not gpu:
         specs.append("nutpie>=0.13")
 
@@ -205,10 +206,8 @@ def _create_modal_app(manifest: dict[str, str], config: RemoteConfig,
     image = (
         modal.Image.debian_slim(python_version=py_major_minor)
         .uv_pip_install(pip_specs)
-        # ignore=[] overrides the default "only .py files": the dashboard's
-        # vendored uPlot assets under cloudposterior/static/ must ship too, or
-        # rendering the page raises in the container.
-        .add_local_python_source("cloudposterior", ignore=[])
+        # Include Python sources and the monitor's packaged dashboard assets.
+        .add_local_python_source("cloudposterior", "pymc_monitor", "pymc_cache", ignore=[])
     )
 
     app = modal.App("cloudposterior")
@@ -408,11 +407,35 @@ def _build_image(manifest: dict[str, str], gpu: str | None = None,
     return (
         modal.Image.debian_slim(python_version=py_major_minor)
         .uv_pip_install(pip_specs)
-        # ignore=[] overrides the default "only .py files": the dashboard's
-        # vendored uPlot assets under cloudposterior/static/ must ship too, or
-        # rendering the page raises in the container.
-        .add_local_python_source("cloudposterior", ignore=[])
+        # Include Python sources and the monitor's packaged dashboard assets.
+        .add_local_python_source("cloudposterior", "pymc_monitor", "pymc_cache", ignore=[])
     )
+
+
+def _dashboard_cors_headers(origin: str) -> dict[str, str]:
+    """Allow credential-free dashboard fetches across Modal endpoint hosts.
+
+    The query token, not the Origin header, authorizes progress/stop. Origin
+    reflection is restricted to well-formed HTTPS origins (and local loopback
+    for development); CORS never grants access without the token.
+    """
+    from urllib.parse import urlsplit
+
+    headers = {"Vary": "Origin"}
+    if not isinstance(origin, str) or any(c.isspace() for c in origin):
+        return headers
+    try:
+        parsed = urlsplit(origin)
+        hostname = parsed.hostname
+        parsed.port  # Reject an invalid port even when the hostname is valid.
+    except ValueError:
+        return headers
+    if (parsed.scheme == "https" or
+            parsed.scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}):
+        if (hostname and parsed.username is None and parsed.password is None
+                and not any((parsed.path, parsed.query, parsed.fragment))):
+            headers["Access-Control-Allow-Origin"] = origin
+    return headers
 
 
 def _create_persistent_app(
@@ -524,15 +547,17 @@ def _create_persistent_app(
         # in-notebook stop button, so it exists whenever control infra does.
         @app.function(serialized=True, image=image)
         @modal.fastapi_endpoint(method="POST", label=_stop_label)
-        async def serve_stop(token: str = "", model: str = ""):
+        async def serve_stop(token: str = "", model: str = "", origin: str = Header(default="")):
             import hmac
 
             import modal as _modal
             from fastapi.responses import JSONResponse
             # Require the token baked into the page so a random caller who
             # finds the stop URL can't kill someone's sampling run.
+            headers = _dashboard_cors_headers(origin)
             if not _stop_token or not hmac.compare_digest(token, _stop_token):
-                return JSONResponse({"stopped": False, "error": "invalid token"}, status_code=403)
+                return JSONResponse({"stopped": False, "error": "invalid token"},
+                                    status_code=403, headers=headers)
             try:
                 # from_name is a lazy reference (no I/O); only get/put have .aio.
                 d = _modal.Dict.from_name(_dict_name)
@@ -543,9 +568,10 @@ def _create_persistent_app(
                 # Reporting success here made a failed stop (deleted Dict,
                 # network error) indistinguishable from a working one.
                 return JSONResponse(
-                    {"stopped": False, "error": str(exc)}, status_code=500
+                    {"stopped": False, "error": str(exc)}, status_code=500,
+                    headers=headers,
                 )
-            return JSONResponse({"stopped": True})
+            return JSONResponse({"stopped": True}, headers=headers)
 
         stop_fn = serve_stop
 
@@ -553,24 +579,28 @@ def _create_persistent_app(
         if dashboard:
             @app.function(serialized=True, image=image)
             @modal.fastapi_endpoint(method="GET", label=_dash_label)
-            def serve_dashboard(token: str = ""):
+            def serve_dashboard(request: Request, token: str = ""):
                 import hmac
 
                 from fastapi.responses import HTMLResponse, JSONResponse
 
-                from cloudposterior.dashboard import render_dashboard_html
+                from cloudposterior.dashboard import (
+                    dashboard_content_security_policy,
+                    render_dashboard_html,
+                )
                 if not _stop_token or not hmac.compare_digest(token, _stop_token):
                     return JSONResponse({"error": "invalid token"}, status_code=403)
-                return HTMLResponse(render_dashboard_html(
-                    progress_label=_progress_label,
-                    stop_label=_stop_label,
-                    dashboard_label=_dash_label,
-                    stop_token=_stop_token,
-                ))
+                kwargs = dict(progress_label=_progress_label, stop_label=_stop_label,
+                              dashboard_label=_dash_label, stop_token=_stop_token,
+                              origin=str(request.base_url))
+                return HTMLResponse(render_dashboard_html(**kwargs), headers={
+                    "Content-Security-Policy": dashboard_content_security_policy(**kwargs),
+                    "Cache-Control": "no-store",
+                })
 
             @app.function(serialized=True, image=image)
             @modal.fastapi_endpoint(method="GET", label=_progress_label)
-            async def serve_progress(token: str = ""):
+            async def serve_progress(token: str = "", origin: str = Header(default="")):
                 # Async handler + .aio() Modal calls: FastAPI runs this on an
                 # event loop, so blocking calls here would warn and stall it.
                 import hmac
@@ -579,8 +609,10 @@ def _create_persistent_app(
                 from fastapi.responses import JSONResponse
                 # This returns parameter names and raw posterior draws, so it
                 # is gated on the same token as /stop.
+                headers = _dashboard_cors_headers(origin)
                 if not _stop_token or not hmac.compare_digest(token, _stop_token):
-                    return JSONResponse({"error": "invalid token"}, status_code=403)
+                    return JSONResponse({"error": "invalid token"}, status_code=403,
+                                        headers=headers)
                 default = {"phases": [], "sampling": None, "complete": False}
                 try:
                     # from_name is a lazy reference (no I/O); only get/put have .aio.
@@ -599,7 +631,7 @@ def _create_persistent_app(
                         data = await d.get.aio("progress", default)
                 except Exception:
                     data = default
-                return JSONResponse(data)
+                return JSONResponse(data, headers=headers)
 
             dashboard_fn = serve_dashboard
             progress_fn = serve_progress

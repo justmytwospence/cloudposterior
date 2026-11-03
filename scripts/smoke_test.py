@@ -44,11 +44,14 @@ def main() -> None:
     # Bundled non-Python files must actually ship in the artifact.
     from importlib.resources import files
 
-    pkg = files("cloudposterior")
-    assert pkg.joinpath("py.typed").is_file(), "py.typed missing from the artifact"
-    assert pkg.joinpath("static", "uPlot.iife.min.js").is_file(), (
-        "vendored dashboard assets missing from the artifact"
+    for package in ("cloudposterior", "pymc_monitor", "pymc_cache"):
+        assert files(package).joinpath("py.typed").is_file(), (
+            f"{package} py.typed missing from the artifact"
+        )
+    assert files("pymc_monitor").joinpath("static", "uPlot.iife.min.js").is_file(), (
+        "monitor's vendored dashboard assets missing from the artifact"
     )
+    assert not files("cloudposterior").joinpath("static", "uPlot.iife.min.js").is_file()
     print("smoke test OK")
 
 

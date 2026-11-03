@@ -2,8 +2,6 @@
 
 from unittest.mock import patch
 
-import pytest
-
 from cloudposterior.backends.modal_backend import _build_pip_specs
 from cloudposterior.config import RemoteConfig
 
@@ -52,7 +50,9 @@ def test_create_modal_app_threads_nuts_sampler(monkeypatch):
         def uv_pip_install(self, specs):
             return self
 
-        def add_local_python_source(self, name, ignore=None):
+        def add_local_python_source(self, *names, ignore=None):
+            captured["shipped_modules"] = names
+            captured["ignore"] = ignore
             return self
 
     class FakeApp:
@@ -70,12 +70,12 @@ def test_create_modal_app_threads_nuts_sampler(monkeypatch):
         mb._create_modal_app(_manifest(), RemoteConfig(), "numpyro")
 
     assert captured["nuts_sampler"] == "numpyro"
+    assert captured["shipped_modules"] == ("cloudposterior", "pymc_monitor", "pymc_cache")
+    assert captured["ignore"] == []
 
 
 def test_image_includes_package_data_files():
-    """Modal's add_local_python_source ships only .py files by default, so the
-    dashboard's vendored uPlot assets never reached the container and rendering
-    the page 500'd. Both image builders must override that."""
+    """Ship monitor's inline dashboard assets with all Python source modules."""
     import inspect
 
     from cloudposterior.backends import modal_backend as mb
@@ -83,20 +83,18 @@ def test_image_includes_package_data_files():
     for fn in (mb._build_image, mb._create_modal_app):
         src = inspect.getsource(fn)
         assert "add_local_python_source" in src, fn.__name__
-        assert "ignore=[]" in src, (
-            f"{fn.__name__} must pass ignore=[] so cloudposterior/static/ ships"
+        assert '"cloudposterior", "pymc_monitor", "pymc_cache", ignore=[]' in src, (
+            f"{fn.__name__} must ship all three modules and monitor assets"
         )
 
 
-def test_static_assets_are_importable_as_package_data():
-    from cloudposterior.dashboard import _static
+def test_static_assets_belong_only_to_monitor():
+    from importlib.resources import files
 
-    assert "uPlot" in _static("uPlot.iife.min.js")
-    assert "uplot" in _static("uPlot.min.css").lower()
+    from pymc_monitor.dashboard import dashboard_assets
 
-
-def test_missing_static_asset_reports_the_likely_cause():
-    from cloudposterior.dashboard import _static
-
-    with pytest.raises(RuntimeError, match="missing from this environment"):
-        _static("does-not-exist.js")
+    assets = dashboard_assets()
+    assert b"uPlot" in assets["uPlot.iife.min.js"]
+    assert b"uPlot" in assets["uPlot.LICENSE"]
+    assert b"dashboard" in assets["dashboard.js"].lower()
+    assert not files("cloudposterior").joinpath("static", "uPlot.iife.min.js").is_file()

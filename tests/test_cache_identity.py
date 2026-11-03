@@ -12,6 +12,7 @@ import textwrap
 
 import numpy as np
 import pymc as pm
+import pytest
 
 from cloudposterior.naming import cache_key, model_digest
 
@@ -99,9 +100,8 @@ def test_same_rng_state_shares_a_cache_entry():
     assert a == b
 
 
-def test_callable_kwargs_are_stable_across_instances():
-    """repr() embeds a memory address, so a callback= kwarg could never hit
-    its own cache entry twice."""
+def test_callable_kwargs_fail_closed_without_explicit_identity():
+    """Two callbacks with the same qualified name may have different behavior."""
 
     def make():
         def cb(*a, **k):
@@ -109,10 +109,11 @@ def test_callable_kwargs_are_stable_across_instances():
 
         return cb
 
+    from pymc_cache.identity import UncacheableError
+
     ident = model_digest(_model())
-    assert cache_key(ident, {"callback": make()}) == cache_key(
-        ident, {"callback": make()}
-    )
+    with pytest.raises(UncacheableError):
+        cache_key(ident, {"callback": make()})
 
 
 def test_key_material_is_length_delimited():

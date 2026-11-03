@@ -180,6 +180,10 @@ DEFAULT_PACKAGES = [
     "cloudpickle",
     "lz4",
     "msgpack",
+    "scipy",
+    "xarray",
+    "h5netcdf",
+    "h5py",
     "fastapi[standard]",
 ]
 

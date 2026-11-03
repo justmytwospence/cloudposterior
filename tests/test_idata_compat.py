@@ -36,11 +36,12 @@ def test_sanitize_makes_dict_attr_netcdf_safe(tmp_path):
     idata = _idata()
     grp = get_group(idata, "posterior")
     grp.attrs["nutpie_like"] = {"settings": {"a": 1}, "b": [1, 2, 3]}  # dict-valued attr
-    sanitize_inference_data(idata)
-    # The dict attr must now be a serializable scalar (JSON string).
-    assert isinstance(get_group(idata, "posterior").attrs.get("nutpie_like"), str)
+    sanitized = sanitize_inference_data(idata)
+    # Storage sanitation preserves the original caller's attrs on a copy.
+    assert isinstance(get_group(idata, "posterior").attrs["nutpie_like"], dict)
+    assert isinstance(get_group(sanitized, "posterior").attrs["nutpie_like"], str)
     path = tmp_path / "out.nc"
-    idata.to_netcdf(str(path))  # must not raise
+    sanitized.to_netcdf(str(path))  # must not raise
     assert path.exists()
 
 

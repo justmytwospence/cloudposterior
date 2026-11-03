@@ -24,12 +24,14 @@ classifiers = [
 dependencies = [
     # <7 so a future major that changes the sampling API again can't silently
     # break installs; PyMC 5 and 6 are both supported (see _idata.pymc_major).
-    "pymc>=5,<7",
+    "pymc>=5.28,<7",
+    "pymc-monitor[notebook,dashboard]>=0.1.0,<0.2",
+    "pymc-cache>=0.1.0,<0.2",
     "arviz>=0.17,<2.0",
     "numpy>=1.24",
     # imported directly (api.py fingerprints SharedVariables); pymc pins the
     # actual version, this floor just makes the dependency explicit
-    "pytensor>=2.18",
+    "pytensor>=2.38",
     "anywidget>=0.9",
     "cloudpickle>=3.0",
     "coolname>=4.0",

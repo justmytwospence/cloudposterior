@@ -9,6 +9,40 @@ from cloudposterior.remote.worker import run_sampling
 from cloudposterior.serialize import create_payload
 
 
+@pytest.mark.parametrize("sampler_auto,tune_default,expected_sampler,expected_tune", [
+    (True, True, None, None),
+    (False, False, "nutpie", 75),
+    (True, False, None, 75),
+])
+def test_worker_preserves_sampler_and_tune_intent(monkeypatch, sampler_auto, tune_default,
+                                                   expected_sampler, expected_tune):
+    from types import SimpleNamespace
+
+    from cloudposterior.remote import worker
+    from cloudposterior.serialize import serialize_model
+
+    seen = []
+
+    def fake_iter(model, kwargs, **options):
+        seen.append((dict(kwargs), options))
+        if False:
+            yield
+        return SimpleNamespace(idata=object(), report={})
+
+    monkeypatch.setattr("pymc_monitor.engine.iter_sample", fake_iter)
+    monkeypatch.setattr("cloudposterior.convergence.attach_report", lambda *args: None)
+    monkeypatch.setattr("cloudposterior._idata.get_group", lambda *args: None)
+    monkeypatch.setattr("cloudposterior.serialize.serialize_inference_data", lambda _: b"wire")
+    kwargs = {"draws": 5, "tune": 75, "_cp_sampler_auto": sampler_auto,
+              "_cp_tune_default": tune_default}
+    _drain_worker(worker.run_sampling(serialize_model(_tiny_model()), kwargs,
+                                      nuts_sampler="nutpie"))
+    sampled, options = seen.pop()
+    assert options["nuts_sampler"] == expected_sampler
+    assert sampled.get("tune") == expected_tune
+    assert not {"_cp_sampler_auto", "_cp_tune_default"} & sampled.keys()
+
+
 def test_worker_end_to_end():
     """Run the worker generator locally and verify we get progress + results."""
     y = np.array([28, 8, -3, 7, -1, 1, 18, 12], dtype=np.float64)
@@ -20,7 +54,8 @@ def test_worker_end_to_end():
         theta = pm.Normal("theta", mu=mu, sigma=tau, shape=8)
         pm.Normal("obs", mu=theta, sigma=sigma, observed=y)
 
-    payload = create_payload(model, {"draws": 20, "tune": 20, "chains": 1})
+    payload = create_payload(model, {"draws": 20, "tune": 20, "chains": 1,
+                                     "random_seed": 42})
 
     events = []
     idata_bytes = None
@@ -59,13 +94,9 @@ def test_worker_end_to_end():
 
     # Verify InferenceData can be deserialized
     assert idata_bytes is not None
-    import io
+    from cloudposterior.serialize import deserialize_inference_data
 
-    import arviz as az
-    import lz4.frame
-
-    raw = lz4.frame.decompress(idata_bytes)
-    idata = az.from_netcdf(io.BytesIO(raw))
+    idata = deserialize_inference_data(idata_bytes)
     from cloudposterior._idata import group_names
 
     assert "posterior" in group_names(idata)
@@ -198,18 +229,16 @@ def test_split_nutpie_kwargs_partitions_by_signature():
     assert forwarded == {"target_accept": 0.9} and set(dropped) == {"anything"}
 
 
-def test_worker_nutpie_forwards_target_accept_and_reports_dropped():
-    """The nutpie branch forwards supported kwargs and reports unsupported ones."""
+def test_worker_nutpie_forwards_target_accept_and_rejects_unknown_args():
+    """The monitor must not silently ignore an unsupported sampler setting."""
     pytest.importorskip("nutpie")
-    payload = create_payload(
-        _tiny_model(),
-        {"draws": 10, "tune": 10, "chains": 2, "target_accept": 0.95,
-         "definitely_not_a_kwarg": 1},
-    )
-    events, idata_bytes = _drain_worker(
+    kwargs = {"draws": 10, "tune": 10, "chains": 2, "target_accept": 0.95}
+    payload = create_payload(_tiny_model(), kwargs)
+    _, idata_bytes = _drain_worker(
         run_sampling(payload.model_bytes, payload.sample_kwargs, nuts_sampler="nutpie")
     )
     assert idata_bytes is not None
-    messages = [e.get("message", "") for e in events if e.get("type") == "phase"]
-    assert any("definitely_not_a_kwarg" in m for m in messages)
-    assert not any("target_accept" in m for m in messages)  # forwarded, not dropped
+
+    bad = create_payload(_tiny_model(), {**kwargs, "definitely_not_a_kwarg": 1})
+    with pytest.raises(ValueError, match="definitely_not_a_kwarg"):
+        _drain_worker(run_sampling(bad.model_bytes, bad.sample_kwargs, nuts_sampler="nutpie"))

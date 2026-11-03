@@ -39,7 +39,7 @@ def test_disk_cache_roundtrip(tmp_path):
         idata = pm.sample(draws=10, tune=10, chains=1, progressbar=False)
 
     sample_kwargs = {"draws": 10, "tune": 10, "chains": 1}
-    key = "a1b2c3d4e5f6g7h8"  # simulate a real cache key hash
+    key = "a1" * 32  # full SHA-256-length identity
 
     cache = DiskCache(base_dir=tmp_path, model=model)
     assert cache.load(key, sample_kwargs=sample_kwargs) is None
@@ -140,15 +140,14 @@ def test_disk_cache_rejects_traversal_in_params(tmp_path):
     assert ".." not in str(path)
 
 
-def test_disk_cache_uses_a_16_char_key_prefix(tmp_path):
+def test_disk_cache_uses_the_full_key(tmp_path):
     cache = _disk(tmp_path)
     key = "b" * 64
-    assert cache._path(key, {"draws": 10}).name.endswith(f"-{'b' * 16}.nc")
+    assert cache._path(key, {"draws": 10}).name.endswith(f"-{key}.nc")
 
 
 def test_disk_cache_verifies_the_full_key(tmp_path):
-    """The filename holds only a prefix; a collision must be a miss, not the
-    wrong posterior."""
+    """Different full keys never resolve to another posterior."""
     import arviz as az
 
     from cloudposterior._idata import add_group
@@ -161,7 +160,7 @@ def test_disk_cache_verifies_the_full_key(tmp_path):
     cache.save(key_a, idata, sample_kwargs={"draws": 10})
     assert cache.load(key_a, sample_kwargs={"draws": 10}) is not None
 
-    # Same 16-char prefix, different full key -> must not resolve to the entry.
+    # Same 16-char prefix, different full key -> different entry.
     key_b = "c" * 16 + "d" * 48
     assert cache.load(key_b, sample_kwargs={"draws": 10}) is None
 
@@ -212,7 +211,7 @@ def test_disk_cache_prunes_to_the_newest_entries(tmp_path):
     assert len(list(tmp_path.rglob("*.nc"))) == _DISK_KEEP_PER_MODEL
 
 
-def test_cleanup_cache_removes_the_tree(tmp_path):
+def test_cleanup_cache_only_removes_owned_entries(tmp_path):
     import arviz as az
 
     from cloudposterior._idata import add_group
@@ -223,5 +222,8 @@ def test_cleanup_cache_removes_the_tree(tmp_path):
     add_group(idata, "posterior", az.dict_to_dataset({"x": np.zeros((2, 5))}))
     cache.save("a" * 64, idata, sample_kwargs={"draws": 10})
 
+    unrelated = tmp_path / "notes.txt"
+    unrelated.write_text("keep")
     assert cleanup_cache(tmp_path) == 1
-    assert not tmp_path.exists()
+    assert unrelated.read_text() == "keep"
+    assert not list(tmp_path.rglob("*.nc"))

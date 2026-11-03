@@ -1,8 +1,20 @@
-"""Tests for the live dashboard sink and HTML rendering."""
+"""Tests for the shared state reducer and Modal-hosted dashboard adapter."""
+
+import base64
+import hashlib
+import html as html_module
+import json
+import re
 
 import pytest
 
-from cloudposterior.dashboard import DashboardSink, render_dashboard_html
+from cloudposterior.backends.modal_backend import _dashboard_cors_headers
+from cloudposterior.dashboard import (
+    DashboardSink,
+    _modal_endpoint_url,
+    dashboard_content_security_policy,
+    render_dashboard_html,
+)
 from cloudposterior.progress import (
     ChainProgress,
     ConvergenceUpdate,
@@ -12,13 +24,36 @@ from cloudposterior.progress import (
     SamplingProgress,
 )
 
+ORIGIN = "https://workspace--proj-abc-dev.modal.run/"
+
+
+def _render(**kwargs):
+    return render_dashboard_html(
+        progress_label="proj-abc-progress", stop_label="proj-abc-stop",
+        dashboard_label="proj-abc", stop_token="tok", origin=ORIGIN, **kwargs,
+    )
+
+
+def test_dashboard_endpoint_cors_requires_well_formed_origin():
+    assert _dashboard_cors_headers("https://dash.modal.run") == {
+        "Vary": "Origin", "Access-Control-Allow-Origin": "https://dash.modal.run",
+    }
+    assert _dashboard_cors_headers("http://localhost:8000") == {
+        "Vary": "Origin", "Access-Control-Allow-Origin": "http://localhost:8000",
+    }
+    for origin in ("null", "http://remote.example", "https://bad.example/path",
+                   "https://[", "https://user@bad.example", "https://@",
+                   "https://bad.example:bogus", "https://bad.example/a b", ""):
+        assert _dashboard_cors_headers(origin) == {"Vary": "Origin"}
+
 
 def test_dashboard_sink_writes_phase_and_sampling():
     store = {}
     sink = DashboardSink(store)
-    sink.show_phase(PhaseUpdate(phase=JobPhase.SAMPLING, status="in_progress", message="sampling", elapsed=0.0))
+    sink.show_phase(PhaseUpdate(JobPhase.SAMPLING, "in_progress", "sampling", 0.0))
     sink.show_sampling(SamplingProgress(
-        chains={0: ChainProgress(draw=10, total=100, phase="sampling", divergences=1, step_size=0.1, tree_size=7)},
+        chains={0: ChainProgress(10, 100, "sampling", divergences=1,
+                                  step_size=0.1, tree_size=7)},
         total_divergences=1, elapsed=1.0, total_draws=10,
     ))
     data = store["progress"]
@@ -39,11 +74,24 @@ def test_dashboard_sink_writes_convergence_and_traces():
     assert data["traces"]["mu"] == [[0.1, 0.2], [0.3, 0.4]]
 
 
-def test_dashboard_sink_sets_complete_on_download_done():
+def test_dashboard_completion_waits_for_download():
     store = {}
     sink = DashboardSink(store)
-    sink.show_phase(PhaseUpdate(phase=JobPhase.DOWNLOADING, status="done", message="trace loaded", elapsed=0.5))
+    sink.show_phase(PhaseUpdate(JobPhase.SAMPLING, "done", "sampled", 0.1))
+    assert store["progress"]["complete"] is False
+    sink.show_phase(PhaseUpdate(JobPhase.DOWNLOADING, "done", "trace loaded", 0.5))
     assert store["progress"]["complete"] is True
+
+
+def test_dashboard_retains_stop_status_until_trace_is_downloaded():
+    store = {}
+    sink = DashboardSink(store)
+    sink.finish("stopped")
+    assert store["progress"]["status"] == "stopped"
+    assert store["progress"]["complete"] is False
+    sink.show_phase(PhaseUpdate(JobPhase.DOWNLOADING, "done", "trace loaded", 0.5))
+    assert store["progress"]["complete"] is True
+    assert store["progress"]["status"] == "stopped"
 
 
 def test_dashboard_sink_is_best_effort_on_write_failure():
@@ -51,106 +99,79 @@ def test_dashboard_sink_is_best_effort_on_write_failure():
         def __setitem__(self, key, value):
             raise RuntimeError("modal dict unavailable")
 
-    sink = DashboardSink(BadDict())
-    # Must not raise -- progress writes are best-effort.
-    sink.show_phase(PhaseUpdate(phase=JobPhase.SAMPLING, status="done", message="x", elapsed=0.2))
+    DashboardSink(BadDict()).show_phase(PhaseUpdate(JobPhase.SAMPLING, "done", "x", 0.2))
 
 
-def test_render_dashboard_html_bakes_labels_and_vehtari_thresholds():
-    html = render_dashboard_html(
-        progress_label="proj-abc-progress", stop_label="proj-abc-stop",
-        dashboard_label="proj-abc", stop_token="tok",
+def test_modal_endpoint_url_replaces_exact_hostname_segment():
+    assert _modal_endpoint_url(ORIGIN, "proj-abc", "proj-abc-progress") == (
+        "https://workspace--proj-abc-progress-dev.modal.run"
     )
-    assert "proj-abc-progress" in html and "proj-abc-stop" in html
-    assert "__PROGRESS_LABEL__" not in html  # placeholders substituted
-    assert "1.01" in html and "400" in html  # rank-normalized R-hat / ESS thresholds
-
-
-def test_render_dashboard_html_requires_every_label():
-    """They previously defaulted to "", making origin.replace('', '') a silent
-    no-op that pointed the progress URL at the dashboard itself."""
-    with pytest.raises(ValueError, match="__STOP_TOKEN__"):
-        render_dashboard_html(
-            progress_label="p", stop_label="s", dashboard_label="d", stop_token="",
-        )
-
-
-def test_render_dashboard_html_escapes_js_string_breakout():
-    """A bare replace into a quoted JS literal breaks out on a quote or
-    backslash; substituting a JSON literal cannot."""
-    hostile = 'tok"; alert(1); //'
-    html = render_dashboard_html(
-        progress_label="p", stop_label="s", dashboard_label="d", stop_token=hostile,
+    prod = "https://workspace--proj-abc.modal.run/"
+    assert _modal_endpoint_url(prod, "proj-abc", "proj-abc-stop") == (
+        "https://workspace--proj-abc-stop.modal.run"
     )
-    # The raw (unescaped) form must not appear -- that would be live JS.
-    assert hostile not in html
-    # It appears only as an escaped JSON string literal.
-    assert 'const stopToken = "tok\\"; alert(1); //";' in html
+    for bad_origin in ("https://unrelated.example/", "https://user@workspace--proj-abc-dev.modal.run/",
+                       "https://workspace--proj-abc-dev.modal.run/path", "https://[",
+                       "https://workspace--proj-abc-dev.modal.run/?x=1"):
+        with pytest.raises(ValueError, match="unexpected Modal endpoint origin"):
+            _modal_endpoint_url(bad_origin, "proj-abc", "proj-abc-stop")
+    with pytest.raises(ValueError, match="invalid Modal endpoint label"):
+        _modal_endpoint_url(ORIGIN, "proj-abc", "stop?token=stolen")
 
 
-def test_dashboard_inlines_uplot_rather_than_using_a_cdn():
-    """The page holds the stop token and polls posterior draws, so third-party
-    script execution on its origin would be enough to exfiltrate both."""
-    html = render_dashboard_html(
-        progress_label="p", stop_label="s", dashboard_label="d", stop_token="tok",
-    )
-    assert "cdn.jsdelivr.net" not in html
-    assert "uPlot" in html
+def _render_config(page):
+    encoded = re.search(r'data-config="([^"]+)"', page)
+    assert encoded is not None
+    return json.loads(html_module.unescape(encoded.group(1)))
 
 
-def test_progress_fetch_carries_the_token():
-    html = render_dashboard_html(
-        progress_label="p", stop_label="s", dashboard_label="d", stop_token="tok",
-    )
-    assert "progressFetchUrl" in html
-    assert "fetch(progressFetchUrl)" in html
+def test_render_dashboard_html_uses_shared_inline_map_page():
+    page = _render()
+    assert _render_config(page) == {
+        "progress_url": "https://workspace--proj-abc-progress-dev.modal.run",
+        "stop_url": "https://workspace--proj-abc-stop-dev.modal.run",
+        "token": "tok",
+    }
+    assert "window.location.origin" not in page
+    assert "cdn.jsdelivr.net" not in page
+    assert "uPlot" in page
+    assert "function normalize" in page  # flat and {models, runs} shapes
+    assert "function requestStop" in page
+    assert 'id="overview"' in page and 'id="detail"' in page
+    assert '<script type="module"' not in page
+    assert "assets/" not in page
 
 
-def test_render_dashboard_html_bakes_stop_token():
-    html = render_dashboard_html(
-        progress_label="p", stop_label="s", dashboard_label="d", stop_token="secret-tok-123",
-    )
-    assert "secret-tok-123" in html
-    assert "__STOP_TOKEN__" not in html
+def test_dashboard_csp_hashes_inline_assets_and_allows_only_api_origins():
+    page = _render()
+    csp = dashboard_content_security_policy(
+        "proj-abc-progress", "proj-abc-stop", "proj-abc", "tok", origin=ORIGIN)
+    for tag, directive in (("style", "style-src"), ("script", "script-src")):
+        body = re.search(rf"<{tag}>(.*?)</{tag}>", page, re.S)
+        assert body is not None
+        digest = base64.b64encode(hashlib.sha256(body.group(1).encode()).digest()).decode()
+        assert f"{directive} 'sha256-{digest}'" in csp
+    assert "connect-src 'self' https://workspace--proj-abc-progress-dev.modal.run " in csp
+    assert "https://workspace--proj-abc-stop-dev.modal.run" in csp
+    assert "default-src 'none'" in csp
 
 
-def test_dashboard_sink_writes_under_custom_key():
-    """cp.map gives each model its own Dict key so concurrent workers don't clash."""
+def test_dashboard_requires_token_and_escapes_json_in_html_attribute():
+    with pytest.raises(ValueError, match="stop_token"):
+        render_dashboard_html("p", "s", "proj-abc", "", origin=ORIGIN)
+    hostile = 'tok"; alert(1); // <img src=x>'
+    page = render_dashboard_html("p", "s", "proj-abc", hostile, origin=ORIGIN)
+    assert hostile not in page
+    assert _render_config(page)["token"] == hostile
+    assert "<img src=x>" not in page
+
+
+def test_dashboard_sink_writes_under_custom_map_key():
     store = {}
     sink = DashboardSink(store, key="pooled-0")
     sink.show_phase(PhaseUpdate(JobPhase.SAMPLING, "in_progress", "go", 0.0))
     assert "pooled-0" in store and "progress" not in store
     sink.show_sampling(SamplingProgress(
-        chains={0: ChainProgress(draw=10, total=20, phase="sampling")},
-        total_divergences=0, elapsed=1.0, total_draws=10,
+        chains={0: ChainProgress(10, 20, "sampling")}, elapsed=1, total_draws=10,
     ))
     assert store["pooled-0"]["sampling"]["chains"]["0"]["draw"] == 10
-
-
-def test_render_dashboard_html_has_unified_multimodel_scaffold():
-    """The page carries the single render path: a per-model template, the
-    overview/detail outlets, client-side normalization, and one stop fn."""
-    html = render_dashboard_html(
-        progress_label="m-abc-progress", stop_label="m-abc-stop",
-        dashboard_label="m-abc", stop_token="tok",
-    )
-    for needle in [
-        'id="modelTpl"', 'id="overview"', 'id="detail"',
-        "function normalize", "function requestStop", "function renderTraces(container, traces, prefix)",
-    ]:
-        assert needle in html, f"missing scaffold: {needle}"
-
-
-def test_dashboard_html_escapes_dynamic_strings():
-    """Param names and worker messages are escaped before innerHTML."""
-    from cloudposterior.dashboard import render_dashboard_html
-
-    html = render_dashboard_html(
-        progress_label="m-p", stop_label="m-s", dashboard_label="m", stop_token="t"
-    )
-    assert "function esc(" in html
-    # every dynamic-string render site goes through esc()
-    assert "esc(cleanName(param))" in html
-    assert "esc(cleanName(name))" in html
-    assert "esc(active.detail)" in html
-    assert "esc(p.detail)" in html

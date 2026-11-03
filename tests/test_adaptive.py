@@ -4,7 +4,7 @@ The worker runs locally here (no Modal): ``run_sampling`` is the same
 generator the container drives.
 """
 
-import io
+import json
 
 import msgpack
 import numpy as np
@@ -49,11 +49,8 @@ def test_normalize_until_shared_by_cloud_and_map():
 
 
 def _run(model, kwargs, sampler):
-    import arviz as az
-    import lz4.frame
-
     from cloudposterior.remote.worker import run_sampling
-    from cloudposterior.serialize import create_payload
+    from cloudposterior.serialize import create_payload, deserialize_inference_data
 
     payload = create_payload(model, kwargs)
     events, result = [], None
@@ -62,7 +59,7 @@ def _run(model, kwargs, sampler):
             events.append(msgpack.unpackb(chunk, raw=False))
         except Exception:
             result = chunk
-    idata = az.from_netcdf(io.BytesIO(lz4.frame.decompress(result)))
+    idata = deserialize_inference_data(result)
     return events, idata
 
 
@@ -121,6 +118,8 @@ def test_worker_superchains_share_starts_and_use_nested_rhat(sampler):
     report = cv.read_report(idata)
     assert report["checks"]["r_hat"]["nested"] is True
     ids = idata.posterior.attrs[cv.SUPERCHAIN_ATTR]
+    if isinstance(ids, str):
+        ids = json.loads(ids)
     assert list(np.asarray(ids).tolist()) == [0, 0, 1, 1, 2, 2, 3, 3]
 
 
@@ -147,7 +146,7 @@ def test_escalation_ladder_steps():
     desc = _next_rung({"cause": "ess_stalled"}, settings, "pymc", applied)
     assert desc.startswith("tune")
     desc = _next_rung({"cause": "slow_mixing", "projected_draws": 1500}, settings, "nutpie", {})
-    assert settings["draws"] == 1800 and "draws cap" in desc
+    assert settings["draws"] == 1800 and "draws 1000 -> 1800" in desc
 
 
 def test_trim_incomplete_draws_and_concat_chains():

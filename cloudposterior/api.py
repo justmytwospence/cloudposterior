@@ -53,11 +53,6 @@ _PATCH_LOCK = threading.Lock()
 # see _ensure_model_bytes for why an attribute would be actively harmful.
 # model -> (observed_data_fingerprint, model_bytes)
 _MODEL_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-# step -> ((id(model), observed_data_fingerprint), combined_model_step_bytes)
-_STEP_BYTES_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-# model -> (observed_data_fingerprint, structural cache identity)
-_MODEL_DIGEST_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-
 # The real pm.* functions, captured the first time a block patches them.
 _TRUE_ORIGINALS: dict = {}
 
@@ -72,8 +67,6 @@ def _true_original(name: str):
 def _forget_model_bytes(model) -> None:
     """Drop memoized serializations for a model (used when tearing down)."""
     _MODEL_BYTES_CACHE.pop(model, None)
-    for step in [s for s, v in _STEP_BYTES_CACHE.items() if v[0][0] == id(model)]:
-        _STEP_BYTES_CACHE.pop(step, None)
 
 
 def _env_key(project: str, model) -> tuple:
@@ -123,6 +116,19 @@ def _check_superchains(until: dict | None, sample_kwargs: dict) -> None:
             f"until superchains={k} must divide chains={chains} evenly "
             "(each superchain holds the same number of chains)"
         )
+
+
+def _legacy_report_aliases(idata) -> None:
+    """Retain old cloudposterior attrs alongside the monitor's canonical attrs."""
+    from cloudposterior._idata import get_group
+
+    post = get_group(idata, "posterior")
+    if post is None:
+        return
+    for source, legacy in (("pymc_monitor_convergence", "cloudposterior_convergence"),
+                           ("pymc_monitor_superchains", "cloudposterior_superchains")):
+        if source in post.attrs:
+            post.attrs[legacy] = post.attrs[source]
 
 
 def _report_verdict(idata, *, label: str | None = None) -> None:
@@ -215,24 +221,14 @@ class cloud:
         overwrite: bool = False,
     ):
         _validate_init(init)
-        # dashboard=None means "default": on for remote, off for local with no
-        # warning. dashboard=True with remote=False is a user mistake -- warn.
-        if dashboard is True and not remote:
-            import warnings
-
-            warnings.warn(
-                "dashboard=True has no effect without remote=True; the live "
-                "dashboard requires cloud execution. Pass remote=True or omit "
-                "dashboard.",
-                stacklevel=2,
-            )
+        # Remote dashboards default on; local authenticated dashboards opt in.
         if dashboard is None:
-            dashboard = True
+            dashboard = remote
         self.model = model
         self.remote = remote
         self.cache = cache
         self.overwrite = overwrite
-        self.dashboard = dashboard and remote  # dashboard only works with remote
+        self.dashboard = dashboard
         self.notify = notify
         self.instance = instance
         self.progress = progress
@@ -419,8 +415,21 @@ class cloud:
             # so it doesn't leak into cache keys or the remote payload.
             kwargs.pop("model", None)
 
+            if not ctx.remote and kwargs.get("trace") is not None:
+                if ctx.until is not None or _normalize_until(kwargs.get("until")) is not None:
+                    raise ValueError("adaptive sampling is unavailable with trace=")
+                warnings.warn(
+                    "trace= uses native PyMC; enhanced monitoring, dashboard, and "
+                    "caching are disabled for this call.", stacklevel=2,
+                )
+                native_kwargs = dict(kwargs)
+                native_kwargs.pop("until", None)
+                return ctx._originals["sample"](**native_kwargs)
+
             _validate_sample_kwargs(kwargs)
             nuts_sampler = kwargs.pop("nuts_sampler", None)
+            sampler_auto = nuts_sampler is None and kwargs.get("step") is None
+            tune_default = kwargs.get("tune") is None
             has_step = kwargs.get("step") is not None
             if has_step:
                 # A custom step= requires PyMC's own sampler -- nutpie and the
@@ -442,16 +451,8 @@ class cloud:
                 # repr embeds a memory address) and ride the wire for nothing.
                 kwargs.pop("callback", None)
 
-            # Adaptive early-stop: worker-side, so remote + nutpie/pymc only.
             if ctx.until is not None:
-                import warnings
-
-                if not ctx.remote:
-                    warnings.warn(
-                        "until= is remote-only (worker-side early-stop); "
-                        "ignored for local sampling.", stacklevel=2,
-                    )
-                elif nuts_sampler in ("numpyro", "blackjax"):
+                if nuts_sampler in ("numpyro", "blackjax"):
                     warnings.warn(
                         f"until= requires the nutpie or pymc sampler; ignored "
                         f"for nuts_sampler={nuts_sampler!r}.", stacklevel=2,
@@ -459,79 +460,60 @@ class cloud:
                 else:
                     _check_superchains(ctx.until, kwargs)
                     kwargs["until"] = ctx.until
-
             if ctx.init is not None:
-                if ctx.remote:
-                    kwargs["cp_init"] = ctx.init
-                elif nuts_sampler == "pymc" and "initvals" not in kwargs:
-                    kwargs["initvals"] = {rv.name: "prior" for rv in ctx.model.free_RVs}
-                else:
-                    import warnings
+                kwargs["cp_init"] = ctx.init
 
-                    warnings.warn(
-                        f"init={ctx.init!r} is applied to remote runs and to the "
-                        f"local pymc sampler; ignored for local {nuts_sampler}.",
-                        stacklevel=2,
-                    )
+            if not ctx.remote and kwargs.get("return_inferencedata") is False:
+                if ctx.until is not None:
+                    raise ValueError("adaptive sampling requires return_inferencedata=True")
+                warnings.warn(
+                    "return_inferencedata=False uses native PyMC; enhanced monitoring "
+                    "and caching are disabled for this call.", stacklevel=2,
+                )
+                native_kwargs = dict(kwargs)
+                native_kwargs.pop("cp_init", None)
+                native_kwargs.pop("until", None)
+                if ctx.init == "prior" and nuts_sampler == "pymc" and "initvals" not in native_kwargs:
+                    native_kwargs["initvals"] = {rv.name: "prior" for rv in ctx.model.free_RVs}
+                return ctx._originals["sample"](nuts_sampler=nuts_sampler, **native_kwargs)
 
-            # Lazy first-touch serialization: pay the cloudpickle cost only
-            # when we actually need it. Memoized, and re-done automatically if
-            # the observed data changed since the last call.
-            ctx._model_bytes = _ensure_model_bytes(ctx.model)
-
-            # Remote step= rides as a combined {model, step} payload so the
-            # step's value variables stay identity-linked to the model the
-            # worker deserializes (a separately-pickled step would not match).
-            call_model_bytes = ctx._model_bytes
-            if ctx.remote and has_step:
-                call_model_bytes = _ensure_step_bytes(ctx.model, kwargs.pop("step"))
+            # Execution intent is not part of the resolved result-cache identity.
+            # The monitor needs it to distinguish automatic nutpie from explicit
+            # nutpie, and to restore native tune defaults if auto compilation fails.
+            kwargs["_cp_sampler_auto"] = sampler_auto
+            kwargs["_cp_tune_default"] = tune_default
+            # A cache hit must avoid even serializing the model or touching Modal.
+            cache_kwargs = {**kwargs, "nuts_sampler": nuts_sampler}
+            session, lookup = _cache_lookup(
+                ctx.cache, ctx.model, cache_kwargs,
+                overwrite=ctx.overwrite, progress=ctx.progress,
+            )
+            if lookup.hit:
+                return lookup.result
 
             if ctx.remote:
-                # Check the cache BEFORE provisioning: a hit must not create
-                # Modal infra (Volume / control Dict / app) just to be skipped.
-                cache_kwargs = {**kwargs, "nuts_sampler": nuts_sampler}
-                cache_backend, cache_key, cached = _cache_lookup(
-                    ctx.cache, ctx.model, call_model_bytes, cache_kwargs,
-                    overwrite=ctx.overwrite, progress=ctx.progress,
-                )
-                if cached is not None:
-                    return cached
-
+                ctx._model_bytes = _ensure_model_bytes(ctx.model)
+                call_model_bytes = ctx._model_bytes
+                if has_step:
+                    call_model_bytes = _ensure_step_bytes(ctx.model, kwargs.pop("step"))
                 if ctx._env is None:
-                    # First sample call -- provision sized to these kwargs.
                     ctx._provision_environment(nuts_sampler, kwargs)
                 else:
-                    # Later call -- warn if auto-sizing would have picked
-                    # different resources (first call wins; container is fixed).
                     _warn_if_resize_drift(ctx, nuts_sampler, kwargs)
-
                 return _run_sample_persistent(
-                    model=ctx.model,
-                    env=ctx._env,
-                    model_bytes=call_model_bytes,
-                    cache_backend=cache_backend,
-                    cache_key=cache_key,
-                    cache_kwargs=cache_kwargs,
-                    dashboard=ctx.dashboard,
-                    notify=ctx.notify,
-                    nuts_sampler=nuts_sampler,
-                    progress=ctx.progress,
-                    notify_topic_holder=ctx,
-                    **kwargs,
+                    model=ctx.model, env=ctx._env, model_bytes=call_model_bytes,
+                    cache_session=session, cache_lookup=lookup,
+                    dashboard=ctx.dashboard, notify=ctx.notify,
+                    nuts_sampler=nuts_sampler, progress=ctx.progress,
+                    notify_topic_holder=ctx, **kwargs,
                 )
             return _run_sample(
-                model=ctx.model,
-                remote=ctx.remote,
-                cache=ctx.cache,
-                overwrite=ctx.overwrite,
-                notify=ctx.notify,
-                instance=ctx.instance,
-                nuts_sampler=nuts_sampler,
-                progress=ctx.progress,
+                model=ctx.model, remote=False, cache=False,
+                notify=ctx.notify, instance=ctx.instance,
+                nuts_sampler=nuts_sampler, progress=ctx.progress,
                 original_sample=ctx._originals["sample"],
-                model_bytes=call_model_bytes,
-                notify_topic_holder=ctx,
-                **kwargs,
+                cache_session=session, cache_lookup=lookup,
+                dashboard=ctx.dashboard, notify_topic_holder=ctx, **kwargs,
             )
 
         return intercepted_sample
@@ -606,10 +588,16 @@ class cloud:
 
             kwargs["draws"] = draws
             _validate_sample_kwargs(kwargs)
+            session, lookup = _cache_lookup(
+                ctx.cache, ctx.model, kwargs, operation="smc",
+                overwrite=ctx.overwrite, progress=ctx.progress,
+            )
+            if lookup.hit:
+                return lookup.result
             ctx._model_bytes = _ensure_model_bytes(ctx.model)
             if ctx._env is None:
                 ctx._provision_environment(_default_sampler(ctx.model, local=False), kwargs)
-            return _run_smc(ctx, kwargs)
+            return _run_smc(ctx, kwargs, cache_session=session, cache_lookup=lookup)
 
         return intercepted_smc
 
@@ -679,21 +667,10 @@ def _is_missing_payload_error(exc: Exception) -> bool:
 
 
 def _model_identity(model) -> str:
-    """Cache identity for a model, memoized against its data fingerprint.
-
-    Structural, not a hash of the pickle bytes: rebuilding the same model in a
-    new session yields different bytes (fresh RNG state on every shared
-    variable), which made the persistent disk cache miss every time.
-    """
+    """Compute the current structural/data identity without an unsafe memo."""
     from cloudposterior.naming import model_digest
 
-    fp = _observed_data_fingerprint(model)
-    cached = _MODEL_DIGEST_CACHE.get(model)
-    if cached is not None and cached[0] == fp:
-        return cached[1]
-    digest = model_digest(model)
-    _MODEL_DIGEST_CACHE[model] = (fp, digest)
-    return digest
+    return model_digest(model)
 
 
 def _call_targets_ctx_model(ctx: "cloud", kwargs: dict, what: str) -> bool:
@@ -742,33 +719,25 @@ def _ensure_model_bytes(model) -> bytes:
     """
     from cloudposterior.serialize import serialize_model
 
-    fp = _observed_data_fingerprint(model)
-    cached = _MODEL_BYTES_CACHE.get(model)
+    fp = _payload_fingerprint(model)
+    cached = _MODEL_BYTES_CACHE.get(model) if fp is not None else None
     if cached is not None and cached[0] == fp:
         return cached[1]
     blob = serialize_model(model)
-    _MODEL_BYTES_CACHE[model] = (fp, blob)
+    if fp is not None:
+        _MODEL_BYTES_CACHE[model] = (fp, blob)
     return blob
 
 
 def _ensure_step_bytes(model, step) -> bytes:
-    """Serialize a combined ``{model, step}`` payload, memoized per step object.
+    """Serialize model and step together afresh so mutable step settings reach the worker.
 
-    A separately-pickled step resolves its value variables against a different
-    graph than the worker's model, so the two must ship in one blob (see
-    ``serialize_model_with_step``). Memoizing on the step instance keeps repeat
-    calls from re-pickling the whole model -- which would also mint a fresh
-    payload hash and churn the remote Volume's prune window on every call.
+    Separately pickling the step loses its value-variable graph identity. The
+    content-addressed Volume path still deduplicates unchanged payloads.
     """
     from cloudposterior.serialize import serialize_model_with_step
 
-    fp = _observed_data_fingerprint(model)
-    cached = _STEP_BYTES_CACHE.get(step)
-    if cached is not None and cached[0] == (id(model), fp):
-        return cached[1]
-    blob = serialize_model_with_step(model, step)
-    _STEP_BYTES_CACHE[step] = ((id(model), fp), blob)
-    return blob
+    return serialize_model_with_step(model, step)
 
 
 def _has_discrete_free_rvs(model) -> bool:
@@ -886,6 +855,16 @@ def _warn_remote_sample_fidelity(kwargs: dict) -> None:
         )
 
 
+def _payload_fingerprint(model) -> str | None:
+    """Use the current safe graph/data digest; unsafe models are reserialized."""
+    from pymc_cache.identity import UncacheableError, model_digest
+
+    try:
+        return model_digest(model)
+    except UncacheableError:
+        return None
+
+
 def _observed_data_fingerprint(model):
     """Best-effort fingerprint of the model's mutable (``pm.Data``) arrays.
 
@@ -949,27 +928,30 @@ def _emit_cached_indicator() -> None:
     )
 
 
-def _cache_lookup(cache_arg, model, model_bytes: bytes, cache_kwargs: dict, *,
-                  overwrite: bool, progress: bool):
-    """Resolve the cache backend and look up an entry.
+def _cache_lookup(cache_arg, model, cache_kwargs: dict, *,
+                  overwrite: bool, progress: bool, operation: str = "sample"):
+    """Preflight a versioned result key without serializing the model."""
+    from pymc_cache import CacheSession
 
-    Returns ``(backend, key, cached_or_None)``. ``overwrite=`` forces a re-run:
-    the load is skipped but the key is still returned so the fresh result can
-    replace the stored entry. Emits the "cached result" indicator on a hit.
-
-    ``model_bytes`` is unused for identity -- see ``_model_identity``.
-    """
     from cloudposterior.cache import resolve_cache
-    from cloudposterior.naming import cache_key as compute_cache_key
+    from cloudposterior.serialize import get_version_manifest
 
     backend = resolve_cache(cache_arg, model=model)
-    if backend is None:
-        return None, None, None
-    key = compute_cache_key(_model_identity(model), cache_kwargs)
-    cached = None if overwrite else backend.load(key, sample_kwargs=cache_kwargs)
-    if cached is not None and progress:
+    session = CacheSession(backend if backend is not None else False, model=model)
+    kwargs = dict(cache_kwargs)
+    kwargs.pop("_cp_sampler_auto", None)
+    kwargs.pop("_cp_tune_default", None)
+    sampler = kwargs.pop("nuts_sampler", None)
+    if operation == "sample":
+        kwargs["nuts_sampler"] = sampler
+        if "cp_init" in kwargs:
+            kwargs["initial_strategy"] = kwargs.pop("cp_init")
+    versions = get_version_manifest() if backend is not None else None
+    lookup = session.lookup(kwargs, operation=operation, overwrite=overwrite,
+                            versions=versions, sampler_identity=sampler)
+    if lookup.hit and progress:
         _emit_cached_indicator()
-    return backend, key, cached
+    return session, lookup
 
 
 def _run_sample(
@@ -984,21 +966,22 @@ def _run_sample(
     progress: bool,
     original_sample,
     model_bytes: bytes | None = None,
+    cache_session=None,
+    cache_lookup=None,
+    dashboard: bool = False,
     notify_topic_holder=None,
     **sample_kwargs,
 ) -> az.InferenceData:
     """Core sampling logic with cache, remote, and notification support."""
-    if model_bytes is None:
+    if cache_lookup is None:
+        cache_session, cache_lookup = _cache_lookup(
+            cache, model, {**sample_kwargs, "nuts_sampler": nuts_sampler},
+            overwrite=overwrite, progress=progress,
+        )
+        if cache_lookup.hit:
+            return cache_lookup.result
+    if remote and model_bytes is None:
         model_bytes = _ensure_model_bytes(model)
-
-    # -- Check cache (include nuts_sampler so different samplers don't collide) --
-    cache_kwargs = {**sample_kwargs, "nuts_sampler": nuts_sampler}
-    cache_backend, cache_key, cached = _cache_lookup(
-        cache, model, model_bytes, cache_kwargs,
-        overwrite=overwrite, progress=progress,
-    )
-    if cached is not None:
-        return cached
 
     # -- Build sinks (only needed for cache miss) --
     if remote:
@@ -1009,7 +992,7 @@ def _run_sample(
 
     # For local runs, skip progress display -- let PyMC show its native output.
     sinks = _build_sinks(
-        progress=progress if remote else False,
+        progress=progress,
         notify=notify,
         instance_desc=instance_desc,
         model=model,
@@ -1039,13 +1022,19 @@ def _run_sample(
                 sinks=sinks,
                 emit=emit,
                 nuts_sampler=nuts_sampler,
+                dashboard=dashboard,
                 **sample_kwargs,
             )
 
-        # -- Cache store --
-        if cache_backend is not None and cache_key:
-            cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
-        if remote:
+        _legacy_report_aliases(idata)
+        if cache_session is not None:
+            from cloudposterior.convergence import read_report
+
+            report = read_report(idata)
+            cache_session.store(cache_lookup, idata,
+                                status=report["status"] if report else "complete",
+                                effective_sampler=(report or {}).get("effective_sampler", nuts_sampler))
+        if remote or sample_kwargs.get("until") is not None:
             _report_verdict(idata)
         return idata
     finally:
@@ -1246,7 +1235,8 @@ def _run_predictive(ctx: "cloud", kind: str, trace, sample_kwargs: dict):
     return deserialize_inference_data(idata_bytes)
 
 
-def _run_smc(ctx: "cloud", sample_kwargs: dict) -> az.InferenceData:
+def _run_smc(ctx: "cloud", sample_kwargs: dict, *, cache_session=None,
+             cache_lookup=None) -> az.InferenceData:
     """Run pm.sample_smc on the remote persistent environment (blocking).
 
     Caches the result like pm.sample, namespacing the key with the op so SMC
@@ -1256,19 +1246,15 @@ def _run_smc(ctx: "cloud", sample_kwargs: dict) -> az.InferenceData:
         _compute_payload_path,
         _run_blocking_op,
     )
-    from cloudposterior.cache import resolve_cache
-    from cloudposterior.naming import cache_key as compute_cache_key
     from cloudposterior.serialize import deserialize_inference_data
 
-    cache_kwargs = {**sample_kwargs, "_cp_op": "smc"}
-    cache_backend = resolve_cache(ctx.cache, model=ctx.model)
-    cache_key = None
-    if cache_backend is not None:
-        cache_key = compute_cache_key(_model_identity(ctx.model), cache_kwargs)
-        # overwrite= forces a re-run: skip the load (still save below to replace).
-        cached = None if ctx.overwrite else cache_backend.load(cache_key, sample_kwargs=cache_kwargs)
-        if cached is not None:
-            return cached
+    if cache_lookup is None:
+        cache_session, cache_lookup = _cache_lookup(
+            ctx.cache, ctx.model, sample_kwargs, operation="smc",
+            overwrite=ctx.overwrite, progress=ctx.progress,
+        )
+        if cache_lookup.hit:
+            return cache_lookup.result
 
     env = ctx._env
     env._ensure_running()
@@ -1279,8 +1265,8 @@ def _run_smc(ctx: "cloud", sample_kwargs: dict) -> az.InferenceData:
     idata_bytes = _run_blocking_op(env, "sample_smc", payload_path, sample_kwargs)
     idata = deserialize_inference_data(idata_bytes)
 
-    if cache_backend is not None and cache_key:
-        cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+    if cache_session is not None:
+        cache_session.store(cache_lookup, idata, status="complete")
     return idata
 
 
@@ -1371,9 +1357,8 @@ def _run_sample_persistent(
     *,
     env,
     model_bytes: bytes,
-    cache_backend=None,
-    cache_key: str | None = None,
-    cache_kwargs: dict | None = None,
+    cache_session=None,
+    cache_lookup=None,
     dashboard: bool = False,
     notify: bool | str | dict = False,
     nuts_sampler: str = "pymc",
@@ -1386,7 +1371,7 @@ def _run_sample_persistent(
     Model payload is in the Volume. Per-call sends only kwargs + a path
     identifying which payload to load. The cache lookup already happened in
     the caller (before the env was provisioned -- a hit never creates Modal
-    infra); ``cache_backend``/``cache_key`` are only used to save the result.
+    infra); the preflight lookup is only used to store the result.
     """
     from cloudposterior.backends.modal_backend import _compute_payload_path
 
@@ -1526,8 +1511,14 @@ def _run_sample_persistent(
             elapsed=time.time() - (download_start or time.time()),
         ))
 
-        if cache_backend is not None and cache_key:
-            cache_backend.save(cache_key, idata, sample_kwargs=cache_kwargs)
+        _legacy_report_aliases(idata)
+        if cache_session is not None:
+            from cloudposterior.convergence import read_report
+
+            report = read_report(idata)
+            cache_session.store(cache_lookup, idata,
+                                status=report["status"] if report else "complete",
+                                effective_sampler=(report or {}).get("effective_sampler", nuts_sampler))
 
         _report_verdict(idata)
         return idata
@@ -1536,97 +1527,57 @@ def _run_sample_persistent(
 
 
 def _run_local(
-    *,
-    model,
-    original_sample,
-    sinks: list,
-    emit,
-    nuts_sampler: str = "pymc",
-    **sample_kwargs,
+    *, model, original_sample, sinks: list, emit,
+    nuts_sampler: str = "pymc", dashboard: bool = False, **sample_kwargs,
 ) -> az.InferenceData:
-    """Run sampling locally using the original pm.sample."""
-    from queue import Queue
-    from threading import Thread
+    """Consume the same monitor sampling engine as the Modal worker."""
+    from pymc_monitor.control import RunControl
+    from pymc_monitor.engine import iter_sample
+    from pymc_monitor.events import RunFinished
 
-    from cloudposterior.progress import ProgressAggregator, make_sampling_callback
+    target = sample_kwargs.pop("until", None)
+    initial_strategy = sample_kwargs.pop("cp_init", None)
+    if sample_kwargs.pop("_cp_sampler_auto", False):
+        nuts_sampler = None
+    if sample_kwargs.pop("_cp_tune_default", False):
+        sample_kwargs.pop("tune", None)
+    sample_kwargs.pop("progressbar", None)  # monitor owns the progress frontend
+    sample_kwargs.pop("return_inferencedata", None)  # only the native bypass returns MultiTrace
+    control = RunControl()
+    server = state = run_id = None
+    if dashboard:
+        from pymc_monitor.dashboard import DashboardState
+        from pymc_monitor.server import Dashboard
 
-    emit(PhaseUpdate(
-        phase=JobPhase.SAMPLING,
-        status="in_progress",
-        message="local sampling started",
-        elapsed=0.0,
-    ))
-
-    sample_start = time.time()
-
-    sampler_kwargs = {"nuts_sampler": nuts_sampler} if nuts_sampler else {}
-
-    # PyMC's per-draw callback only fires for the pymc sampler; external samplers
-    # (nutpie/numpyro/blackjax) raise if a callback is passed (PyMC 6), so only
-    # attach it when the resolved sampler is "pymc".
-    if sinks and nuts_sampler == "pymc":
-        tune = sample_kwargs.get("tune", 1000)
-        draws = sample_kwargs.get("draws", 1000)
-        progress_queue: Queue = Queue()
-        progress_cb = make_sampling_callback(progress_queue, tune, draws)
-        # pm.sample takes a single callback: compose ours with the user's
-        # instead of passing callback= twice (TypeError).
-        user_cb = sample_kwargs.pop("callback", None)
-        if user_cb is not None:
-            def callback(trace, draw, _progress_cb=progress_cb, _user_cb=user_cb):
-                _progress_cb(trace, draw)
-                _user_cb(trace, draw)
-        else:
-            callback = progress_cb
-        aggregator = ProgressAggregator(progress_queue)
-
-        def stream_progress():
-            for snapshot in aggregator.snapshots():
-                emit(snapshot)
-
-        # A plain threading.Thread has no marimo runtime context, so the
-        # widget's trait writes would no-op there; marimo.Thread propagates the
-        # context so local progress animates live. (Remote sampling emits on the
-        # main thread, so it's unaffected.) Fall back to threading.Thread
-        # elsewhere (Jupyter/terminal).
-        from cloudposterior.display import _is_marimo
-
-        if _is_marimo():
-            import marimo
-
-            thread_cls = marimo.Thread
-        else:
-            thread_cls = Thread
-        progress_thread = thread_cls(target=stream_progress, daemon=True)
-        progress_thread.start()
-
-        try:
-            with model:
-                idata = original_sample(
-                    callback=callback,
-                    **sampler_kwargs,
-                    **sample_kwargs,
-                )
-        finally:
-            # On a sampling error these would otherwise never run, leaving the
-            # aggregator blocked on its queue and the thread alive for the
-            # rest of the session.
-            aggregator.stop()
-            progress_thread.join(timeout=2)
-    else:
-        with model:
-            idata = original_sample(**sampler_kwargs, **sample_kwargs)
-
-    emit(PhaseUpdate(
-        phase=JobPhase.SAMPLING,
-        status="done",
-        message="sampling complete",
-        elapsed=time.time() - sample_start,
-    ))
-
-    from cloudposterior.serialize import sanitize_inference_data
-
-    return sanitize_inference_data(idata)
+        state = DashboardState()
+        server = Dashboard(title="cloudposterior")
+        run_id = server.add_run(state, control)
+        _show_link(server.url(run_id), label="Dashboard", show_qr=False)
+    stream = iter_sample(model, sample_kwargs, nuts_sampler=nuts_sampler,
+                         until=target, initial_strategy=initial_strategy,
+                         control=control, sample_fn=original_sample)
+    try:
+        while True:
+            try:
+                event = next(stream)
+            except StopIteration as end:
+                return end.value.idata
+            if state is not None:
+                state.update(event)
+            if not isinstance(event, RunFinished):
+                emit(event)
+    except BaseException:
+        if state is not None:
+            state.finish("error")
+        raise
+    finally:
+        stream.close()
+        if server is not None:
+            # Leave the finished dashboard browsable briefly, but never keep a
+            # loopback service alive forever after the sampling context exits.
+            timer = threading.Timer(server.idle_timeout, server.close)
+            timer.daemon = True
+            timer.start()
 
 
 # -- Explicit API (backwards-compatible) --
@@ -1635,7 +1586,7 @@ def sample(
     model: pm.Model,
     *,
     draws: int = 1000,
-    tune: int = 1000,
+    tune: int | None = None,
     chains: int | None = None,
     cores: int | None = None,
     nuts_sampler: str | None = None,
@@ -1651,8 +1602,11 @@ def sample(
     manager instead -- it keeps the container warm and only ships sample
     kwargs after the first call.
     """
+    sampler_auto = nuts_sampler is None and pm_sample_kwargs.get("step") is None
     if nuts_sampler is None:
         nuts_sampler = _default_sampler(model, local=False)
+    tune_default = tune is None
+    tune = resolve_tune({"tune": tune}, nuts_sampler)
 
     return _run_sample(
         model=model,
@@ -1665,6 +1619,7 @@ def sample(
         # Not pm.sample: inside a cp.cloud block that is the interceptor, and
         # taking it as the "original" would recurse.
         original_sample=_true_original("sample"),
+        _cp_sampler_auto=sampler_auto, _cp_tune_default=tune_default,
         draws=draws,
         tune=tune,
         **({"chains": chains} if chains is not None else {}),
@@ -1740,8 +1695,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         _compute_payload_path,
         _run_blocking,
     )
-    from cloudposterior.cache import resolve_cache
-    from cloudposterior.naming import cache_key as compute_cache_key, model_slug
+    from cloudposterior.naming import model_slug
     from cloudposterior.serialize import (
         deserialize_inference_data,
         get_version_manifest,
@@ -1768,8 +1722,10 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
     for kw in kwargs_list:
         _validate_sample_kwargs(kw)
 
-    model_bytes_list = [_ensure_model_bytes(m) for m in models]
-    samplers = [nuts_sampler or _default_sampler(m, local=False) for m in models]
+    model_bytes_list = [None] * n  # populated only for preflight misses
+    sampler_choices = [kw.pop("nuts_sampler", None) for kw in kwargs_list]
+    samplers = [nuts_sampler or choice or _default_sampler(m, local=False)
+                for m, choice in zip(models, sampler_choices)]
     project = project or _detect_project_name()
     dashboard_on = True if dashboard is None else bool(dashboard)
     until_param = _normalize_until(until)
@@ -1785,17 +1741,13 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         if progress:
             print(f"cp.map: {msg}")
 
-    # -- Cache check first: all local (cloudpickle + key hash + cache load touch
-    # no Modal), so only cache *misses* need a remote container. An all-cached
-    # map therefore provisions nothing -- no env, no dashboard. Resolve one
-    # backend per model: a disk cache derives its directory from the model's
-    # slug, so a shared backend would file every result under models[0]. --
-    cache_backends = [resolve_cache(cache, model=m) for m in models]
+    # Each model gets its own cache session. Preflight before serialization:
+    # an all-hit map does no cloudpickle, payload hashing or Modal work.
     results: list = [None] * n
     cached_idx: list[int] = []
     run_idx: list[int] = []
     # aligned with run_idx:
-    #   (model_bytes, payload_path, kwargs, sampler, key, key_kwargs, label, config)
+    #   (model_bytes, payload_path, kwargs, sampler, session, lookup, label, config)
     run_meta: list = []
     for i, m in enumerate(models):
         # Adaptive-stop target: the until= param wins; otherwise normalize (and
@@ -1818,21 +1770,22 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
                 kwargs_list[i]["until"] = eff_until
         if init is not None:
             kwargs_list[i]["cp_init"] = init
+        tune_default = kwargs_list[i].get("tune") is None
+        kwargs_list[i]["tune"] = resolve_tune(kwargs_list[i], samplers[i])
+        kwargs_list[i]["_cp_sampler_auto"] = nuts_sampler is None and sampler_choices[i] is None
+        kwargs_list[i]["_cp_tune_default"] = tune_default
 
-        mb = model_bytes_list[i]
-        payload_path = _compute_payload_path(model_slug(m), mb)
         ck_kwargs = {**kwargs_list[i], "nuts_sampler": samplers[i]}
-        ckey = None
-        if cache_backends[i] is not None:
-            # Still compute the key (so the fresh result is saved) but skip the
-            # load when overwrite= forces a re-run.
-            ckey = compute_cache_key(_model_identity(m), ck_kwargs)
-            if not overwrite:
-                hit = cache_backends[i].load(ckey, sample_kwargs=ck_kwargs)
-                if hit is not None:
-                    results[i] = hit
-                    cached_idx.append(i)
-                    continue
+        session, lookup = _cache_lookup(
+            cache, m, ck_kwargs, overwrite=overwrite, progress=False,
+        )
+        if lookup.hit:
+            results[i] = lookup.result
+            cached_idx.append(i)
+            continue
+        mb = _ensure_model_bytes(m)
+        model_bytes_list[i] = mb
+        payload_path = _compute_payload_path(model_slug(m), mb)
         # Size each fit to its own model (each fans out to its own container);
         # narrowed per-spawn via with_options below.
         cfg = RemoteConfig.from_instance(
@@ -1840,7 +1793,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         )
         run_idx.append(i)
         run_meta.append(
-            (mb, payload_path, kwargs_list[i], samplers[i], ckey, ck_kwargs, labels[i], cfg)
+            (mb, payload_path, kwargs_list[i], samplers[i], session, lookup, labels[i], cfg)
         )
 
     n_cached = len(cached_idx)
@@ -1868,7 +1821,7 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
         (s for s in run_samplers if s in ("numpyro", "blackjax")), run_samplers[0]
     )
     env = backend.provision(
-        model_bytes_list[0], models[0], get_version_manifest(), base_config,
+        run_meta[0][0], models[run_idx[0]], get_version_manifest(), base_config,
         project=project, idle_timeout=base_config.idle_timeout,
         dashboard=dashboard_on, stop_enabled=dashboard_on,
         nuts_sampler=image_sampler,
@@ -1950,9 +1903,11 @@ def map(models, sample_kwargs=None, *, cache: bool | str = True,
             status = f" -- {report['status']}: {report['summary']}" if report else ""
             _log(f"[{j + 1}/{len(run_idx)}] {names[i]} done{status}")
             _report_verdict(idata, label=names[i])
-            _mb, _pp, _kw, _sp, ckey, ck_kwargs, _lbl, _cfg = run_meta[j]
-            if cache_backends[i] is not None and ckey is not None:
-                cache_backends[i].save(ckey, idata, sample_kwargs=ck_kwargs)
+            _legacy_report_aliases(idata)
+            _mb, _pp, _kw, _sp, session, lookup, _lbl, _cfg = run_meta[j]
+            session.store(lookup, idata,
+                          status=report["status"] if report else "complete",
+                          effective_sampler=(report or {}).get("effective_sampler", _sp))
 
         if dashboard_on:
             # Keep the env warm (reusing the cp.cloud registry) so the dashboard

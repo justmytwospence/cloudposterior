@@ -31,15 +31,14 @@ def test_partial_sampling_payload_decodes():
 
 
 def test_numeric_fields_are_coerced():
-    """A null or stringly field reaching the dashboard hit .toFixed and read
-    as the run having gone offline."""
+    """String counts decode, while unavailable diagnostics remain explicitly null."""
     event = decode_progress_event({
         "type": "sampling",
         "chains": {"0": {"draw": "10", "total": "20", "step_size": None}},
         "elapsed": "1.5",
     })
     assert event.chains[0].draw == 10
-    assert event.chains[0].step_size == 0.0
+    assert event.chains[0].step_size is None
     assert event.elapsed == 1.5
 
 
@@ -159,7 +158,9 @@ def test_dashboard_sink_state_is_initialized_upfront():
     from cloudposterior.dashboard import DashboardSink
 
     sink = DashboardSink({}, key="k")
-    assert sink._convergence == {} and sink._traces == {}
+    state = sink._state.snapshot()
+    assert state["sampling"] is None and state["phases"] == []
+    assert state["complete"] is False
 
 
 # -- display fallback --------------------------------------------------------

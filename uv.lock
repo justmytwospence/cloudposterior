@@ -599,6 +599,8 @@ dependencies = [
     { name = "msgpack" },
     { name = "numpy" },
     { name = "pymc" },
+    { name = "pymc-cache" },
+    { name = "pymc-monitor", extra = ["dashboard", "notebook"] },
     { name = "pytensor" },
     { name = "qrcode" },
     { name = "requests" },
@@ -641,8 +643,10 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "nutpie", marker = "extra == 'nutpie'", specifier = ">=0.13" },
-    { name = "pymc", specifier = ">=5,<7" },
-    { name = "pytensor", specifier = ">=2.18" },
+    { name = "pymc", specifier = ">=5.28,<7" },
+    { name = "pymc-cache", specifier = ">=0.1.0,<0.2" },
+    { name = "pymc-monitor", extras = ["notebook", "dashboard"], specifier = ">=0.1.0,<0.2" },
+    { name = "pytensor", specifier = ">=2.38" },
     { name = "qrcode", specifier = ">=7.0" },
     { name = "requests", specifier = ">=2.28" },
     { name = "rich", specifier = ">=13.0" },
@@ -976,6 +980,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cc/28/c14e053b6762b1044f34a13aab6859bbf40456d37d23aa286ac24cfd9a5d/executing-2.2.1.tar.gz", hash = "sha256:3632cc370565f6648cc328b32435bd120a1e4ebb20c77e3fdde9a13cd1e533c4", size = 1129488, upload-time = "2025-09-01T09:48:10.866Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/ea/53f2148663b321f21b5a606bd5f191517cf40b7072c0497d3c92c4a13b1e/executing-2.2.1-py2.py3-none-any.whl", hash = "sha256:760643d3452b4d777d295bb167ccc74c64a81df23fb5e08eff250c425a4b2017", size = 28317, upload-time = "2025-09-01T09:48:08.5Z" },
+]
+
+[[package]]
+name = "fastapi"
+version = "0.162.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "opentelemetry-api" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/eb/2cf8c80abf09b2800aef0a83b41066fbfda8ee5495b7a08b9d1af40f7046/fastapi-0.162.0.tar.gz", hash = "sha256:6a22c1e2e6e32e0633ee7e170f00009a29b8228b16feb219ee42f32fd8d88a8f", size = 527867, upload-time = "2026-10-23T18:47:33.264Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/4f/3f2c25c9b43970b5e9a08beb5e04776247edea684ddc0930f4f02f0bb6cb/fastapi-0.162.0-py3-none-any.whl", hash = "sha256:3785963de305dd09912426cb81f2d230fce98ab3521cdfe97265c8d14983128c", size = 148912, upload-time = "2026-10-23T18:47:31.734Z" },
 ]
 
 [[package]]
@@ -2584,6 +2605,18 @@ wheels = [
 ]
 
 [[package]]
+name = "opentelemetry-api"
+version = "1.45.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/19/14/cf3a6b6448849656e1e5f4e2101f3988dc6789724050096aba1bc5ccf592/opentelemetry_api-1.45.2.tar.gz", hash = "sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4", size = 73277, upload-time = "2026-10-29T17:29:37.888Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/2d/610db864d7513158cebb8f36cc88e67e73bd6c7aa1905ef18d89e1281c81/opentelemetry_api-1.45.2-py3-none-any.whl", hash = "sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34", size = 60335, upload-time = "2026-10-29T17:29:06.955Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3210,6 +3243,50 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/7b/b8ccacceb44ba06806611c2fd35e05429c051497f46d55f1f0ee61a6c442/pymc-5.28.0.tar.gz", hash = "sha256:cea264e72b1040399db1f33a4585ce45b7223eb81c29c299e7ed6e3e26ec2129", size = 506476, upload-time = "2026-02-21T09:38:22.551Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/18/93d9cd30ba5badf82defa8b88409b865ca5bc49add21a8ac8c22332438ac/pymc-5.28.0-py3-none-any.whl", hash = "sha256:4f153c121fae8713ebcfd473f0b127ae02d5dfd04dd7ce2c17652715c586fe45", size = 560725, upload-time = "2026-02-21T09:38:20.733Z" },
+]
+
+[[package]]
+name = "pymc-cache"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "arviz" },
+    { name = "h5netcdf" },
+    { name = "h5py" },
+    { name = "numpy" },
+    { name = "pymc" },
+    { name = "pytensor" },
+    { name = "xarray" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/d1/7691ffbaa495b10713e467030aa7cbbb60c360da007b30f57953683af49f/pymc_cache-0.1.0.tar.gz", hash = "sha256:ad896da1195f7c48fc0af2e8b117dfffe0f5ad91a2fc51158a38937aa53f5552", size = 39504, upload-time = "2026-11-03T03:34:24.726Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4d/13/7b7ede3036ae0f1709786fd298319f8869b762e1d169f9a597c7ea23ea17/pymc_cache-0.1.0-py3-none-any.whl", hash = "sha256:616ec44e69462e705f1a1c0e1e17589e1cbbe9ee9b227271175eeff9be66d3fb", size = 21837, upload-time = "2026-11-03T03:34:23.254Z" },
+]
+
+[[package]]
+name = "pymc-monitor"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "arviz" },
+    { name = "numpy" },
+    { name = "pymc" },
+    { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/20/66/bb39d07aa20d7a8de4242850863df2b63711cdfab695c05f65c176a4d191/pymc_monitor-0.1.0.tar.gz", hash = "sha256:5c96830ae388f9734567cdd2923786dd8219dc378effb5faa41fbbf29f3225c5", size = 368146, upload-time = "2026-11-03T03:35:15.263Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/28/6fb8fd2d1acc738beacd613c05f07eeac2cc58f9029592e89bc58afb1165/pymc_monitor-0.1.0-py3-none-any.whl", hash = "sha256:8f8fcd4ca14cc158a18a7d06f5f0752ea027d0e1f22cafd77421306af1732fcc", size = 84056, upload-time = "2026-11-03T03:35:13.78Z" },
+]
+
+[package.optional-dependencies]
+dashboard = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
+notebook = [
+    { name = "anywidget" },
+    { name = "ipython", version = "9.10.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "ipython", version = "9.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [[package]]

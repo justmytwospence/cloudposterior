@@ -5,6 +5,9 @@ outlive a single call, and each has a failure mode that silently produces a
 wrong result rather than an error. These tests pin the guards down.
 """
 
+import asyncio
+import threading
+
 import numpy as np
 import pymc as pm
 import pytest
@@ -100,7 +103,7 @@ def test_model_bytes_not_stored_on_the_model_object():
     assert not hasattr(model, "_cp_data_fp")
 
 
-def test_step_blob_memoized_per_step_instance():
+def test_step_blob_reserialized_after_mutating_same_step(monkeypatch):
     from cloudposterior import serialize
 
     model = _model()
@@ -114,15 +117,20 @@ def test_step_blob_memoized_per_step_instance():
         calls.append((m, s))
         return real(m, s)
 
-    serialize.serialize_model_with_step = counting
-    try:
-        first = api._ensure_step_bytes(model, step)
-        second = api._ensure_step_bytes(model, step)
-    finally:
-        serialize.serialize_model_with_step = real
+    monkeypatch.setattr(serialize, "serialize_model_with_step", counting)
+    step.scaling = 1.0
+    first = api._ensure_step_bytes(model, step)
+    step.scaling = 2.5
+    second = api._ensure_step_bytes(model, step)
 
-    assert first is second
-    assert len(calls) == 1
+    assert calls == [(model, step), (model, step)]
+    assert first != second
+    for blob, scaling in ((first, 1.0), (second, 2.5)):
+        combined = serialize.deserialize_model(blob)
+        restored_model, restored_step = combined["model"], combined["step"]
+        assert float(restored_step.scaling) == scaling
+        assert all(any(v is sv for v in restored_model.value_vars)
+                   for sv in restored_step.vars)
 
 
 # -- interceptor model targeting --------------------------------------------
@@ -167,6 +175,62 @@ def test_ops_targeting_another_model_defer_to_native_pymc(fn_name, call):
 
     assert seen["model"] is other
     assert getattr(pm, fn_name) is real
+
+
+# -- client-side Modal waits (no production deadline yet) ------------------
+
+def test_ensure_running_can_outlive_remote_function_timeout():
+    """A remote function timeout does not bound app.run client startup."""
+    from cloudposterior.backends.modal_backend import ModalEnvironment
+
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+
+    class App:
+        def run(self):
+            class Context:
+                def __enter__(self):
+                    entered.set()
+                    release.wait(2)
+
+                def __exit__(self, *args):
+                    pass
+            return Context()
+
+    env = ModalEnvironment(App(), None, None, "test", "test",
+                           config=type("Config", (), {"timeout": 0.01})())
+    thread = threading.Thread(target=lambda: (env._ensure_running(), done.set()), daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert not done.wait(0.03), "app.run should be independent of remote function timeout"
+    finally:
+        release.set()
+        thread.join(1)
+    assert done.is_set()
+
+
+def test_run_blocking_future_wait_has_no_client_deadline():
+    from cloudposterior.backends import modal_backend
+
+    started, release = threading.Event(), threading.Event()
+
+    def blocked():
+        started.set()
+        release.wait(2)
+        return "finished"
+
+    async def invoke():
+        return modal_backend._run_blocking(blocked)
+
+    thread = threading.Thread(target=lambda: asyncio.run(invoke()), daemon=True)
+    thread.start()
+    try:
+        assert started.wait(1)
+        assert thread.is_alive(), "Future.result() still waits without a client timeout"
+    finally:
+        release.set()
+        thread.join(1)
+    assert not thread.is_alive()
 
 
 # -- remote job result() ----------------------------------------------------

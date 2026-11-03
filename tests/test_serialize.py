@@ -111,3 +111,63 @@ def test_deserialize_inference_data_is_eagerly_loaded(tmp_path, monkeypatch):
 
     xr.backends.file_manager.FILE_CACHE.clear()
     assert out.posterior["mu"].values.shape == (2, 50)
+
+
+def test_wire_roundtrip_preserves_object_nan_and_warning_none():
+    """Nutpie can emit NaN missing messages; PyMC emits all-None warnings."""
+    import math
+
+    import arviz as az
+    import xarray as xr
+
+    from cloudposterior._idata import add_group
+    from cloudposterior.serialize import deserialize_inference_data, serialize_inference_data
+
+    messages = np.array([[float("nan"), None, "diverged"]], dtype=object)
+    warnings = np.array([[None, None, None]], dtype=object)
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"mu": np.zeros((1, 3))}))
+    # az.dict_to_dataset normalizes None to NaN when a float NaN is also
+    # present; build the diagnostic group directly to exercise the wire codec.
+    add_group(idata, "sample_stats", xr.Dataset({
+        "divergence_message": (("chain", "draw"), messages),
+        "warning": (("chain", "draw"), warnings),
+    }))
+    # xarray also treats None as missing during Variable construction; restore
+    # the actual mixed object values before the wire boundary being tested.
+    diagnostic = idata.sample_stats["divergence_message"]
+    diagnostic.values[0, 0] = float("nan")
+    diagnostic.values[0, 1] = None
+    diagnostic.values[0, 2] = "diverged"
+    idata.sample_stats["warning"].values[:] = None
+    assert diagnostic.dtype == object
+    assert type(diagnostic.values[0, 0]) is float and math.isnan(diagnostic.values[0, 0])
+    assert diagnostic.values[0, 1] is None
+    assert diagnostic.values[0, 2] == "diverged"
+    assert idata.sample_stats["warning"].dtype == object
+    assert all(value is None for value in idata.sample_stats["warning"].values.flat)
+    loaded = deserialize_inference_data(serialize_inference_data(idata))
+    actual = loaded.sample_stats["divergence_message"].values
+    assert type(actual[0, 0]) is float and math.isnan(actual[0, 0])
+    assert actual[0, 1:].tolist() == [None, "diverged"]
+    assert loaded.sample_stats["warning"].values.tolist() == warnings.tolist()
+    assert loaded.sample_stats["warning"].values.dtype == object
+
+
+def test_wire_roundtrip_preserves_nutpie_divergence_messages():
+    """The cache codec preserves tagged None/text/bytes across LZ4+NetCDF."""
+    import arviz as az
+
+    from cloudposterior._idata import add_group
+    from cloudposterior.serialize import deserialize_inference_data, serialize_inference_data
+
+    messages = np.array([[None, "bad energy", b"raw"],
+                         ["second", None, b"\x00binary"]], dtype=object)
+    idata = az.InferenceData()
+    add_group(idata, "posterior", az.dict_to_dataset({"mu": np.zeros((2, 3))}))
+    add_group(idata, "sample_stats", az.dict_to_dataset({"divergence_message": messages}))
+    roundtripped = deserialize_inference_data(serialize_inference_data(idata))
+    actual = roundtripped.sample_stats["divergence_message"].values
+    assert actual.tolist() == messages.tolist()
+    assert [type(value) for value in actual.flat] == [type(value) for value in messages.flat]
+    assert idata.sample_stats["divergence_message"].values.dtype == object

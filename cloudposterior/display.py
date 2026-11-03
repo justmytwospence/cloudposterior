@@ -82,22 +82,22 @@ def _sampling_table_html(progress: SamplingProgress) -> str:
     for chain_id in sorted(progress.chains.keys()):
         cp = progress.chains[chain_id]
         pct = cp.draw / cp.total if cp.total > 0 else 0
-        bar_color = "#d9534f" if cp.divergences > 0 else "#1764f4"
+        bar_color = "#d9534f" if (cp.divergences or 0) > 0 else "#1764f4"
         bar = _bar_html(pct, width_px=180, color=bar_color)
 
         phase_label = f'<span style="color:#888;">[{html.escape(str(cp.phase))}]</span>'
-        speed_str = f"{cp.draws_per_sec:.0f} draws/s" if cp.draws_per_sec > 0 else "--"
-        elapsed = _format_time(cp.draw / cp.draws_per_sec if cp.draws_per_sec > 0 else 0)
-        remaining = _format_time(cp.eta_seconds) if cp.eta_seconds > 0 else "--"
+        speed_str = f"{cp.draws_per_sec:.0f} draws/s" if cp.draws_per_sec is not None and cp.draws_per_sec > 0 else "--"
+        elapsed = _format_time(cp.draw / cp.draws_per_sec) if cp.draws_per_sec is not None and cp.draws_per_sec > 0 else "--"
+        remaining = _format_time(cp.eta_seconds) if cp.eta_seconds is not None and cp.eta_seconds > 0 else "--"
 
         rows.append(
             f"<tr>"
             f"<td style='padding:2px 8px;white-space:nowrap;'>Chain {chain_id} {phase_label}</td>"
             f"<td style='padding:2px 4px;'>{bar}</td>"
             f"<td style='padding:2px 8px;text-align:right;'>{cp.draw}/{cp.total}</td>"
-            f"<td style='padding:2px 8px;text-align:right;'>{cp.divergences}</td>"
-            f"<td style='padding:2px 8px;text-align:right;'>{cp.step_size:.3f}</td>"
-            f"<td style='padding:2px 8px;text-align:right;'>{cp.tree_size}</td>"
+            f"<td style='padding:2px 8px;text-align:right;'>{cp.divergences if cp.divergences is not None else '--'}</td>"
+            f"<td style='padding:2px 8px;text-align:right;'>{f'{cp.step_size:.3f}' if cp.step_size is not None else '--'}</td>"
+            f"<td style='padding:2px 8px;text-align:right;'>{cp.tree_size if cp.tree_size is not None else '--'}</td>"
             f"<td style='padding:2px 8px;text-align:right;'>{speed_str}</td>"
             f"<td style='padding:2px 8px;text-align:right;'>{elapsed}</td>"
             f"<td style='padding:2px 8px;text-align:right;'>{remaining}</td>"
@@ -118,7 +118,7 @@ def _sampling_table_html(progress: SamplingProgress) -> str:
         "</tr>"
     )
 
-    footer_parts = [f"Total divergences: {progress.total_divergences}"]
+    footer_parts = [f"Total divergences: {progress.total_divergences if progress.total_divergences is not None else '--'}"]
     footer_parts.append(f"Elapsed: {_format_time(progress.elapsed)}")
     footer = " | ".join(footer_parts)
 
@@ -441,30 +441,30 @@ class TerminalDisplay:
                 bar_width = 20
                 filled = int(pct * bar_width)
 
-                bar_color = "red" if cp.divergences > 0 else "blue"
+                bar_color = "red" if (cp.divergences or 0) > 0 else "blue"
                 bar = f"[{bar_color}]" + "\u2501" * filled + f"[/{bar_color}]" + "[dim]\u2501[/dim]" * (bar_width - filled)
 
                 phase_tag = f"[dim][{cp.phase}][/dim]"
-                speed_str = f"{cp.draws_per_sec:.0f} dr/s" if cp.draws_per_sec > 0 else "--"
-                elapsed = _format_time(cp.draw / cp.draws_per_sec if cp.draws_per_sec > 0 else 0)
-                remaining = _format_time(cp.eta_seconds) if cp.eta_seconds > 0 else "--"
+                speed_str = f"{cp.draws_per_sec:.0f} dr/s" if cp.draws_per_sec is not None and cp.draws_per_sec > 0 else "--"
+                elapsed = _format_time(cp.draw / cp.draws_per_sec) if cp.draws_per_sec is not None and cp.draws_per_sec > 0 else "--"
+                remaining = _format_time(cp.eta_seconds) if cp.eta_seconds is not None and cp.eta_seconds > 0 else "--"
 
-                div_style = "red" if cp.divergences > 0 else ""
+                div_style = "red" if (cp.divergences or 0) > 0 else ""
 
                 table.add_row(
                     f"Chain {chain_id} {phase_tag}",
                     bar,
                     f"{cp.draw}/{cp.total}",
-                    Text(str(cp.divergences), style=div_style),
-                    f"{cp.step_size:.3f}",
-                    str(cp.tree_size),
+                    Text(str(cp.divergences) if cp.divergences is not None else "--", style=div_style),
+                    f"{cp.step_size:.3f}" if cp.step_size is not None else "--",
+                    str(cp.tree_size) if cp.tree_size is not None else "--",
                     speed_str,
                     elapsed,
                     remaining,
                 )
 
             # Footer
-            footer_parts = [f"Divergences: {self._sampling.total_divergences}"]
+            footer_parts = [f"Divergences: {self._sampling.total_divergences if self._sampling.total_divergences is not None else '--'}"]
             footer_parts.append(f"Elapsed: {_format_time(self._sampling.elapsed)}")
             table.add_row("", "", "", "", "", "", "", "", "")
             table.add_row(

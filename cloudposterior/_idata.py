@@ -1,111 +1,24 @@
-"""arviz 0.x / 1.x compatibility shims.
+"""Compatibility shims for ArviZ 0.x InferenceData and 1.x DataTree.
 
-PyMC 6 hard-requires ``arviz>=1.1``, a DataTree-based rewrite that:
-
-- makes ``InferenceData.groups()`` a ``DataTree.groups`` *property* returning
-  slash-prefixed paths (``/posterior``) plus a ``/`` root,
-- removes ``arviz.convert_to_inference_data``,
-- may reject ``arviz.ess(..., method="tail")`` without a ``prob`` argument
-  (current 1.x releases accept it defaulted; the shim tries the plain call
-  first and only then supplies one),
-- returns ``xarray.DataTree`` from samplers / ``from_netcdf`` instead of
-  ``arviz.InferenceData``.
-
-PyMC 5 ships arviz 0.x with the old API. These helpers work on both majors so
-cloudposterior (and the remote worker) stay version-agnostic.
+Storage conversion belongs to pymc-cache; sampler trace operations belong to
+pymc-monitor. These names remain available for existing cloudposterior users.
 """
 
 from __future__ import annotations
 
-
-def group_names(idata) -> list[str]:
-    """Clean group names (no leading slash, no DataTree root) for both majors."""
-    groups = idata.groups
-    raw = list(groups() if callable(groups) else groups)
-    out = []
-    for name in raw:
-        name = name.strip("/")
-        if name:  # drop the DataTree root group ("/")
-            out.append(name)
-    return out
-
-
-def get_group(idata, name):
-    """Return a group dataset/node by name for both majors (attr or item access)."""
-    try:
-        group = getattr(idata, name)
-        if group is not None:
-            return group
-    except Exception:
-        pass
-    try:
-        return idata[name]
-    except Exception:
-        return None
-
-
-def group_attrs(idata, name=None):
-    """attrs dict of a group, or the top-level attrs when ``name`` is None."""
-    if name is None:
-        return getattr(idata, "attrs", None)
-    return getattr(get_group(idata, name), "attrs", None)
-
-
-def add_group(idata, name: str, group) -> None:
-    """Add ``group`` to ``idata`` under ``name`` in place, across arviz majors.
-
-    Used to merge a remotely-computed group (e.g. ``log_likelihood``) into the
-    caller's local idata so cloudposterior matches PyMC's
-    ``extend_inferencedata=True`` in-place semantics. ``group`` may be an
-    xarray Dataset or a DataTree node; it is normalized to a Dataset.
-    """
-    import xarray as xr
-
-    ds = group
-    if not isinstance(group, xr.Dataset):
-        to_ds = getattr(group, "to_dataset", None)
-        if callable(to_ds):
-            try:
-                ds = to_ds()
-            except Exception:
-                ds = group
-
-    # arviz 0.x InferenceData exposes add_groups({name: ds}).
-    adder = getattr(idata, "add_groups", None)
-    if callable(adder):
-        try:
-            adder({name: ds})
-            return
-        except Exception:
-            pass
-
-    # arviz 1.x DataTree (and general fallback): item assignment creates a child.
-    try:
-        idata[name] = ds
-        return
-    except Exception:
-        pass
-
-    # Last resort. This can set a plain Python attribute that is not a real
-    # group -- it would not appear in groups(), would not serialize, and would
-    # vanish on a netcdf round-trip -- so verify rather than lose the data
-    # silently (the caller merges a remotely-computed log_likelihood here).
-    setattr(idata, name, ds)
-    if name not in group_names(idata):
-        raise RuntimeError(
-            f"could not attach group {name!r} to this InferenceData/DataTree"
-        )
+from pymc_cache.io import (  # noqa: F401
+    add_group,
+    get_group,
+    group_attrs,
+    group_names,
+    load_all,
+    sanitize_inference_data,
+)
+from pymc_monitor.idata import concat_chains, to_inference_data, trim_incomplete_draws  # noqa: F401
 
 
 def pymc_major() -> int:
-    """Major version of the installed PyMC.
-
-    Single place for version branching. PyMC 6 changed several things this
-    library sits directly on top of: nuts_sampler defaults to auto-selecting
-    nutpie, tune resolves per sampler (400 for nutpie vs 1000 for pymc),
-    sample_posterior_predictive's var_names became output-only, and a new
-    backend= kwarg appeared across the sampling entry points.
-    """
+    """Major PyMC API version for client compatibility checks."""
     try:
         import pymc
 
@@ -114,222 +27,27 @@ def pymc_major() -> int:
         return 5
 
 
-def load_all(idata) -> None:
-    """Best-effort eager load of every group so a temp NetCDF file can be deleted."""
-    import logging
-
-    for name in group_names(idata):
-        loader = getattr(get_group(idata, name), "load", None)
-        if callable(loader):
-            try:
-                loader()
-            except Exception as exc:
-                # A group left lazy here resurfaces much later as an opaque
-                # "file not found" from an already-deleted temp path, so at
-                # least record which group and why.
-                logging.getLogger(__name__).debug(
-                    "could not eagerly load group %r: %s", name, exc
-                )
-
-
-def to_inference_data(trace):
-    """Normalize a sampler result to an arviz object across majors.
-
-    arviz 0.x: convert non-InferenceData via ``convert_to_inference_data``.
-    arviz 1.x: nutpie / pm.sample already return a DataTree -- use it as-is.
-    """
-    import arviz as az
-
-    inference_data = getattr(az, "InferenceData", None)
-    if inference_data is not None and isinstance(trace, inference_data):
-        return trace
-    conv = getattr(az, "convert_to_inference_data", None)
-    if conv is not None:
-        try:
-            return conv(trace)
-        except Exception:
-            pass
-    return trace
-
-
-def trim_incomplete_draws(idata):
-    """Drop the NaN-padded tail an aborted nutpie run leaves on faster chains.
-
-    nutpie's ``abort()`` returns arrays sized to the longest chain and pads the
-    others with NaN; every chain is cut to the shortest complete one so the
-    returned trace has no NaN draws. Returns the (possibly new) object.
-    """
-    import numpy as np
-
-    post = get_group(idata, "posterior")
-    if post is None or "draw" not in getattr(post, "dims", {}):
-        return idata
-    n_total = int(post.sizes["draw"])
-    n = n_total
-    for name in post.data_vars:
-        da = post[name]
-        if "chain" not in da.dims or not np.issubdtype(da.dtype, np.floating):
-            continue
-        vals = np.asarray(da.transpose("chain", "draw", ...).values)
-        flat = vals.reshape(vals.shape[0], vals.shape[1], -1)
-        for ch in range(flat.shape[0]):
-            bad = ~np.isfinite(flat[ch]).any(axis=1)
-            if bad.any():
-                n = min(n, int(np.argmax(bad)))
-        break
-    if n >= n_total:
-        return idata
-    isel = getattr(idata, "isel")
-    try:
-        return isel(draw=slice(0, n))  # arviz 0.x: groups lacking `draw` skipped
-    except Exception:
-        return isel(draw=slice(0, n), missing_dims="ignore")
-
-
-def concat_chains(parts):
-    """Join traces sampled separately (e.g. one per superchain) along ``chain``.
-
-    Each group is trimmed to the shortest ``draw`` length among the parts (an
-    aborted sampler stops a few draws early), chains are renumbered 0..C-1,
-    and the result has the same type as the inputs on both arviz majors.
-    """
-    import xarray as xr
-
-    first = parts[0]
-    groups = {}
-    for name in group_names(first):
-        datasets = []
-        for part in parts:
-            g = get_group(part, name)
-            if g is None:
-                break
-            to_ds = getattr(g, "to_dataset", None)
-            ds = to_ds() if callable(to_ds) and not isinstance(g, xr.Dataset) else g
-            datasets.append(ds)
-        if len(datasets) != len(parts):
-            continue
-        if not all("chain" in ds.dims for ds in datasets):
-            groups[name] = datasets[0]
-            continue
-        if all("draw" in ds.dims for ds in datasets):
-            n = min(ds.sizes["draw"] for ds in datasets)
-            datasets = [ds.isel(draw=slice(0, n)) for ds in datasets]
-        merged = xr.concat(datasets, dim="chain", combine_attrs="override")
-        merged = merged.assign_coords(chain=list(range(merged.sizes["chain"])))
-        groups[name] = merged
-
-    datatree = getattr(xr, "DataTree", None)
-    if datatree is not None and isinstance(first, datatree):
-        return datatree.from_dict({f"/{k}": v for k, v in groups.items()})
-    return type(first)(**groups)  # arviz 0.x InferenceData
-
-
 _ess_tail_fallback_warned = False
 
 
 def ess_tail(arr) -> float:
-    """Tail-ESS across majors (arviz 1.x changed ``ess(method="tail")``)."""
+    """Tail ESS with a fallback for the different ArviZ 0.x/1.x signatures."""
     import arviz as az
 
     try:
         return float(az.ess(arr, method="tail"))
     except (TypeError, ValueError):
-        # ValueError too: arviz 1.x validates prob inside the function, so a
-        # missing-prob rejection need not surface as TypeError. Letting it
-        # escape would kill adaptive early-stop for the whole run.
-        for kwargs in ({"method": "tail", "prob": (0.025, 0.975)}, {"method": "tail", "prob": 0.05}):
+        for kwargs in ({"method": "tail", "prob": (0.025, 0.975)},
+                       {"method": "tail", "prob": 0.05}):
             try:
                 return float(az.ess(arr, **kwargs))
             except Exception:
                 continue
-        # Last resort: bulk ESS. Warn once -- silently relabeling bulk as tail
-        # would misreport convergence across future arviz API changes.
         global _ess_tail_fallback_warned
         if not _ess_tail_fallback_warned:
             _ess_tail_fallback_warned = True
             import warnings
 
-            warnings.warn(
-                "arviz tail-ESS API unavailable; reporting bulk ESS in place "
-                "of tail ESS.", stacklevel=2,
-            )
+            warnings.warn("arviz tail-ESS API unavailable; reporting bulk ESS in place "
+                          "of tail ESS.", stacklevel=2)
         return float(az.ess(arr))
-
-
-def sanitize_inference_data(idata, copy: bool = False):
-    """Make all attrs (top-level, group, variable, coord) NetCDF-serializable.
-
-    nutpie stores a dict-valued ``sample_stats`` attr that xarray's NetCDF writer
-    rejects (it only accepts str/Number/ndarray/list/tuple/bytes). Any other value
-    is JSON-encoded. Idempotent for already-clean objects.
-
-    Mutates in place by default. Pass ``copy=True`` on paths that only need a
-    serializable *snapshot* (caching, shipping over the wire): those would
-    otherwise rewrite the attrs of the object the user still holds, so merely
-    enabling the cache changed the type of ``idata.attrs[...]`` under them.
-    """
-    import json
-
-    if copy:
-        try:
-            idata = idata.copy()
-        except Exception:
-            pass  # no copy available -- fall back to in-place
-
-    try:
-        import numpy as np
-
-        # np.bool_ is not an np.number; without it boolean attrs (which the
-        # NetCDF writer accepts) would be needlessly JSON-encoded.
-        ok = (str, bytes, int, float, list, tuple, np.ndarray, np.number, np.bool_)
-    except Exception:
-        ok = (str, bytes, int, float, list, tuple)
-
-    def _fix(attrs):
-        if not isinstance(attrs, dict):
-            return
-        for key, value in list(attrs.items()):
-            if not isinstance(value, ok):
-                try:
-                    attrs[key] = json.dumps(value, default=str)
-                except Exception:
-                    attrs[key] = str(value)
-
-    def _coerce_object_datavars(group):
-        """Coerce object-dtype numeric data variables to float64 in place.
-
-        PyMC's SMC sample_stats (beta, accept_rate, log_marginal_likelihood)
-        come back as object arrays of mixed Python float/int that NetCDF can't
-        write (even native ``idata.to_netcdf()`` raises). The values are regular
-        (chain x stage) numbers, so float64 is lossless.
-        """
-        data_vars = getattr(group, "data_vars", None)
-        if data_vars is None:
-            return
-        for name in list(data_vars):
-            try:
-                if group[name].dtype == object:
-                    group[name] = group[name].astype("float64")
-            except (ValueError, TypeError, KeyError):
-                pass
-
-    _fix(group_attrs(idata, None))
-    for name in group_names(idata):
-        group = get_group(idata, name)
-        _fix(group_attrs(idata, name))
-        # Variable- and coordinate-level attrs reach the NetCDF writer too; a
-        # dict on a DataArray still broke to_netcdf when only group attrs were
-        # swept.
-        for container in (
-            getattr(group, "data_vars", None),
-            getattr(group, "coords", None),
-        ):
-            if container is None:
-                continue
-            for var_name in list(container):
-                try:
-                    _fix(group[var_name].attrs)
-                except Exception:
-                    continue
-        _coerce_object_datavars(group)
-    return idata

@@ -33,12 +33,17 @@ def get_version_manifest() -> dict[str, str]:
         "cloudpickle",
         "arviz",
         "numba",
+        "h5netcdf",
+        "h5py",
+        "xarray",
+        "pymc_monitor",
+        "pymc_cache",
     ]
     manifest = {"python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"}
     for pkg in packages:
         try:
             mod = importlib.import_module(pkg)
-            manifest[pkg] = getattr(mod, "__version__", "unknown")
+            manifest[pkg.replace("_", "-")] = getattr(mod, "__version__", "unknown")
         except ImportError:
             pass
 
@@ -126,18 +131,14 @@ def deserialize_inference_data(data: bytes):
     import os
     import tempfile
 
-    import arviz as az
-
-    from cloudposterior._idata import load_all
+    from pymc_cache.io import load_inference_data
 
     raw = lz4.frame.decompress(data)
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         tmp.write(raw)
         tmp_path = tmp.name
     try:
-        idata = az.from_netcdf(tmp_path)
-        load_all(idata)
-        return idata
+        return load_inference_data(tmp_path)
     finally:
         os.unlink(tmp_path)
 

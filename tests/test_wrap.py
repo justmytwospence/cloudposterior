@@ -79,8 +79,7 @@ def test_cloud_delegates_to_run_sample():
 
 def test_cloud_default_does_not_warn_about_dashboard():
     """The default cp.cloud(model) (no remote, no explicit dashboard) must not
-    spam users with a dashboard warning -- only explicit dashboard=True without
-    remote=True should warn."""
+    spam users with a dashboard warning."""
     model = _make_model()
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # promote warnings to errors
@@ -88,12 +87,11 @@ def test_cloud_default_does_not_warn_about_dashboard():
             pass
 
 
-def test_cloud_explicit_dashboard_without_remote_warns():
-    """Explicit dashboard=True without remote=True is a user error; warn."""
+def test_cloud_explicit_local_dashboard_is_enabled():
+    """The authenticated loopback dashboard can be requested for local runs."""
     model = _make_model()
-    with pytest.warns(UserWarning, match="dashboard=True has no effect"):
-        with cp.cloud(model, dashboard=True):
-            pass
+    with cp.cloud(model, dashboard=True) as active:
+        assert active is model
 
 
 def test_remote_pops_callback_from_kwargs_and_cache_key():
@@ -102,9 +100,9 @@ def test_remote_pops_callback_from_kwargs_and_cache_key():
     model = _make_model()
     captured = {}
 
-    def fake_lookup(cache_arg, m, mb, cache_kwargs, *, overwrite, progress):
+    def fake_lookup(cache_arg, m, cache_kwargs, *, overwrite, progress):
         captured["cache_kwargs"] = cache_kwargs
-        return None, None, None
+        return MagicMock(), MagicMock(hit=False)
 
     def fake_provision(self, nuts_sampler, kwargs):
         self._env = MagicMock()
@@ -127,12 +125,14 @@ def test_remote_cache_hit_skips_provisioning():
     sentinel = MagicMock(name="cached_idata")
 
     def fake_lookup(*args, **kwargs):
-        return MagicMock(), "key", sentinel
+        return MagicMock(), MagicMock(hit=True, result=sentinel)
 
     def boom(self, nuts_sampler, kwargs):
         raise AssertionError("provisioned despite cache hit")
 
     with patch("cloudposterior.api._cache_lookup", side_effect=fake_lookup), \
+         patch("cloudposterior.api._ensure_model_bytes",
+               side_effect=AssertionError("cache hit serialized model")), \
          patch.object(cp.cloud, "_provision_environment", boom):
         with cp.cloud(model, remote=True):
             out = pm.sample(draws=10)

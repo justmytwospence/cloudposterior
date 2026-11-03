@@ -30,8 +30,9 @@ def _fake_modal(monkeypatch):
     counter = {"i": 0}
 
     class FakeCall:
-        def __init__(self, tag):
+        def __init__(self, tag, draws):
             self._tag = tag
+            self._draws = draws
 
         def get(self):
             if state["fail_get"]:
@@ -39,7 +40,7 @@ def _fake_modal(monkeypatch):
             state["captured"].append(self._tag)
             # tag each result by spawn order so the caller can verify ordering
             return serialize_inference_data(
-                _posterior_idata({"x": np.full((2, 5), float(self._tag))})
+                _posterior_idata({"x": np.full((2, self._draws), float(self._tag))})
             )
 
         def cancel(self):
@@ -57,7 +58,7 @@ def _fake_modal(monkeypatch):
                 "progress_key": progress_key,
                 "stop_dict_name": stop_dict_name,
             })
-            return FakeCall(tag)
+            return FakeCall(tag, kw.get("draws", 1000))
 
     class FakeSampler:
         sample_blocking = FakeMethod()
@@ -127,6 +128,19 @@ def test_cp_map_runs_all_in_input_order(monkeypatch):
     # fake tags results by spawn order -> 0,1,2 returned in input order
     assert [float(o.posterior["x"].values.flat[0]) for o in out] == [0.0, 1.0, 2.0]
     assert len(state["captured"]) == 3
+
+
+def test_cp_map_transports_implicit_and_explicit_sampler_intent(monkeypatch):
+    import cloudposterior as cp
+
+    state = _fake_modal(monkeypatch)
+    cp.map(_models(2), [{"draws": 5}, {"draws": 5, "nuts_sampler": "pymc",
+                                         "tune": 17}], cache=False, dashboard=False)
+    auto, explicit = [item["kw"] for item in state["spawned"]]
+    assert (auto["_cp_sampler_auto"], auto["_cp_tune_default"]) == (True, True)
+    assert auto["tune"] > 0
+    assert (explicit["_cp_sampler_auto"], explicit["_cp_tune_default"]) == (False, False)
+    assert explicit["tune"] == 17
 
 
 def test_cp_map_kwargs_list_must_align(monkeypatch):
@@ -237,7 +251,12 @@ def test_cp_map_all_cached_skips_provisioning(monkeypatch):
         def save(self, key, idata, **kw):
             raise AssertionError("save should not run when everything is cached")
 
-    out = cp.map(_models(3), {"draws": 10}, cache=AllHitCache())
+    def unexpected_serialize(model):
+        raise AssertionError("cached map serialized a model")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(api, "_ensure_model_bytes", unexpected_serialize)
+        out = cp.map(_models(3), {"draws": 10}, cache=AllHitCache())
     assert len(out) == 3 and all(o is not None for o in out)
     # zero Modal work
     assert state["provision_kwargs"] == []

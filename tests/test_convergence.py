@@ -153,6 +153,10 @@ def _draws(x, names=None, **kw):
     per = k // len(names)
     for i, n in enumerate(names):
         arrays[n] = x[:, :, i * per:(i + 1) * per]
+    # Synthetic policy tests assume valid HMC stats unless a test explicitly
+    # supplies pathologies. Missing stats now fail closed, not silently pass.
+    kw.setdefault("diverging", np.zeros(x.shape[:2], dtype=int))
+    kw.setdefault("energy", np.random.default_rng(42).normal(size=x.shape[:2]))
     return cv.draws_from_arrays(arrays, **kw)
 
 
@@ -166,6 +170,13 @@ def test_assess_checks_vector_elements():
     assert a["checks"]["r_hat"]["worst"][0] == "theta[1]"
     assert a["params"]["mu"]["rhat"] < 1.01
     assert a["met"] is False
+
+
+def test_missing_hmc_stats_cannot_prove_targets_met():
+    x = np.random.default_rng(3).normal(size=(4, 1000, 1))
+    result = cv.assess(cv.draws_from_arrays({"a": x}), cv.normalize_target(True))
+    assert result["met"] is False
+    assert result["checks"]["divergences"]["ok"] is False
 
 
 def test_assess_met_on_iid_draws():
