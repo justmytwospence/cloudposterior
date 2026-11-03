@@ -1,0 +1,15 @@
+---
+title: Packages and composition
+---
+
+cloudposterior composes two independently usable Python packages. Its `cp.cloud(model)` context manager remains the only global PyMC interceptor.
+
+| Package | Owns | Public documentation |
+|---|---|---|
+| [pymc-monitor](https://github.com/justmytwospence/pymc-monitor) | Sampling engine, adaptive diagnostics, notebook/terminal displays and authenticated localhost dashboard | [Monitor API](https://justmytwospence.github.io/pymc-monitor/) |
+| [pymc-cache](https://github.com/justmytwospence/pymc-cache) | Versioned model/data/kwargs fingerprints, policy-aware preflight, memory and disk storage | [Cache API](https://justmytwospence.github.io/pymc-cache/) |
+| cloudposterior | Modal image/source delivery, volumes, progress transport, hosted dashboard, ntfy, model-map fanout and PyMC interception | [This API](reference/index.qmd) |
+
+The monitor never imports the cache, and neither package imports Modal or cloudposterior. Each is on PyPI and usable on its own (`pip install pymc-monitor`, `pip install pymc-cache`); `pip install cloudposterior` pulls in both, as `pymc-monitor[notebook,dashboard]>=0.1,<0.2` and `pymc-cache>=0.1,<0.2`. Modal images install only pinned third-party dependencies and mount all three package sources and the monitor assets, so the remote worker runs exactly the code installed locally.
+
+Local sampling uses the monitor engine with the captured original `pm.sample`, including `until=` and `init="prior"`. A local `dashboard=True` binds an authenticated loopback-only server; remote dashboard URLs are Modal-hosted and support phone access. PyMC/nutpie provide live draws and early stop; JAX samplers provide phase-level progress only. PyMC 5 and 6 are supported on their respective Python versions. Diagnostic thresholds are heuristics rather than guarantees.

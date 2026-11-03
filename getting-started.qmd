@@ -4,16 +4,13 @@ title: "Getting started"
 
 ## Install
 
+Requires Python >=3.11 and PyMC >=5.28.
+
 ```bash
 pip install cloudposterior
 ```
 
-This pulls in PyMC, ArviZ, and the Modal client. For cloud execution you also
-need a (free) [Modal](https://modal.com) account --- authenticate once:
-
-```bash
-modal setup
-```
+This pulls in PyMC, ArviZ, pymc-monitor, pymc-cache and the Modal client. For cloud execution, obtain a (free) [Modal](https://modal.com) account and authenticate once with `modal setup`.
 
 ## Your first cloud sample
 
@@ -45,8 +42,9 @@ Run that cell again and the cached result returns instantly --- no re-sampling.
   The default `cache=True` keeps results for the current session; `cache=False`
   disables it.
 - `dashboard=True` --- a live web dashboard (convergence, traces, a Stop
-  button). On by default for `remote=True`; pass `dashboard=False` to skip it.
-  The URL it prints carries an access token, so treat it as a secret.
+  button). On by default for `remote=True`; opt in locally for an authenticated
+  loopback-only dashboard. Pass `dashboard=False` to skip it. Treat its URL/token
+  as a secret.
 - `notify=True` --- push notifications to your phone via
   [ntfy](https://ntfy.sh) on sampling start, completion, and errors. Pass a
   string to choose the topic, or a dict for `{"topic", "server"}`. Auto-
@@ -58,8 +56,9 @@ Run that cell again and the cached result returns instantly --- no re-sampling.
   R-hat <= 1.01, bulk and tail ESS >= 400, no divergences, E-BFMI >= 0.3. It
   also stops when more draws can't help, and says why. `until="draft"` is a
   looser development preset. A dict sets your own targets (`ess`, `mcse`,
-  `var_names`, `escalate`, `superchains`, ...). Remote runs with the nutpie or
-  pymc sampler only. `cp.check_convergence(idata)` gives the same report for
+  `var_names`, `escalate`, `superchains`, ...). Works locally or remotely with
+  nutpie/pymc. These checks are heuristics, not convergence guarantees.
+  `cp.check_convergence(idata)` gives the same report for
   any trace.
 - `init="prior"` --- start each chain from a prior draw (dispersed starts make
   R-hat trustworthy).
@@ -68,7 +67,7 @@ Run that cell again and the cached result returns instantly --- no re-sampling.
   the working directory name.
 - `progress=False` --- silence the live progress display.
 
-See the [examples](examples/basics.ipynb) for each feature in depth.
+See the [packages](packages.qmd), [migration](migration.qmd) and [examples](examples/basics.ipynb) for composition, old cache invalidation, and each feature in depth.
 
 ## Fitting many models at once
 

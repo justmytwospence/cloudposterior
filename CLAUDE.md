@@ -11,8 +11,11 @@ cloudposterior lets you run PyMC MCMC sampling on cloud VMs (currently Modal) wi
 ```bash
 uv sync                          # install all deps (including dev group)
 ./scripts/lock.sh                # re-lock (never plain `uv lock` -- see note below)
-uv run pytest tests/ -v          # run free local tests (default)
-uv run pytest tests/ -v --run-modal   # also run paid Modal e2e tests
+uv lock --check --no-config        # verify portable lock freshness
+uv sync --frozen                  # local execution honors configured policy
+uv run --frozen pytest tests/ -v  # run free local tests (default)
+# Paid extraction smoke is separate and must be explicitly authorized:
+# uv run --frozen pytest tests/test_extraction_modal.py -v --run-modal
 uv run pytest tests/test_cache.py -v          # run one test file
 uv run pytest tests/test_cache.py::test_name -v  # run single test
 ```
@@ -29,7 +32,7 @@ then verifies the result is clean. A `.githooks/pre-push` hook blocks a push
 carrying a poisoned lockfile; enable it once per clone with
 `git config core.hooksPath .githooks`.
 
-Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`) hit real Modal infrastructure and incur cloud costs. They are skipped unless `--run-modal` is passed. See `tests/conftest.py` for the marker plumbing.
+Tests marked `@pytest.mark.modal` (`tests/test_modal_e2e.py`, `tests/test_extraction_modal.py`) hit real Modal infrastructure and incur cloud costs. They are skipped unless `--run-modal` is passed. See `tests/conftest.py` for the marker plumbing.
 
 CI runs pytest on Python 3.11-3.13 (free tests only -- Modal tests are not in CI).
 
@@ -52,9 +55,9 @@ Each example in `examples/` exists in two formats that must be kept in sync:
 
 1. `cp.cloud(model)` context manager monkeypatches five PyMC functions to route through `api.py`: `pm.sample` (→ `_run_sample` / `_run_sample_persistent`), `pm.sample_prior_predictive` / `pm.sample_posterior_predictive` (→ `_run_predictive`), `pm.sample_smc` (→ `_run_smc`), and `pm.compute_log_likelihood` (→ `_run_idata_op`). The latter three reuse a blocking (non-streaming) remote-op template; only `pm.sample` streams per-draw progress.
 2. The model is serialized as a single cloudpickle + lz4 blob in `serialize.py` (observed data is captured inside the model pickle -- no separate data payload)
-3. Cache key is computed from the serialized bytes + sample kwargs (`naming.cache_key`); cache backends live in `cache.py`
+3. `pymc_cache.CacheSession` fingerprints the current model graph/data, sampler settings and environment before serialization or provisioning; compatibility exports remain in `cache.py` / `naming.py`
 4. If remote: `ModalBackend` (`backends/modal_backend.py`) submits a `SamplingPayload` to Modal, which runs `remote/worker.py` in a container with version-matched dependencies
-5. If local: the original `pm.sample` is called directly
+5. If local: the same `pymc_monitor.engine.iter_sample` receives the captured original `pm.sample` (native MultiTrace requests bypass enhanced monitoring)
 6. Progress events stream back via msgpack and are rendered by display sinks (an anywidget that animates live in both Jupyter and marimo notebooks, Rich for terminals) in `display.py`
 7. Results are cached and returned as `az.InferenceData`
 
@@ -70,7 +73,7 @@ Each example in `examples/` exists in two formats that must be kept in sync:
 
 When `remote=True`, containers stay warm for 20 minutes. Model payloads are stored in a project-scoped Modal Volume so only sample kwargs are sent per-call:
 
-1. Model is serialized once on the first `pm.sample()` call (lazy first-touch, memoized on the model) and uploaded to a Volume at `{model_slug}/payload-{hash}.bin`
+1. The model is serialized on first touch and reused while its structural/data fingerprint is unchanged. A custom `step=` instead serializes `{model, step}` together afresh for each remote execution. The payload is uploaded to a Volume at `{model_slug}/payload-{hash}.bin`
 2. A `modal.Cls`-based sampler loads the payload from the mounted Volume (fast local read)
 3. Each `pm.sample()` call sends only kwargs + a path string -- no model/data bytes on the wire
 4. If the model changes between calls, the new payload is uploaded to the Volume (KB, fast)
@@ -84,7 +87,7 @@ Human-readable names for browsability, machine hashes for correctness:
 
 | System | Human-readable (cosmetic) | Machine-correct (identity) |
 |--------|--------------------------|---------------------------|
-| Local disk cache | `{model_slug}/{params_label}-{key8}.nc` | `cache_key()` SHA-256 |
+| Local disk cache | `{model_slug}/{params_label}-{full-key}.nc` | `pymc_cache.cache_key()` versioned SHA-256 |
 | Remote Volume | `{model_slug}/payload-{hash}.bin` | `payload_hash()` SHA-256 prefix |
 | Notifications | `{model_slug}-{random_wordhash}` | N/A |
 
@@ -92,13 +95,13 @@ Shared utilities: `model_slug()`, `payload_hash()`, `cache_key()` in `naming.py`
 
 ### Live dashboard (`dashboard=` kwarg; on by default for `remote=True`)
 
-`dashboard.py` contains `DashboardSink` (writes progress to a Modal Dict) and `DASHBOARD_HTML` (self-contained page with JS polling). Two `@modal.fastapi_endpoint` functions serve the HTML and progress JSON. The dashboard URL includes the model name for readability (e.g., `radon-intercepts-a3f7b2-dev.modal.run`).
+`dashboard.py` contains `DashboardSink` (writes `pymc_monitor.dashboard.DashboardState` progress to a Modal Dict) and a hosted frontend rendered from monitor assets. Two `@modal.fastapi_endpoint` functions serve the HTML and progress JSON. The dashboard URL includes the model name for readability (e.g., `radon-intercepts-a3f7b2-dev.modal.run`).
 
-The dashboard is controlled by the separate `dashboard: bool | None` kwarg (default: on for remote runs, off -- with a warning if explicitly requested -- for local). `notify=` is ntfy-only: `True` auto-generates a topic, a string is the topic, a dict accepts `{"topic", "server"}`; sends fire on sampling start, completion, and errors.
+The dashboard is controlled by the separate `dashboard: bool | None` kwarg (default: on for remote runs, off unless requested for local). A requested local dashboard binds an authenticated loopback service. `notify=` is ntfy-only: `True` auto-generates a topic, a string is the topic, a dict accepts `{"topic", "server"}`; sends fire on sampling start, completion, and errors.
 
 ### Remote worker
 
-`remote/worker.py` runs inside Modal containers. It is never imported locally -- Modal serializes and executes it. It deserializes the model, runs sampling while streaming per-chain stats via a queue, and returns lz4-compressed NetCDF. `_sample_and_stream` branches three ways by sampler:
+`remote/worker.py` runs inside Modal containers. It deserializes the model, drives `pymc_monitor.engine.iter_sample` with a `RunControl` polling Modal stop flags, streams typed events over msgpack, and returns the same lz4-compressed NetCDF wire format. The monitor owns sampler branches:
 
 - **`pymc`**: `pm.sample(nuts_sampler="pymc", callback=...)` -- the per-draw callback fills the progress queue. The `nuts_sampler="pymc"` is explicit so PyMC 6 doesn't auto-select nutpie (which would reject the callback).
 - **`nutpie`** (the default): runs nutpie's background sampler (`blocking=False`) with its native `progress_callback`; the generator loop polls the stop Dict and calls `handle.abort()` to stop early (keeping the partial trace), then `handle.wait()` for the final result.
@@ -110,7 +113,7 @@ Besides streaming sampling, the worker has **blocking (non-streaming) entries** 
 
 ### Convergence layer (`convergence.py`, `until=`)
 
-`convergence.py` is shared by the worker and the client. It holds four things:
+`convergence.py` re-exports the monitor's numerical and policy APIs for compatibility; the monitor owns four things:
 
 - **Targets:** `normalize_target` handles the presets `final` and `draft` and dict overrides, and rejects unknown keys.
 - **Diagnostics:** vectorized numpy ports of ArviZ 0.x rank-normalized R-hat, bulk/tail/mean ESS and quantile MCSE, plus nested R-hat. They are tested against ArviZ and are identical across arviz majors, so don't swap in `az.rhat`.
@@ -119,8 +122,8 @@ Besides streaming sampling, the worker has **blocking (non-streaming) entries** 
 
 In the worker:
 
-- `_sample_and_stream` loops over `_sample_once` attempts. With `escalate`, it re-runs with settings from `_LADDER`, chosen by the diagnosed cause.
-- Every result gets a report in `posterior.attrs["cloudposterior_convergence"]`. The client warns from it (`_report_verdict`).
+- The monitor engine owns retry attempts and escalation. `cloudposterior.remote.worker._next_rung` is a compatibility alias, not an algorithm copy.
+- Every result has canonical `posterior.attrs["pymc_monitor_convergence"]` and the cloudposterior legacy alias. The client warns from unmet adaptive reports (`_report_verdict`).
 - Superchains run as K nutpie samplers that share a compiled model, with its `initial_point_func` replaced by a fixed point. On the pymc path they use per-chain `initvals` with `init="adapt_diag"`.
 - A convergence stop on the pymc path waits until every chain reaches the leader's draw count (`stop_at`). Interrupting at once lets PyMC's `_choose_chains` drop the chains that are behind.
 - Aborted nutpie traces are NaN-padded, so they are trimmed with `_idata.trim_incomplete_draws`.
@@ -129,7 +132,7 @@ In the worker:
 
 - **Default sampler**: `api._default_sampler()` picks nutpie for fully continuous models (PyMC's own default, ~2x faster) and the pymc sampler when there are discrete free RVs; locally it falls back to pymc when nutpie isn't installed. nutpie is always installed in CPU remote images (`_build_pip_specs`).
 - **Callback constraint**: PyMC's per-draw `callback` only fires for `nuts_sampler="pymc"`; PyMC 6 *raises* if a callback is passed to an external sampler. Only attach a callback on the pymc path (worker + `_run_local`).
-- **`_idata.py`**: thin shims so the codebase works on **both arviz 0.x (PyMC 5) and arviz 1.x (PyMC 6, DataTree)** -- `.groups()` vs `.groups`, removed `convert_to_inference_data`, changed `ess(method="tail")`, the dict-valued `sample_stats` attr nutpie writes, and object-dtype data vars from SMC's `sample_stats` (`beta`/`accept_rate`/`log_marginal_likelihood`, which even native `to_netcdf` rejects) -- both handled by `sanitize_inference_data`. `add_group` merges a remotely-computed group (e.g. `log_likelihood`) into a local idata in place. Always go through these helpers instead of calling arviz idata methods directly.
+- **`_idata.py`**: compatibility re-exports for both ArviZ 0.x (PyMC 5) and ArviZ 1.x (PyMC 6, DataTree): sampling helpers from `pymc_monitor.idata`, storage sanitation and eager loading from `pymc_cache.io`, and small version/tail-ESS shims. `add_group` merges remotely-computed groups (e.g. `log_likelihood`) into the caller's idata. Always use these helpers instead of calling ArviZ internals directly.
 
 ### Auto-sizing
 

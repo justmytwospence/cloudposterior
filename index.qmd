@@ -33,12 +33,13 @@ All three work independently --- use any combination, or just the caching.
 ## Install
 
 ```bash
-pip install cloudposterior  # pulls in PyMC, ArviZ, and the Modal client
+pip install cloudposterior  # pulls in PyMC, ArviZ, pymc-monitor, pymc-cache and the Modal client
 modal setup                 # one-time auth, for cloud execution
 ```
 
 ## Next steps
 
 - [Getting started](getting-started.qmd) --- install and your first cloud sample
+- [Packages](packages.qmd) and [migration](migration.qmd) --- extracted monitor/cache APIs and versioned cache identity
 - [Examples](examples/basics.ipynb) --- cloud execution, caching, parallel fitting, monitoring
 - [API reference](reference/index.qmd) --- `cloud`, `sample`, `map`, and configuration

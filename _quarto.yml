@@ -6,6 +6,8 @@ project:
   render:
     - index.qmd
     - getting-started.qmd
+    - packages.qmd
+    - migration.qmd
     - examples/*.ipynb
     - reference/
 
@@ -25,6 +27,8 @@ website:
     left:
       - text: "Get started"
         href: getting-started.qmd
+      - text: "Packages"
+        href: packages.qmd
       - text: "Examples"
         href: examples/basics.ipynb
       - text: "API reference"
@@ -41,6 +45,8 @@ website:
       - text: Overview
         href: index.qmd
       - getting-started.qmd
+      - packages.qmd
+      - migration.qmd
       - section: Examples
         contents:
           - text: Cloud execution
@@ -59,6 +65,7 @@ website:
           - reference/map.qmd
           - reference/cleanup_volumes.qmd
           - reference/cleanup_cache.qmd
+          - reference/check_convergence.qmd
           - reference/config.RemoteConfig.qmd
           - reference/cache.MemoryCache.qmd
           - reference/cache.DiskCache.qmd
@@ -87,6 +94,8 @@ quartodoc:
   dir: reference
   title: API reference
   parser: google
+  # Most public cloud names are compatibility aliases to extracted packages.
+  dynamic: true
   sections:
     - title: Core
       desc: "The one-line cloud sampling API."
@@ -96,6 +105,7 @@ quartodoc:
         - map
         - cleanup_volumes
         - cleanup_cache
+        - check_convergence
     - title: Configuration
       desc: "Right-size the remote VM."
       contents:

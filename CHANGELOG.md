@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Extraction and migration
+
+- Compose independent [pymc-monitor](https://justmytwospence.github.io/pymc-monitor/) and [pymc-cache](https://justmytwospence.github.io/pymc-cache/) packages. Cloudposterior keeps PyMC interception, Modal transport, notifications and model-map fanout. Both are released on PyPI (0.1.0) and required as `pymc-monitor[notebook,dashboard]>=0.1,<0.2` and `pymc-cache>=0.1,<0.2`.
+- Use the same monitoring engine for local and cloud sampling: `until=` and `init="prior"` now work locally; `dashboard=True` locally serves an authenticated loopback dashboard. The canonical report/superchain attrs have `pymc_monitor_` names; cloudposterior writes its legacy aliases too.
+- Cache lookup precedes serialization, volume upload and provisioning. Versioned graph/data/environment fingerprints deliberately invalidate old `.cloudposterior/` hits without removing files. `cleanup_cache()` removes only verified owned entries and matching legacy pairs, preserving unrelated files and symlinks. Stopped, futile, unmet and indeterminate adaptive traces are not automatically cached; `cache=False` skips identity work and `overwrite=True` forces a fresh eligible result.
+- Require PyMC >=5.28 and PyTensor >=2.38 (Python >=3.11); keep PyMC 5/6 compatibility. Monitor convergence presets remain heuristics, not scientific certification.
+
 ### Added
 
 - **Convergence layer** (`cloudposterior.convergence`) behind `until=`. It

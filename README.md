@@ -2,7 +2,7 @@
 
 **Stop waiting for MCMC. Start shipping posteriors.**
 
-cloudposterior lets you run PyMC models on cloud VMs without changing your sampling code. One extra line gives you cloud compute, automatic caching, and phone notifications -- while `pm.sample()` stays exactly the same.
+cloudposterior lets you run PyMC models on cloud VMs without changing your sampling code. One extra line gives you cloud compute, automatic caching, and phone notifications -- while `pm.sample()` stays exactly the same. Sampling diagnostics and local dashboards come from [pymc-monitor](https://justmytwospence.github.io/pymc-monitor/); safe result reuse comes from [pymc-cache](https://justmytwospence.github.io/pymc-cache/).
 
 ```python
 import cloudposterior as cp
@@ -29,6 +29,8 @@ All three features work independently. Use any combination, or just the caching.
 
 ## Quick start
 
+Requires Python >=3.11 and PyMC >=5.28.
+
 ```bash
 uv add cloudposterior
 
@@ -53,6 +55,14 @@ with cp.cloud(my_model, remote=True, cache="disk"):
 Second time you run that cell? Instant. The result is already cached.
 
 ---
+
+## Three composable packages
+
+- **[pymc-monitor](https://justmytwospence.github.io/pymc-monitor/)** owns sampling progress, diagnostic checkpoints, adaptive stopping, retries, displays, and the local dashboard. Its [API reference](https://justmytwospence.github.io/pymc-monitor/reference/) provides a standalone `sample`/`start` interface without any Modal dependency.
+- **[pymc-cache](https://justmytwospence.github.io/pymc-cache/)** owns graph/data identity, cache eligibility, safe memory/disk storage, and the `CacheSession` preflight API. Its [API reference](https://justmytwospence.github.io/pymc-cache/reference/) has no monitor or cloud dependency.
+- **cloudposterior** keeps the `cp.cloud` interceptor, Modal provisioning and transport, notifications and model-map fanout. It composes the two packages rather than maintaining independent samplers or cache-key algorithms.
+
+The cloud API is unchanged. Local `until=` and an authenticated `dashboard=True` loopback page are now supported. Diagnostic thresholds are heuristics, **not** convergence guarantees or publication certification. See [migration](migration.qmd) and [packages](packages.qmd) for the compatibility boundary and pre-PyPI installation.
 
 ## Features
 
@@ -113,12 +123,12 @@ Results are stored in a human-readable directory tree:
 ```
 .cloudposterior/
 ├── radon_intercepts/
-│   └── draws2000_tune1000_chains4-a3f7b2c9.nc
+│   └── draws2000_tune1000_chains4-<full-sha256>.nc
 └── radon_slopes/
-    └── draws2000_tune1000_chains4-7c2e5fa8.nc
+    └── draws2000_tune1000_chains4-<full-sha256>.nc
 ```
 
-Model names come from `pm.Model(name="radon_intercepts")`. The hash suffix ensures uniqueness when non-displayed parameters (like `random_seed`) differ.
+Model names come from `pm.Model(name="radon_intercepts")`. The full versioned fingerprint includes graph structure, data, software versions and sampler settings. Existing legacy entries remain on disk but are not reused: see the [migration guide](migration.qmd). `cache=True` explicitly reuses an unseeded run; choose `overwrite=True` or `cache=False` for a fresh draw. Manually stopped and unmet adaptive runs are not automatically cached.
 
 ### Monitoring
 
@@ -177,7 +187,7 @@ Works with both **PyMC 5 and PyMC 6** (PyMC 6 ships arviz 1.x's DataTree); the v
 Stop when the chains have converged instead of guessing a draw count. `draws` becomes the cap:
 
 ```python
-with cp.cloud(model, remote=True, until=True):
+with cp.cloud(model, until=True):  # also works locally; add remote=True for Modal
     idata = pm.sample(draws=20000)   # stops once the convergence target holds
 ```
 
@@ -281,9 +291,9 @@ Two `pm.sample` details can't be matched exactly for remote execution and warn r
 |---------|---------|---------|
 | Caching | **on** (in-memory) | `cache=True` / `"memory"` / `False` / `"disk"` / `Path(...)` |
 | Cloud execution | off | `remote=True` / `False` |
-| Live dashboard | **on** (when remote) | `dashboard=True` / `False` |
+| Live dashboard | on remotely, off locally | `dashboard=True` (authenticated localhost for local runs) / `False` |
 | Push notifications | off | `notify=True` / `"topic"` / `{"server": ..., "topic": ...}` |
-| Adaptive stopping + convergence verdict | off | `until=True` / `"draft"` / `{"ess": ..., "mcse": ..., ...}` (remote) |
+| Adaptive stopping + convergence verdict | off | `until=True` / `"draft"` / `{"ess": ..., "mcse": ..., ...}` (local or remote) |
 | Chain initialization | sampler default | `init="prior"` |
 | Re-run and replace the cache entry | off | `overwrite=True` |
 | Project namespace (volume + dashboard) | working directory name | `project="name"` |

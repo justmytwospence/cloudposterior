@@ -1,0 +1,21 @@
+---
+title: Migration after the package extraction
+---
+
+The public `cp.cloud`, `cp.sample`, `cp.map`, `cp.cleanup_cache`, `cp.cleanup_volumes` and `cp.check_convergence` names remain. Existing paired notebook examples do not need edits. The two new standalone packages are optional when accessing cloudposterior's API: cloudposterior's declared requirements include them.
+
+## Cache identity and old files
+
+`pymc-cache` uses a versioned canonical graph/data/kwargs/environment fingerprint. Previous cloudposterior cache keys are intentionally invalidated because some representations could miss changes in a model or its data. **Existing `.cloudposterior/` files are preserved, not silently read or deleted.** New disk entries have full SHA-256 suffixes and full-key metadata. This means the first call after upgrade recomputes the posterior; subsequent equivalent calls can hit the new entry. A custom callable, step method or model operation without a safely representable identity bypasses automatic caching rather than risking a false hit.
+
+`cache=True` reuses an unseeded result even with `random_seed=None`. Use `cache=False` to skip caching altogether or `overwrite=True` to run again and replace an eligible entry. Only completed fixed-length runs and adaptive runs with met targets are reusable. Manually stopped, futile, capped-but-unmet, failed and indeterminate adaptive results are returned to the caller but not stored for reuse. This is not a sampler checkpoint/resume mechanism.
+
+`cp.cleanup_cache(base_dir=...)` removes verified new-format entries and matching legacy `.nc`/`.key` pairs under the selected cloudposterior root. It preserves the root, unrelated files and symlinks. It does not remove Modal volumes; `cp.cleanup_volumes(project=...)` is separate.
+
+## Local monitoring and report attributes
+
+`cp.cloud(model, until="draft")` now checks targets and stops locally with the same monitor engine as the remote worker. `dashboard=True` with `remote=False` opens an authenticated localhost dashboard rather than warning that it has no effect. Local `return_inferencedata=False` remains a native PyMC passthrough, disables enhanced monitoring/caching for that call, and cannot be combined with adaptive stopping.
+
+The canonical report is stored in `posterior.attrs["pymc_monitor_convergence"]`; cloudposterior also writes the historical `cloudposterior_convergence` alias. Superchain membership similarly has canonical `pymc_monitor_superchains` and legacy `cloudposterior_superchains` aliases. Use `cp.check_convergence(idata)` to assess any InferenceData independently. For precise interpretation, see the [monitor statistical policy](https://justmytwospence.github.io/pymc-monitor/) and [cache policy](https://justmytwospence.github.io/pymc-cache/).
+
+The supported floor is PyMC 5.28 and PyTensor 2.38 (with Python >=3.11). PyMC 6 requires Python >=3.12. Remote numpyro/blackjax still warn and ignore `until=` for compatibility; standalone pymc-monitor rejects unsupported adaptive requests. Native `callback=` is still unavailable across Modal; it works locally through the captured original sampler.
