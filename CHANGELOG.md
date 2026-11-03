@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] -- 2026-11-02
+
 ### Extraction and migration
 
 - Compose independent [pymc-monitor](https://justmytwospence.github.io/pymc-monitor/) and [pymc-cache](https://justmytwospence.github.io/pymc-cache/) packages. Cloudposterior keeps PyMC interception, Modal transport, notifications and model-map fanout. Both are released on PyPI (0.1.0) and required as `pymc-monitor[notebook,dashboard]>=0.1,<0.2` and `pymc-cache>=0.1,<0.2`.
