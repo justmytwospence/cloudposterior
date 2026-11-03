@@ -109,7 +109,11 @@ def test_fallback_not_stored_under_nutpie_preflight_key():
                              "random_seed": 7, "nuts_sampler": "nutpie"},
                             sampler_identity="nutpie")
     assert not lookup.hit
-    idata = az.from_dict(posterior={"x": np.zeros((1, 5))})
+    groups = {"posterior": {"x": np.zeros((1, 5))}}
+    try:  # ArviZ 0.x takes group kwargs, 1.x one dict
+        idata = az.from_dict(**groups)
+    except TypeError:
+        idata = az.from_dict(groups)
     assert session.store(lookup, idata, status="complete", effective_sampler="pymc") is False
     assert session.lookup({"draws": 5, "tune": 400, "chains": 1,
                            "random_seed": 7, "nuts_sampler": "nutpie"},
