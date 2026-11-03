@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.ci-deps/
 .eggs/
 *.egg
 .env
@@ -30,3 +31,4 @@ _site/
 **/*.quarto_ipynb
 
 /.quarto/
+/.ci-deps/

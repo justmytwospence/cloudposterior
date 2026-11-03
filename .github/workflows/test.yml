@@ -21,7 +21,7 @@ jobs:
       - name: Lint with ruff
         run: |
           uv sync --locked
-          uv run ruff check cloudposterior/ tests/
+          uv run --locked ruff check cloudposterior/ tests/ scripts/
 
   test:
     runs-on: ubuntu-latest
@@ -60,12 +60,17 @@ jobs:
       - name: Run tests (PyMC ${{ matrix.pymc }})
         run: |
           if [ "${{ matrix.pymc }}" = "6" ]; then
-            uv run --python ${{ matrix.python-version }} \
+            uv run --locked --python ${{ matrix.python-version }} \
               --with "pymc>=6,<7" --with "arviz>=1.1,<2.0" --with "nutpie>=0.16.10" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           else
-            uv run --python ${{ matrix.python-version }} \
-              --with "pymc>=5,<6" --with "arviz>=0.18,<1.0" --with "nutpie>=0.13" \
+            if [ "${{ matrix.python-version }}" = "3.11" ]; then
+              NUTPIE="nutpie==0.16.8"
+            else
+              NUTPIE="nutpie>=0.13"
+            fi
+            uv run --locked --python ${{ matrix.python-version }} \
+              --with "pymc>=5.28,<6" --with "arviz>=0.18,<1.0" --with "$NUTPIE" \
               python -m pytest tests/ -v --cov=cloudposterior --cov-report=term-missing
           fi
 
@@ -73,4 +78,50 @@ jobs:
       # into the log that nobody reads. Raise the floor as coverage improves.
       - name: Enforce coverage floor
         if: matrix.python-version == '3.13' && matrix.pymc == '6'
-        run: uv run coverage report --fail-under=70
+        run: uv run --locked coverage report --fail-under=70
+
+  artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Install Python
+        run: uv python install 3.12
+      - name: Download the locked pymc-monitor and pymc-cache releases
+        run: |
+          uv run --no-project --python 3.12 --with pip python - <<'PY'
+          import subprocess
+          import sys
+          import tomllib
+
+          lock = tomllib.load(open("uv.lock", "rb"))
+          for project in ("pymc-monitor", "pymc-cache"):
+              entry = next(p for p in lock["package"] if p["name"] == project)
+              if entry["source"].get("registry") != "https://pypi.org/simple":
+                  raise SystemExit(f"{project} must be locked from PyPI, not {entry['source']}")
+              spec = f"{project}=={entry['version']}"
+              dest = f".ci-deps/{project}/dist"
+              pip = [sys.executable, "-m", "pip", "download", "--no-deps", "-d", dest]
+              subprocess.run([*pip, "--only-binary", ":all:", spec], check=True)
+              subprocess.run([*pip, "--no-binary", ":all:", spec], check=True)
+          PY
+      - name: Build cloudposterior
+        run: uv build --no-sources --out-dir dist
+      - name: Verify metadata, included modules and assets
+        run: |
+          uv sync --locked
+          uv run --locked python scripts/check_extraction_artifacts.py \
+            --monitor .ci-deps/pymc-monitor/dist \
+            --cache .ci-deps/pymc-cache/dist --cloud dist
+      - name: Smoke all three installed wheels, not sibling source trees
+        run: |
+          uv run --isolated --no-project --prerelease=disallow \
+            --with .ci-deps/pymc-monitor/dist/*.whl \
+            --with .ci-deps/pymc-cache/dist/*.whl \
+            --with dist/*.whl scripts/smoke_extraction.py
+      - name: Smoke all three installed sdists
+        run: |
+          uv run --isolated --no-project --prerelease=disallow \
+            --with .ci-deps/pymc-monitor/dist/*.tar.gz \
+            --with .ci-deps/pymc-cache/dist/*.tar.gz \
+            --with dist/*.tar.gz scripts/smoke_extraction.py

@@ -33,12 +33,44 @@ jobs:
             exit 1
           fi
 
+      # uv's Git source overrides are local-resolution instructions, not
+      # distributable Requires-Dist. Refuse a release until both canonical
+      # requirements can actually be installed from the public index.
+      - name: Verify extracted dependencies exist on PyPI
+        run: |
+          uv run --locked python - <<'PY'
+          import json
+          import tomllib
+          import urllib.error
+          import urllib.request
+          from packaging.requirements import Requirement
+          from packaging.version import Version
+
+          project = tomllib.load(open("pyproject.toml", "rb"))["project"]
+          for name in ("pymc-monitor", "pymc-cache"):
+              requirement = next(
+                  Requirement(raw) for raw in project["dependencies"]
+                  if Requirement(raw).name.lower().replace("_", "-") == name
+              )
+              try:
+                  with urllib.request.urlopen(
+                      f"https://pypi.org/pypi/{name}/json", timeout=15
+                  ) as response:
+                      releases = json.load(response)["releases"]
+              except (urllib.error.URLError, KeyError) as exc:
+                  raise SystemExit(f"{name} is unavailable from PyPI: {exc}") from exc
+              available = [version for version, files in releases.items()
+                           if files and Version(version) in requirement.specifier]
+              if not available:
+                  raise SystemExit(f"{name} has no PyPI release matching {requirement.specifier}")
+          PY
+
       # The Tests workflow gates merges, but a release can be cut from any commit;
       # re-run the free suite so an untested tree never reaches PyPI.
       - name: Run test suite
         run: |
           uv sync --locked
-          uv run pytest tests/ -v
+          uv run --locked pytest tests/ -v
 
       - name: Build package
         run: uv build --no-sources
@@ -46,8 +78,8 @@ jobs:
       - name: Check package metadata
         run: uvx twine check --strict dist/*.whl dist/*.tar.gz
 
-      # Catch a wheel/sdist that's missing bundled files (remote/worker.py, the
-      # embedded dashboard HTML) before anything is uploaded -- versions on PyPI
+      # Catch a wheel/sdist that's missing remote/worker.py or the monitor's
+      # bundled dashboard assets before upload -- versions on PyPI
       # are immutable, so a broken artifact would burn the version number.
       # --prerelease=disallow: an isolated resolve otherwise picks prerelease
       # transitive deps (e.g. a numba beta that is incompatible with the numpy

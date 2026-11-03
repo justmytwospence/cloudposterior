@@ -4,6 +4,15 @@ name: Modal e2e (paid)
 # they never run on push or on a schedule.
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: "Paid test scope (full suite requires explicit selection)"
+        type: choice
+        required: true
+        default: extraction-smoke
+        options:
+          - extraction-smoke
+          - full
 
 permissions:
   contents: read
@@ -34,11 +43,10 @@ jobs:
             echo "MODAL_TOKEN_ID is not configured; skipping."
             exit 1
           fi
-          uv run pytest tests/ -v --run-modal -m modal
-
-      - name: Clean up any leftover volumes
-        if: always()
-        env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-        run: uv run python -c "import cloudposterior as cp; cp.cleanup_volumes()" || true
+          if [ "${{ inputs.suite }}" = "full" ]; then
+            uv run --locked pytest tests/ -v --run-modal -m modal
+          else
+            uv run --locked pytest tests/test_extraction_modal.py -v --run-modal
+          fi
+      # Each extraction test tears down only its own isolated project; never
+      # call cp.cleanup_volumes() without a project here (user data may exist).
